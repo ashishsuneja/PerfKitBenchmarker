@@ -33,3 +33,6 @@ setuptools>=40.3.0,<81
 six>=1.13.0
 timeout-decorator
 scipy
+azure-mgmt-containerservice==41.1.0
+azure-identity==1.19.0
+google-cloud-container==2.64.0

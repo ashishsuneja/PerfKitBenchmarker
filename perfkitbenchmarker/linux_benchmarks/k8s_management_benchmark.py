@@ -57,7 +57,7 @@ k8s_management_benchmark:
     vm_count: 1
     vm_spec:
       GCP:
-        machine_type: e2-standard-2
+        machine_type: e2-standard-4
         zone: us-central1-a
       AWS:
         machine_type: t3.medium
@@ -73,11 +73,11 @@ k8s_management_benchmark:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer(
-    'mgmt_concurrent_nodepools', 5,
+    'mgmt_concurrent_nodepools', 1,
     'Number of node pools to create/upgrade/delete concurrently in Scenario A.')
 
 flags.DEFINE_integer(
-    'mgmt_large_scale_nodepools', 50,
+    'mgmt_large_scale_nodepools', 5,
     'Number of node pools to provision in the large-scale Scenario C. '
     'Set up to 1000 for full stress test (ensure quota is available).')
 
@@ -104,6 +104,16 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'mgmt_poll_interval_sec', 15,
     'Polling interval in seconds when waiting for async operations to complete.')
+
+flags.DEFINE_string(
+    'mgmt_scenarios', 'A,B,C',
+    'Comma-separated list of scenarios to run: A (concurrent ops), B (overlap), C (large-scale). '
+    'Example: --mgmt_scenarios=A or --mgmt_scenarios=A,B')
+
+flags.DEFINE_string(
+    'azure_subscription_id', None,
+    'Azure subscription ID to use for AKS management operations. '
+    'If not provided, uses the cluster\'s subscription_id attribute.')
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -143,12 +153,15 @@ def Prepare(benchmark_spec):
 
     logging.info('[Prepare] Cluster %s on %s - cluster is ready (PKB provisioned).', cluster.name, cloud)
     # PKB already waits for the cluster to be ready during _PostCreate.
-    # Verify reachability via kubectl before proceeding.
-    try:
-        cluster.RunKubectl(['get', 'nodes', '--no-headers'])
-        logging.info('[Prepare] kubectl get nodes succeeded - cluster is reachable.')
-    except Exception as exc:  # pylint: disable=broad-except
-        logging.warning('[Prepare] kubectl get nodes warning: %s', exc)
+    # Verify reachability via kubectl before proceeding if supported.
+    if hasattr(cluster, 'RunKubectl'):
+        try:
+            cluster.RunKubectl(['get', 'nodes', '--no-headers'])
+            logging.info('[Prepare] kubectl get nodes succeeded - cluster is reachable.')
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.warning('[Prepare] kubectl get nodes warning: %s', exc)
+    else:
+        logging.warning('[Prepare] Cluster object has no RunKubectl method; skipping kubectl reachability check.')
 
     client = _get_cloud_client(cloud, cluster)
 
@@ -176,35 +189,49 @@ def Run(benchmark_spec):
     target_version  = benchmark_spec.mgmt_target_version
     results         = []
 
+    # Parse which scenarios to run
+    requested_scenarios = set(s.strip().upper() for s in FLAGS.mgmt_scenarios.split(','))
+    if not requested_scenarios.issubset({'A', 'B', 'C'}):
+        raise ValueError(f'Invalid scenario(s). Must be subset of {{A, B, C}}, got: {FLAGS.mgmt_scenarios}')
+
     # ------------------------------------------------------------------
     # Scenario A – Concurrent Node Pool operations
     # ------------------------------------------------------------------
-    logging.info('=' * 60)
-    logging.info('SCENARIO A: Concurrent Node Pool Operations')
-    logging.info('=' * 60)
-    results += _run_scenario_a(client, initial_version, target_version)
+    if 'A' in requested_scenarios:
+        logging.info('=' * 60)
+        logging.info('SCENARIO A: Concurrent Node Pool Operations')
+        logging.info('=' * 60)
+        try:
+            results += _run_scenario_a(client, initial_version, target_version)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error('[Run] Scenario A failed: %s', exc)
 
     # ------------------------------------------------------------------
     # Scenario B – Overlapping Cluster Update + Node Pool Create
     # ------------------------------------------------------------------
-    logging.info('=' * 60)
-    logging.info('SCENARIO B: Overlapping Cluster Update + NodePool Create')
-    logging.info('=' * 60)
-    results += _run_scenario_b(client, initial_version)
+    if 'B' in requested_scenarios:
+        logging.info('=' * 60)
+        logging.info('SCENARIO B: Overlapping Cluster Update + NodePool Create')
+        logging.info('=' * 60)
+        try:
+            results += _run_scenario_b(client, initial_version)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error('[Run] Scenario B failed: %s', exc)
 
     # ------------------------------------------------------------------
     # Scenario C – Large-scale Node Pool provisioning
     # ------------------------------------------------------------------
-    logging.info('=' * 60)
-    logging.info('SCENARIO C: Large-Scale Node Pool Provisioning (%d pools)',
-                 FLAGS.mgmt_large_scale_nodepools)
-    logging.info('=' * 60)
-    results += _run_scenario_c(client, initial_version)
+    if 'C' in requested_scenarios:
+        logging.info('=' * 60)
+        logging.info('SCENARIO C: Large-Scale Node Pool Provisioning (%d pools)',
+                     FLAGS.mgmt_large_scale_nodepools)
+        logging.info('=' * 60)
+        try:
+            results += _run_scenario_c(client, initial_version)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error('[Run] Scenario C failed: %s', exc)
 
     return results
-
-
-def Cleanup(benchmark_spec):
     """
     Best-effort deletion of any node pools created during the run.
     PKB deletes the cluster itself; we only clean up leftover node pools.
@@ -300,45 +327,94 @@ def _run_scenario_b(client, initial_version: str) -> List[sample.Sample]:
 
     # Fire cluster update (async)
     cluster_op_start = time.time()
-    cluster_op_id    = client.start_cluster_update_async()
-    cluster_initiation_latency = time.time() - cluster_op_start
-
-    results.append(sample.Sample(
-        'ScenarioB_ClusterUpdate_InitiationLatency',
-        cluster_initiation_latency,
-        'seconds',
-        {'operation': 'ClusterUpdate', 'phase': 'initiation'},
-    ))
-    logging.info('[ScenarioB] ClusterUpdate initiated (op_id=%s) in %.2fs',
-                 cluster_op_id, cluster_initiation_latency)
+    try:
+        cluster_op_id = client.start_cluster_update_async()
+        cluster_initiation_latency = time.time() - cluster_op_start
+        results.append(sample.Sample(
+            'ScenarioB_ClusterUpdate_InitiationLatency',
+            cluster_initiation_latency,
+            'seconds',
+            {'operation': 'ClusterUpdate', 'phase': 'initiation', 'success': 'True'},
+        ))
+        logging.info('[ScenarioB] ClusterUpdate initiated (op_id=%s) in %.2fs',
+                     cluster_op_id, cluster_initiation_latency)
+    except Exception as exc:  # pylint: disable=broad-except
+        cluster_initiation_latency = time.time() - cluster_op_start
+        logging.error('[ScenarioB] ClusterUpdate failed to start: %s', exc)
+        results.append(sample.Sample(
+            'ScenarioB_ClusterUpdate_InitiationLatency',
+            cluster_initiation_latency,
+            'seconds',
+            {'operation': 'ClusterUpdate', 'phase': 'initiation', 'success': 'False', 'error': str(exc)},
+        ))
+        results.append(sample.Sample(
+            'ScenarioB_ClusterUpdate_EndToEndLatency',
+            0.0,
+            'seconds',
+            {'operation': 'ClusterUpdate', 'success': 'False', 'final_state': 'FAILED', 'error': str(exc)},
+        ))
+        return results
 
     # Immediately fire CreateNodePool (overlapping)
-    np_start   = time.time()
-    np_op_id   = client.start_create_nodepool_async(
-        name         = pool_name,
-        node_count   = FLAGS.mgmt_nodes_per_nodepool,
-        node_version = initial_version,
-    )
-    np_initiation_latency = time.time() - np_start
+    np_start = time.time()
+    np_op_id = None
+    try:
+        np_op_id = client.start_create_nodepool_async(
+            name         = pool_name,
+            node_count   = FLAGS.mgmt_nodes_per_nodepool,
+            node_version = initial_version,
+        )
+        np_initiation_latency = time.time() - np_start
+        results.append(sample.Sample(
+            'ScenarioB_CreateNodePool_InitiationLatency',
+            np_initiation_latency,
+            'seconds',
+            {'operation': 'CreateNodePool', 'phase': 'initiation', 'overlap': 'ClusterUpdate', 'success': 'True'},
+        ))
+        logging.info('[ScenarioB] CreateNodePool initiated (op_id=%s) in %.2fs',
+                     np_op_id, np_initiation_latency)
+    except Exception as exc:  # pylint: disable=broad-except
+        np_initiation_latency = time.time() - np_start
+        logging.warning('[ScenarioB] CreateNodePool failed to start while cluster update is in progress: %s', exc)
+        results.append(sample.Sample(
+            'ScenarioB_CreateNodePool_InitiationLatency',
+            np_initiation_latency,
+            'seconds',
+            {'operation': 'CreateNodePool', 'phase': 'initiation', 'overlap': 'ClusterUpdate', 'success': 'False', 'error': str(exc)},
+        ))
+        np_result = {
+            'success': False,
+            'end_to_end_latency': 0.0,
+            'final_state': 'FAILED',
+            'error': str(exc),
+        }
 
-    results.append(sample.Sample(
-        'ScenarioB_CreateNodePool_InitiationLatency',
-        np_initiation_latency,
-        'seconds',
-        {'operation': 'CreateNodePool', 'phase': 'initiation', 'overlap': 'ClusterUpdate'},
-    ))
-    logging.info('[ScenarioB] CreateNodePool initiated (op_id=%s) in %.2fs',
-                 np_op_id, np_initiation_latency)
+    # Poll operations to completion
+    try:
+        with ThreadPoolExecutor(max_workers=2 if np_op_id else 1) as executor:
+            cluster_future = executor.submit(
+                client.wait_for_operation, cluster_op_id, cluster_op_start)
+            np_future = None
+            if np_op_id:
+                np_future = executor.submit(
+                    client.wait_for_operation, np_op_id, np_start)
 
-    # Poll both operations to completion concurrently
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        cluster_future = executor.submit(
-            client.wait_for_operation, cluster_op_id, cluster_op_start)
-        np_future = executor.submit(
-            client.wait_for_operation, np_op_id, np_start)
-
-        cluster_result = cluster_future.result()
-        np_result      = np_future.result()
+            cluster_result = cluster_future.result()
+            np_result = np_result if np_future is None else np_future.result()
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.error('[ScenarioB] Failed to poll operations: %s', exc)
+        cluster_result = {
+            'success': False,
+            'end_to_end_latency': time.time() - cluster_op_start,
+            'final_state': 'ERROR',
+            'error': str(exc),
+        }
+        np_result = np_result if 'end_to_end_latency' in np_result else {
+            'success': False,
+            'end_to_end_latency': time.time() - np_start if np_op_id else 0.0,
+            'final_state': 'ERROR',
+            'error': str(exc),
+        }
 
     results.append(sample.Sample(
         'ScenarioB_ClusterUpdate_EndToEndLatency',
@@ -573,7 +649,10 @@ def _get_cloud_client(cloud: str, cluster):
 
 def _pool_name(scenario_tag: str, index: int) -> str:
     """Generates a deterministic, PKB-safe node pool name."""
-    return f'pkb-{scenario_tag}-{index:04d}'
+    # AKS requires names to be 1-12 chars, lowercase alphanumeric, start with letter, no hyphens
+    # Use first letter of scenario_tag to distinguish scenarios
+    scenario_letter = scenario_tag[0]
+    return f'pkb{scenario_letter}{index:03d}'
 
 
 def _wait_for_operation_generic(
@@ -635,11 +714,33 @@ class GKEManagementClient:
         from google.cloud import container_v1  # pylint: disable=import-outside-toplevel
         self._cluster  = cluster
         self._gke      = container_v1.ClusterManagerClient()
-        self._project  = cluster.project
-        self._location = cluster.zone           # e.g. 'us-central1-a' or 'us-central1'
-        self._cluster_name = cluster.name
+        self._project  = getattr(cluster, 'project', None) or getattr(cluster, 'project_id', None)
+        self._location = getattr(cluster, 'zone', None) or getattr(cluster, 'region', None) or getattr(cluster, 'location', None)
+        self._cluster_name = getattr(cluster, 'name', None) or getattr(cluster, 'cluster_name', None)
+        if not all([self._project, self._location, self._cluster_name]):
+            raise ValueError(f"GKE cluster object missing required attributes: project={self._project}, location={self._location}, name={self._cluster_name}")
         self._parent   = f'projects/{self._project}/locations/{self._location}'
         self._cluster_path = f'{self._parent}/clusters/{self._cluster_name}'
+        logging.debug(
+            '[GKE] resolved cluster metadata: project=%s, location=%s, cluster_name=%s, parent=%s, cluster_path=%s, cluster_obj=%s',
+            self._project,
+            self._location,
+            self._cluster_name,
+            self._parent,
+            self._cluster_path,
+            type(cluster).__name__,
+        )
+
+    def __getstate__(self):
+        # Exclude unpicklable gRPC client when PKB serialises benchmark_spec
+        state = self.__dict__.copy()
+        state.pop('_gke', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        from google.cloud import container_v1  # pylint: disable=import-outside-toplevel
+        self._gke = container_v1.ClusterManagerClient()
 
     # ------------------------------------------------------------------
     # Version resolution
@@ -648,10 +749,19 @@ class GKEManagementClient:
     def resolve_versions(self, flags_initial, flags_target):
         from google.cloud import container_v1  # pylint: disable=import-outside-toplevel
         sc = self._gke.get_server_config(name=self._parent)
-        valid_versions = [c.name for c in sc.channels
-                          if c.channel == container_v1.ReleaseChannel.Channel.REGULAR]
+        valid_versions = []
+        for channel in getattr(sc, 'channels', []):
+            if channel.channel == container_v1.ReleaseChannel.Channel.REGULAR:
+                version = getattr(channel, 'default_version', None)
+                if version:
+                    valid_versions.append(version)
+
         if not valid_versions:
-            valid_versions = sc.valid_node_versions
+            valid_versions = list(getattr(sc, 'valid_node_versions', []))
+
+        if not valid_versions:
+            raise errors.Benchmarks.PrepareException(
+                'Could not determine any valid GKE node versions.')
 
         valid_versions.sort(reverse=True)   # latest first
 
@@ -666,9 +776,21 @@ class GKEManagementClient:
     # ------------------------------------------------------------------
 
     def wait_for_operation(self, op_name: str, start_time: float) -> dict:
+        logging.debug('[GKE] waiting for operation %s on cluster %s', op_name, self._cluster_path)
+
         def _poll():
-            op = self._gke.get_operation({'name': op_name})
-            return op.status.name   # RUNNING / DONE / ABORTING
+            # If op_name is just the operation ID (operation-...), construct full resource path
+            if op_name.startswith('operation-'):
+                full_op_name = f'{self._parent}/operations/{op_name}'
+            else:
+                full_op_name = op_name
+            logging.debug('[GKE] polling operation with full path: %s', full_op_name)
+            try:
+                op = self._gke.get_operation({'name': full_op_name})
+                return op.status.name   # RUNNING / DONE / ABORTING
+            except Exception as e:
+                logging.error('[GKE] get_operation failed for name=%s: %s', full_op_name, e)
+                raise
 
         return _wait_for_operation_generic(
             poll_fn           = _poll,
@@ -687,23 +809,51 @@ class GKEManagementClient:
 
     def start_create_nodepool_async(self, name: str, node_count: int, node_version: str):
         from google.cloud import container_v1  # pylint: disable=import-outside-toplevel
-        req = container_v1.CreateNodePoolRequest(
-            parent    = self._cluster_path,
-            node_pool = container_v1.NodePool(
-                name             = name,
-                version          = node_version,
-                initial_node_count = node_count,
-                config           = container_v1.NodeConfig(machine_type='e2-standard-2'),
-            ),
+        logging.debug('[GKE] Creating node pool %s in cluster %s with version %s',
+                      name, self._cluster_path, node_version)
+        node_pool = container_v1.NodePool(
+            name               = name,
+            version            = node_version,
+            initial_node_count = node_count,
+            config             = container_v1.NodeConfig(machine_type='e2-standard-2'),
         )
-        op = self._gke.create_node_pool(request=req)
+        op = self._gke.create_node_pool(parent=self._cluster_path, node_pool=node_pool)
+        if not hasattr(op, 'name') or not op.name:
+            raise RuntimeError(
+                f'GKE create_node_pool returned invalid operation object: {op}')
+        logging.debug('[GKE] create_node_pool returned operation name: %s (type: %s)', op.name, type(op.name))
         return op.name   # operation resource name
 
     def create_nodepool(self, name: str, node_count: int, node_version: str) -> dict:
         start = time.time()
-        op_id = self.start_create_nodepool_async(name, node_count, node_version)
+        try:
+            op_id = self.start_create_nodepool_async(name, node_count, node_version)
+            logging.debug('[GKE] started create_nodepool for %s, op_id=%s', name, op_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            initiation_latency = time.time() - start
+            logging.error('[GKE] Failed to start create_nodepool for %s: %s', name, exc)
+            return {
+                'name':               name,
+                'success':            False,
+                'initiation_latency': initiation_latency,
+                'end_to_end_latency': -1.0,
+                'error':              str(exc),
+            }
+
         initiation_latency = time.time() - start
-        result = self.wait_for_operation(op_id, start)
+        try:
+            result = self.wait_for_operation(op_id, start)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error('[GKE] wait_for_operation failed for %s op_id=%s cluster_path=%s: %s',
+                          name, op_id, self._cluster_path, exc)
+            return {
+                'name':               name,
+                'success':            False,
+                'initiation_latency': initiation_latency,
+                'end_to_end_latency': -1.0,
+                'error':              str(exc),
+            }
+
         return {
             'name':               name,
             'success':            result['success'],
@@ -1017,8 +1167,21 @@ class AKSManagementClient:
         from azure.mgmt.containerservice import ContainerServiceClient  # pylint: disable=import-outside-toplevel
         self._cluster         = cluster
         self._cluster_name    = cluster.name
-        self._resource_group  = cluster.resource_group
-        self._subscription_id = cluster.subscription_id
+        self._resource_group  = getattr(cluster.resource_group, 'name', str(cluster.resource_group))
+        self._subscription_id = getattr(cluster, 'subscription_id', None) or FLAGS.azure_subscription_id
+        cred = DefaultAzureCredential()
+        self._aks = ContainerServiceClient(cred, self._subscription_id)
+
+    def __getstate__(self):
+        # Exclude unpicklable Azure client when PKB serialises benchmark_spec
+        state = self.__dict__.copy()
+        state.pop('_aks', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        from azure.identity import DefaultAzureCredential           # pylint: disable=import-outside-toplevel
+        from azure.mgmt.containerservice import ContainerServiceClient  # pylint: disable=import-outside-toplevel
         cred = DefaultAzureCredential()
         self._aks = ContainerServiceClient(cred, self._subscription_id)
 
@@ -1027,17 +1190,33 @@ class AKSManagementClient:
     # ------------------------------------------------------------------
 
     def resolve_versions(self, flags_initial, flags_target):
-        versions = sorted(
-            [v.orchestrator_version
-             for v in self._aks.container_services.list_orchestrators(
-                 location='eastus', resource_type='managedClusters'
-             ).orchestrators],
-            reverse=True,
-        )
+        # In modern SDKs, we list versions for a specific location
+        response = self._aks.managed_clusters.list_kubernetes_versions(location='eastus')
+
+        if isinstance(response, dict):
+            version_list = response.get('values', []) or []
+        elif hasattr(response, 'get'):
+            version_list = response.get('values', []) or []
+        else:
+            version_list = getattr(response, 'values', None) or response or []
+
+        versions = []
+        for v in version_list:
+            if isinstance(v, dict):
+                version = v.get('version') or v.get('orchestrator_version') or v.get('name')
+            else:
+                version = getattr(v, 'version', None) or getattr(v, 'orchestrator_version', None) or getattr(v, 'name', None)
+            if version:
+                versions.append(version)
+
+        versions = sorted(set(versions), reverse=True)
+
+        if not versions:
+            raise errors.Benchmarks.PrepareException("Could not find any valid AKS versions.")
+
         initial = flags_initial or (versions[2] if len(versions) >= 3 else versions[-1])
         target  = flags_target  or versions[0]
         return initial, target
-
     # ------------------------------------------------------------------
     # Async helpers
     # ------------------------------------------------------------------
@@ -1140,3 +1319,22 @@ class AKSManagementClient:
                     self.delete_nodepool(pool.name)
                 except Exception as exc:  # pylint: disable=broad-except
                     logging.warning('Could not delete agent pool %s: %s', pool.name, exc)
+
+
+# ===========================================================================
+# PKB lifecycle hooks (continued)
+# ===========================================================================
+
+def Cleanup(benchmark_spec):
+    """
+    Best-effort deletion of any node pools created during the run.
+    PKB deletes the cluster itself; we only clean up leftover node pools.
+    """
+    client = getattr(benchmark_spec, 'mgmt_client', None)
+    if client is None:
+        return
+    logging.info('[Cleanup] Removing any benchmark node pools…')
+    try:
+        client.delete_all_benchmark_nodepools()
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.warning('[Cleanup] Non-fatal error during node pool cleanup: %s', exc)
