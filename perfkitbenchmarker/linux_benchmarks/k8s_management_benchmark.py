@@ -63,8 +63,8 @@ k8s_management_benchmark:
         machine_type: t3.medium
         zone: us-east-1a
       Azure:
-        machine_type: Standard_D2s_v3
-        zone: eastus
+        machine_type: Standard_B2s_v2
+        zone: centralus
 """
 
 # ---------------------------------------------------------------------------
@@ -73,16 +73,16 @@ k8s_management_benchmark:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer(
-    'mgmt_concurrent_nodepools', 1,
+    'mgmt_concurrent_nodepools', 5,
     'Number of node pools to create/upgrade/delete concurrently in Scenario A.')
 
 flags.DEFINE_integer(
-    'mgmt_large_scale_nodepools', 5,
+    'mgmt_large_scale_nodepools', 100,
     'Number of node pools to provision in the large-scale Scenario C. '
     'Set up to 1000 for full stress test (ensure quota is available).')
 
 flags.DEFINE_integer(
-    'mgmt_nodes_per_nodepool', 1,
+    'mgmt_nodes_per_nodepool', 2,
     'Number of nodes per node pool. Kept low to reduce quota consumption.')
 
 flags.DEFINE_string(
@@ -104,11 +104,6 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'mgmt_poll_interval_sec', 15,
     'Polling interval in seconds when waiting for async operations to complete.')
-
-flags.DEFINE_string(
-    'mgmt_scenarios', 'A,B,C',
-    'Comma-separated list of scenarios to run: A (concurrent ops), B (overlap), C (large-scale). '
-    'Example: --mgmt_scenarios=A or --mgmt_scenarios=A,B')
 
 flags.DEFINE_string(
     'azure_subscription_id', None,
@@ -189,49 +184,35 @@ def Run(benchmark_spec):
     target_version  = benchmark_spec.mgmt_target_version
     results         = []
 
-    # Parse which scenarios to run
-    requested_scenarios = set(s.strip().upper() for s in FLAGS.mgmt_scenarios.split(','))
-    if not requested_scenarios.issubset({'A', 'B', 'C'}):
-        raise ValueError(f'Invalid scenario(s). Must be subset of {{A, B, C}}, got: {FLAGS.mgmt_scenarios}')
-
     # ------------------------------------------------------------------
     # Scenario A – Concurrent Node Pool operations
     # ------------------------------------------------------------------
-    if 'A' in requested_scenarios:
-        logging.info('=' * 60)
-        logging.info('SCENARIO A: Concurrent Node Pool Operations')
-        logging.info('=' * 60)
-        try:
-            results += _run_scenario_a(client, initial_version, target_version)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.error('[Run] Scenario A failed: %s', exc)
+    logging.info('=' * 60)
+    logging.info('SCENARIO A: Concurrent Node Pool Operations')
+    logging.info('=' * 60)
+    results += _run_scenario_a(client, initial_version, target_version)
 
     # ------------------------------------------------------------------
     # Scenario B – Overlapping Cluster Update + Node Pool Create
     # ------------------------------------------------------------------
-    if 'B' in requested_scenarios:
-        logging.info('=' * 60)
-        logging.info('SCENARIO B: Overlapping Cluster Update + NodePool Create')
-        logging.info('=' * 60)
-        try:
-            results += _run_scenario_b(client, initial_version)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.error('[Run] Scenario B failed: %s', exc)
+    logging.info('=' * 60)
+    logging.info('SCENARIO B: Overlapping Cluster Update + NodePool Create')
+    logging.info('=' * 60)
+    results += _run_scenario_b(client, initial_version)
 
     # ------------------------------------------------------------------
     # Scenario C – Large-scale Node Pool provisioning
     # ------------------------------------------------------------------
-    if 'C' in requested_scenarios:
-        logging.info('=' * 60)
-        logging.info('SCENARIO C: Large-Scale Node Pool Provisioning (%d pools)',
-                     FLAGS.mgmt_large_scale_nodepools)
-        logging.info('=' * 60)
-        try:
-            results += _run_scenario_c(client, initial_version)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.error('[Run] Scenario C failed: %s', exc)
+    logging.info('=' * 60)
+    logging.info('SCENARIO C: Large-Scale Node Pool Provisioning (%d pools)',
+                 FLAGS.mgmt_large_scale_nodepools)
+    logging.info('=' * 60)
+    results += _run_scenario_c(client, initial_version)
 
     return results
+
+
+def Cleanup(benchmark_spec):
     """
     Best-effort deletion of any node pools created during the run.
     PKB deletes the cluster itself; we only clean up leftover node pools.
@@ -815,7 +796,7 @@ class GKEManagementClient:
             name               = name,
             version            = node_version,
             initial_node_count = node_count,
-            config             = container_v1.NodeConfig(machine_type='e2-standard-2'),
+            config             = container_v1.NodeConfig(machine_type='e2-micro'),
         )
         op = self._gke.create_node_pool(parent=self._cluster_path, node_pool=node_pool)
         if not hasattr(op, 'name') or not op.name:
@@ -1270,7 +1251,7 @@ class AKSManagementClient:
             name,
             AgentPool(
                 count              = node_count,
-                vm_size            = 'Standard_D2s_v3',
+                vm_size            = FLAGS.machine_type,
                 orchestrator_version = node_version,
                 mode               = 'User',
             ),
@@ -1324,17 +1305,3 @@ class AKSManagementClient:
 # ===========================================================================
 # PKB lifecycle hooks (continued)
 # ===========================================================================
-
-def Cleanup(benchmark_spec):
-    """
-    Best-effort deletion of any node pools created during the run.
-    PKB deletes the cluster itself; we only clean up leftover node pools.
-    """
-    client = getattr(benchmark_spec, 'mgmt_client', None)
-    if client is None:
-        return
-    logging.info('[Cleanup] Removing any benchmark node pools…')
-    try:
-        client.delete_all_benchmark_nodepools()
-    except Exception as exc:  # pylint: disable=broad-except
-        logging.warning('[Cleanup] Non-fatal error during node pool cleanup: %s', exc)
