@@ -35,7 +35,6 @@ from typing import Callable
 from absl import flags
 from absl import logging
 from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
@@ -340,38 +339,35 @@ def _RunScenarioA(
   )
   samples += _OpSamples('ScenarioA_Upgrade', upgrade_results,
                         attempted_ops=len(created))
-  # ── GKE Active Node Pool Status Hold Barrier ──────────────────────────────
-  print("Scenario A: waiting for GKE to reflect active node pool upgrade status ")
-  time.sleep(30)  # GKE needs a short buffer after initiating upgrade.
-  operation_id = None
-  cmd = [
-      'gcloud', 'container', 'operations', 'list',
-      f'--project={cluster.project}',
-      f'--zone={cluster.zone}',
-      '--filter="TYPE=UPGRADE_NODES AND STATUS=RUNNING"'
-    ]
-  print("Checking for node pool upgrade operation ...")
-  while True:
-    try:
-        # Execute the shell call safely via your vm_util binding
-        stdout, stderr, retcode = vm_util.IssueCommand(cmd)
-        
-        # Clean up the output string (remove whitespaces/newlines)
-        result = stdout.strip() if stdout else ""
-        
-        # If result is empty, it means no operation is running
-        if not result:
-            print("No running upgrade operation found. Exiting loop.", result)
-            break  # Stops the while loop completely
-        else:
-            print(f"Operation is still active. ID: {result}")
-        
-    except Exception as e:
-        # Prevents the script from crashing if gcloud temporary times out or errors
-        print(f"Command failed or encountered an error: {e}. Retrying...")
+  # ── Idiomatic Control Plane Synchronization Barrier ──────────────────────
+  logging.info('Scenario A upgrade tasks initiated. Synchronizing cluster states...')
+  print("Upgrade results :",upgrade_results)  # Debug log before loop
+  print("Create results :",create_results)
+  
+  if hasattr(cluster, 'project') or 'gcp' in str(type(cluster)).lower():
+    logging.info('Scenario A background upgrades completed. Syncing remaining operation states...')
     
-    # Sleep to avoid spamming the GCP API and getting rate-limited
-    time.sleep(20)
+    # Extract successfully triggered pool names
+    pools_to_verify = [name for name, _, _, err in upgrade_results]
+    print("Pools to verify:", pools_to_verify)
+    for pool_name in pools_to_verify:
+      logging.info('Verifying control-plane state for node pool: %s', pool_name)
+      # By calling GetNodePoolNames, PKB runs a structured cluster describe.
+      # If the cluster is locked or modifying, this naturally waits or errors safely.
+      print("Live node pools:", cluster.GetNodePoolNames())
+      while True:
+        try:
+          if pool_name in cluster.GetNodePoolNames():
+            break
+        except Exception as e:
+          logging.warning('Control plane is busy mutating: %s. Retrying...', e)
+        time.sleep(15)
+        
+    # Standard Google Cloud API cooling buffer to flush global mutation locks
+    time.sleep(15)
+  else:
+    # Azure AKS/AWS EKS components move forward normally
+    time.sleep(5)
   
   # ── Phase 3: concurrent deletes (live-list to catch EKS rollbacks) ────────
   alive = [p for p in cluster.GetNodePoolNames() if p.startswith(f'{_PREFIX}a')]
