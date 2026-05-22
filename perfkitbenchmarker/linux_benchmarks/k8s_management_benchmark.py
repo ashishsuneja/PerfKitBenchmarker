@@ -340,6 +340,38 @@ def _RunScenarioA(
   )
   samples += _OpSamples('ScenarioA_Upgrade', upgrade_results,
                         attempted_ops=len(created))
+  # ── GKE Active Node Pool Status Hold Barrier ──────────────────────────────
+  print("Scenario A: waiting for GKE to reflect active node pool upgrade status ")
+  time.sleep(30)  # GKE needs a short buffer after initiating upgrade.
+  operation_id = None
+  cmd = [
+      'gcloud', 'container', 'operations', 'list',
+      f'--project={cluster.project}',
+      f'--zone={cluster.zone}',
+      '--filter="TYPE=UPGRADE_NODES AND STATUS=RUNNING"'
+    ]
+  print("Checking for node pool upgrade operation ...")
+  while True:
+    try:
+        # Execute the shell call safely via your vm_util binding
+        stdout, stderr, retcode = vm_util.IssueCommand(cmd)
+        
+        # Clean up the output string (remove whitespaces/newlines)
+        result = stdout.strip() if stdout else ""
+        
+        # If result is empty, it means no operation is running
+        if not result:
+            print("No running upgrade operation found. Exiting loop.", result)
+            break  # Stops the while loop completely
+        else:
+            print(f"Operation is still active. ID: {result}")
+        
+    except Exception as e:
+        # Prevents the script from crashing if gcloud temporary times out or errors
+        print(f"Command failed or encountered an error: {e}. Retrying...")
+    
+    # Sleep to avoid spamming the GCP API and getting rate-limited
+    time.sleep(20)
   
   # ── Phase 3: concurrent deletes (live-list to catch EKS rollbacks) ────────
   alive = [p for p in cluster.GetNodePoolNames() if p.startswith(f'{_PREFIX}a')]
