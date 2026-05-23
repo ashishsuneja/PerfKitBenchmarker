@@ -39,7 +39,6 @@ from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.resources.container_service import container as container_lib
 from perfkitbenchmarker.resources.container_service import kubectl
@@ -340,47 +339,24 @@ def _RunScenarioA(
   )
   samples += _OpSamples('ScenarioA_Upgrade', upgrade_results,
                         attempted_ops=len(created))
-  ## ── GKE Operational List Holding Barrier ──────────────────────────────────
-  if hasattr(cluster, 'project') or 'gcp' in str(type(cluster)).lower():
-    logging.info('GCP GKE cluster detected. Waiting for all active upgrade operations to finish...')
+  
+  # ── Idiomatic Control Plane Synchronization Barrier ──────────────────────
+  # Give the GKE control plane a brief window to register the async operations
+  time.sleep(15)
+
+  # Check if the cluster object has our native upgrade tracking capability
+  if hasattr(cluster, 'HasActiveUpgradeOperations'):
+    logging.info('GCP GKE cluster detected. Polling control plane operations via provider API...')
     
-    # Pre-calculated cooldown to give the GKE API gateway time to register the tasks
-    time.sleep(15)
-
-    # Note the double escaping for the filter so the shell handles quotes perfectly
-    cmd = [
-        'gcloud', 'container', 'operations', 'list',
-        f'--project={cluster.project}',
-        f'--zone={cluster.zone}',
-        '--filter=operationType=UPGRADE_NODES AND status=RUNNING',
-        '--sort-by=~startTime',
-        '--limit=1',
-        '--format=value(name)'
-    ]
-
-    while True:
-      try:
-        # Execute the exact gcloud lookup command via the host system shell
-        stdout, stderr, retcode = vm_util.IssueCommand(cmd)
-        active_op = stdout.strip()
-
-        if not active_op:
-          logging.info('No active UPGRADE_NODES operations found running. Safe to proceed!')
-          break
-        
-        logging.info('Control plane is still upgrading. Found active tracking token: %s', active_op)
-      except Exception as e:
-        logging.warning('Transient connectivity error while querying operations: %s', e)
-
-      logging.info('Upgrade operation(s) in progress. Holding delete phase for 30 seconds...')
+    while cluster.HasActiveUpgradeOperations():
+      logging.info('Upgrade operations are still active. Holding delete phase for 30 seconds...')
       time.sleep(30)
-
-    # Safe structural flush window before slamming deletions
-    logging.info('Operation block cleared. Pausing 10 seconds to flush API gateway write-locks...')
+      
+    logging.info('All active upgrade operations completed. Flushing API gateway write-locks...')
     time.sleep(10)
   else:
-    # Azure AKS or AWS EKS components proceed with a standard structural pause
-    logging.info('Non-GCP provider detected. Short 5-second stabilization pause...')
+    # Non-GCP providers (Azure AKS / AWS EKS) proceed with a standard safety pause
+    logging.info('Non-GCP cluster detected. Proceeding with standard stabilization pause...')
     time.sleep(5)
   
   # ── Phase 3: concurrent deletes (live-list to catch EKS rollbacks) ────────

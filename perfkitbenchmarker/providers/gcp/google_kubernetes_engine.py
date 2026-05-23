@@ -691,6 +691,20 @@ class GkeCluster(BaseGkeCluster):
     cmd.args.append('--quiet')
     cmd.Issue(timeout=ONE_HOUR)
 
+  def HasActiveUpgradeOperations(self) -> bool:
+    """Checks if there are any active node pool upgrades running on the cluster."""
+    cmd = self._GcloudCommand('container', 'operations', 'list')
+    cmd.flags['project'] = self.project
+    cmd.flags['zone'] = self.zone
+    cmd.flags['filter'] = 'operationType=UPGRADE_NODES AND status=RUNNING'
+    cmd.flags['sort-by'] = '~startTime'
+    cmd.flags['limit'] = 1
+    cmd.flags['format'] = 'value(name)'
+    
+    # Issue the command using PKB's native GcloudCommand wrapper
+    stdout, _, _ = cmd.Issue(raise_on_failure=False)
+    return bool(stdout.strip())
+
   def UpdateCluster(self) -> None:
     """Real cluster-level update via a unique-timestamp label change.
 
