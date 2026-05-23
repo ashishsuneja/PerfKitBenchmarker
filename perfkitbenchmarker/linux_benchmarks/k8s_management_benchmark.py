@@ -39,6 +39,7 @@ from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.resources.container_service import container as container_lib
 from perfkitbenchmarker.resources.container_service import kubectl
@@ -339,34 +340,47 @@ def _RunScenarioA(
   )
   samples += _OpSamples('ScenarioA_Upgrade', upgrade_results,
                         attempted_ops=len(created))
-  # ── Idiomatic Control Plane Synchronization Barrier ──────────────────────
-  logging.info('Scenario A upgrade tasks initiated. Synchronizing cluster states...')
-  print("Upgrade results :",upgrade_results)  # Debug log before loop
-  print("Create results :",create_results)
-  
+  ## ── GKE Operational List Holding Barrier ──────────────────────────────────
   if hasattr(cluster, 'project') or 'gcp' in str(type(cluster)).lower():
-    logging.info('Scenario A background upgrades completed. Syncing remaining operation states...')
+    logging.info('GCP GKE cluster detected. Waiting for all active upgrade operations to finish...')
     
-    # Extract successfully triggered pool names
-    pools_to_verify = [name for name, _, _, err in upgrade_results]
-    print("Pools to verify:", pools_to_verify)
-    for pool_name in pools_to_verify:
-      logging.info('Verifying control-plane state for node pool: %s', pool_name)
-      # By calling GetNodePoolNames, PKB runs a structured cluster describe.
-      # If the cluster is locked or modifying, this naturally waits or errors safely.
-      print("Live node pools:", cluster.GetNodePoolNames())
-      while True:
-        try:
-          if pool_name in cluster.GetNodePoolNames():
-            break
-        except Exception as e:
-          logging.warning('Control plane is busy mutating: %s. Retrying...', e)
-        time.sleep(15)
-        
-    # Standard Google Cloud API cooling buffer to flush global mutation locks
+    # Pre-calculated cooldown to give the GKE API gateway time to register the tasks
     time.sleep(15)
+
+    # Note the double escaping for the filter so the shell handles quotes perfectly
+    cmd = [
+        'gcloud', 'container', 'operations', 'list',
+        f'--project={cluster.project}',
+        f'--zone={cluster.zone}',
+        '--filter=operationType=UPGRADE_NODES AND status=RUNNING',
+        '--sort-by=~startTime',
+        '--limit=1',
+        '--format=value(name)'
+    ]
+
+    while True:
+      try:
+        # Execute the exact gcloud lookup command via the host system shell
+        stdout, stderr, retcode = vm_util.IssueCommand(cmd)
+        active_op = stdout.strip()
+
+        if not active_op:
+          logging.info('No active UPGRADE_NODES operations found running. Safe to proceed!')
+          break
+        
+        logging.info('Control plane is still upgrading. Found active tracking token: %s', active_op)
+      except Exception as e:
+        logging.warning('Transient connectivity error while querying operations: %s', e)
+
+      logging.info('Upgrade operation(s) in progress. Holding delete phase for 30 seconds...')
+      time.sleep(30)
+
+    # Safe structural flush window before slamming deletions
+    logging.info('Operation block cleared. Pausing 10 seconds to flush API gateway write-locks...')
+    time.sleep(10)
   else:
-    # Azure AKS/AWS EKS components move forward normally
+    # Azure AKS or AWS EKS components proceed with a standard structural pause
+    logging.info('Non-GCP provider detected. Short 5-second stabilization pause...')
     time.sleep(5)
   
   # ── Phase 3: concurrent deletes (live-list to catch EKS rollbacks) ────────
