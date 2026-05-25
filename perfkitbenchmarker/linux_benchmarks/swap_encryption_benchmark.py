@@ -530,13 +530,30 @@ def _DeleteDaemonSet() -> None:
 # ---------------------------------------------------------------------------
 
 def _PodExec(
-    pod: str, cmd: str, ignore_failure: bool = False
+    pod: str,
+    cmd: str,
+    ignore_failure: bool = False,
+    timeout: int = 300,
 ) -> tuple[str, str]:
-  """Run a shell command inside the benchmark pod via kubectl exec."""
+  """Run a shell command inside the benchmark pod via kubectl exec.
+
+  Args:
+    pod:            Pod name returned by _WaitForBenchmarkPod.
+    cmd:            Shell command string passed to bash -c.
+    ignore_failure: When True, non-zero exit codes are logged but not raised.
+    timeout:        Seconds before PKB kills the kubectl exec process.
+                    Default 300 s matches PKB's IssueCommand default.
+                    Pass a larger value for long-running jobs (fio, stress-ng,
+                    kernel build).
+
+  Returns:
+    (stdout, stderr) strings.
+  """
   out, err, rc = kubectl.RunKubectlCommand(
       ['exec', pod, '-n', _DS_NAMESPACE,
        '--', 'bash', '-c', cmd],
       raise_on_failure=not ignore_failure,
+      timeout=timeout,
   )
   return out, err
 
@@ -685,22 +702,51 @@ def _SetupGKELoopDeviceSwap(pod: str) -> None:
   dm-crypt is still exercised and all I/O ultimately lands on the
   hyperdisk-balanced boot volume, so the measurement is representative of
   GKE's encryption overhead on that storage tier.
+
+  Steps are intentionally separated into individual _PodExec calls so that:
+  - Each step has its own PKB IssueCommand timeout budget.
+  - Progress is visible in logs (easier to spot which step is slow).
+
+  Uses truncate -s (sparse file) instead of fallocate so the backing file is
+  created instantly without any disk writes.  fallocate inside an overlayfs
+  container layer triggers synchronous block pre-allocation on the underlying
+  hyperdisk which can exceed PKB's 300 s IssueCommand timeout.
   """
   size_gb = _SWAP_SIZE_GB.value
-  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap (%d GB)', size_gb)
-  _PodExec(pod, textwrap.dedent(f"""
-    fallocate -l {size_gb}G /var/pkb_swap_backing && \\
+  backing   = '/var/pkb_swap_backing'
+  logging.info('[swap_encryption] GKE: creating %d GB sparse backing file', size_gb)
+
+  # Step 1 – create sparse backing file (instant – no disk writes)
+  _PodExec(pod, f'truncate -s {size_gb}G {backing}')
+  logging.info('[swap_encryption] GKE: backing file created')
+
+  # Step 2 – attach loop device and report the device name
+  loop_out, _ = _PodExec(pod, textwrap.dedent(f"""
     LOOP=$(losetup -f) && \\
-    losetup "$LOOP" /var/pkb_swap_backing && \\
+    losetup "$LOOP" {backing} && \\
+    echo "$LOOP"
+  """))
+  loop_dev = loop_out.strip()
+  if not loop_dev or not loop_dev.startswith('/dev/loop'):
+    raise RuntimeError(
+        f'[swap_encryption] losetup failed – unexpected output: {loop_out!r}'
+    )
+  logging.info('[swap_encryption] GKE: loop device: %s', loop_dev)
+
+  # Step 3 – open dm-crypt (plain mode, ephemeral key)
+  _PodExec(pod, textwrap.dedent(f"""
     dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
     cryptsetup open --type plain \\
       --cipher aes-xts-plain64 \\
       --key-size 256 \\
       --key-file=- \\
-      "$LOOP" swap_encrypted && \\
-    mkswap /dev/mapper/swap_encrypted && \\
-    swapon /dev/mapper/swap_encrypted
+      {loop_dev} swap_encrypted
   """))
+  logging.info('[swap_encryption] GKE: dm-crypt opened on %s', loop_dev)
+
+  # Step 4 – format and activate swap
+  _PodExec(pod, 'mkswap /dev/mapper/swap_encrypted')
+  _PodExec(pod, 'swapon /dev/mapper/swap_encrypted')
   logging.info('[swap_encryption] GKE: dm-crypt loop-device swap active')
 
 
@@ -909,12 +955,17 @@ def _Phase1_Fio(
 
   _PodExec(pod, f'swapoff {swap_dev}', ignore_failure=True)
 
-  # Pre-fill device so read tests have real data
+  # Pre-fill device so read tests have real data.
+  # Timeout = swap_size_gb / ~200 MB/s (conservative hyperdisk write rate) + buffer.
+  prefill_timeout = max(600, _SWAP_SIZE_GB.value * 10)
   logging.info('[swap_encryption] Pre-filling swap device: %s', swap_dev)
   _PodExec(pod, (
       f'fio --name=prefill --filename={swap_dev} '
       f'--ioengine=libaio --direct=1 --rw=write --bs=1m --size=100% --verify=0'
-  ))
+  ), timeout=prefill_timeout)
+
+  # Each fio job: runtime + 60 s buffer for setup/teardown
+  fio_timeout = _FIO_RUNTIME_SEC.value + 60
 
   for name, rw, bs, depth, label in _FIO_JOBS:
     logging.info('[swap_encryption] fio: %s', name)
@@ -925,7 +976,7 @@ def _Phase1_Fio(
         f'--time_based --runtime={_FIO_RUNTIME_SEC.value}s '
         f'--output-format=json'
     )
-    out, _ = _PodExec(pod, cmd)
+    out, _ = _PodExec(pod, cmd, timeout=fio_timeout)
     results += _ParseFioJson(out, name, label, base_meta)
 
   _PodExec(pod, f'swapon {swap_dev}', ignore_failure=True)
@@ -1022,7 +1073,7 @@ def _RunCpuOverheadSweep(
       f'--vm-method all '
       f'--timeout {timeout}s '
       f'--metrics-brief 2>&1'
-  ))
+  ), timeout=timeout + 60)
   elapsed = time.time() - t0
 
   time.sleep(interval + 1)  # let collectors flush last sample
@@ -1275,7 +1326,7 @@ def _Phase3b_KernelBuild(pod: str, base_meta: dict) -> list[sample.Sample]:
     else:
       cmd = f'make -C {src} -j$(nproc) vmlinux 2>&1'
     t0 = time.time()
-    _PodExec(pod, cmd)
+    _PodExec(pod, cmd, timeout=3600)  # kernel builds can take up to ~1 hr
     elapsed = time.time() - t0
     m = dict(base_meta,
              workload='kernel_build',
