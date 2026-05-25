@@ -624,29 +624,47 @@ def _SetupGKESwap(pod: str) -> None:
 
 
 def _SetupGKEHyperdiskSwap(pod: str) -> None:
-  """Configure dm-crypt swap on the hyperdisk-balanced data disk (GKE default)."""
+  """Configure dm-crypt swap on hyperdisk-balanced (GKE default).
+
+  Disk detection is split into two separate commands so that the boot-device
+  name is resolved first and then substituted as a literal string — nested
+  $() expansions inside a kubectl exec bash -c argument are unreliable.
+
+  If no dedicated data disk is attached (single-disk node) dm-crypt is set up
+  over a loop device backed by a file on the boot hyperdisk, which still
+  exercises the full encryption path on the same storage tier.
+  """
   logging.info('[swap_encryption] GKE: setting up dm-crypt on hyperdisk')
 
-  # Find the data disk (not the boot device)
-  disk_out, _ = _PodExec(
+  # Step 1: identify the boot device name (e.g. "nvme0n1", "sda")
+  boot_out, _ = _PodExec(
       pod,
-      "lsblk -d -o NAME,TYPE | awk '$2==\"disk\"{print $1}' | "
-      "grep -v '$(lsblk -no pkname $(findmnt -n -o SOURCE /))' | head -1",
+      'lsblk -no pkname "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1',
       ignore_failure=True,
   )
-  disk = '/dev/' + disk_out.strip()
-  if disk == '/dev/':
-    # Fallback: use sdb or the second listed disk
-    disk_out2, _ = _PodExec(
-        pod,
-        "lsblk -d -o NAME | grep -E 'sdb|nvme1n1|vdb' | head -1",
-        ignore_failure=True,
-    )
-    disk = '/dev/' + disk_out2.strip() if disk_out2.strip() else '/dev/sdb'
+  boot_base = boot_out.strip() or 'nvme0n1'
+  logging.info('[swap_encryption] GKE: boot device: %s', boot_base)
 
+  # Step 2: find a non-boot disk using the literal name from step 1
+  disk_out, _ = _PodExec(
+      pod,
+      f"lsblk -d -o NAME,TYPE | awk '$2==\"disk\"{{print $1}}' "
+      f"| grep -v '^{boot_base}$' | head -1",
+      ignore_failure=True,
+  )
+  disk_name = disk_out.strip()
+
+  if not disk_name:
+    logging.info(
+        '[swap_encryption] No dedicated data disk found – '
+        'using dm-crypt loop device on boot hyperdisk'
+    )
+    _SetupGKELoopDeviceSwap(pod)
+    return
+
+  disk = f'/dev/{disk_name}'
   logging.info('[swap_encryption] GKE: dm-crypt target disk: %s', disk)
 
-  # Open dm-crypt in plain mode with an ephemeral random key (matches GKE)
   _PodExec(pod, textwrap.dedent(f"""
     dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
     cryptsetup open --type plain \\
@@ -658,6 +676,32 @@ def _SetupGKEHyperdiskSwap(pod: str) -> None:
     swapon /dev/mapper/swap_encrypted
   """))
   logging.info('[swap_encryption] GKE: dm-crypt swap active on /dev/mapper/swap_encrypted')
+
+
+def _SetupGKELoopDeviceSwap(pod: str) -> None:
+  """dm-crypt swap over a loop device backed by a file on the hyperdisk.
+
+  Used when no dedicated data disk is attached (single-disk GKE node).
+  dm-crypt is still exercised and all I/O ultimately lands on the
+  hyperdisk-balanced boot volume, so the measurement is representative of
+  GKE's encryption overhead on that storage tier.
+  """
+  size_gb = _SWAP_SIZE_GB.value
+  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap (%d GB)', size_gb)
+  _PodExec(pod, textwrap.dedent(f"""
+    fallocate -l {size_gb}G /var/pkb_swap_backing && \\
+    LOOP=$(losetup -f) && \\
+    losetup "$LOOP" /var/pkb_swap_backing && \\
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
+    cryptsetup open --type plain \\
+      --cipher aes-xts-plain64 \\
+      --key-size 256 \\
+      --key-file=- \\
+      "$LOOP" swap_encrypted && \\
+    mkswap /dev/mapper/swap_encrypted && \\
+    swapon /dev/mapper/swap_encrypted
+  """))
+  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap active')
 
 
 def _SetupGKELSSDSwap(pod: str) -> None:
