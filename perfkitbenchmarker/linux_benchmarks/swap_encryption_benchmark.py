@@ -264,11 +264,30 @@ def _DaemonSetYaml(image: str) -> str:
             - bash
             - -c
             - |
-              apt-get update -qq && \\
+              set -e
+              apt-get update -qq
               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \\
-                fio stress-ng sysstat cryptsetup mdadm \\
-                redis-server redis-tools wget make gcc \\
-                linux-headers-$(uname -r) cgroup-tools 2>&1
+                fio \\
+                stress-ng \\
+                sysstat \\
+                cryptsetup \\
+                mdadm \\
+                redis-server \\
+                redis-tools \\
+                wget \\
+                curl \\
+                make \\
+                gcc \\
+                bc \\
+                flex \\
+                bison \\
+                libelf-dev \\
+                libssl-dev \\
+                cgroup-tools \\
+                nvme-cli \\
+                util-linux \\
+                2>&1
+              echo "install-tools done"
             securityContext:
               privileged: true
             volumeMounts:
@@ -423,23 +442,66 @@ def _DeployDaemonSet() -> None:
 
 
 def _WaitForBenchmarkPod(timeout: int = 600) -> str | None:
-  """Wait until the DaemonSet pod is Running and return its name."""
+  """Wait until the DaemonSet pod is Running and return its name.
+
+  Uses a tab-separated name/phase listing so kubectl always exits 0 whether
+  or not any pods exist, avoiding the jsonpath-index-out-of-bounds error that
+  occurs when --field-selector returns an empty list.
+  """
   deadline = time.time() + timeout
+  last_phase = ''
   while time.time() < deadline:
     out, _, rc = kubectl.RunKubectlCommand([
         'get', 'pods',
         '-l', f'app={_DS_LABEL}',
         '-n', _DS_NAMESPACE,
-        '--field-selector', 'status.phase=Running',
-        '-o', 'jsonpath={.items[0].metadata.name}',
+        '-o',
+        r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}',
     ], raise_on_failure=False)
-    pod = out.strip()
-    if rc == 0 and pod:
-      return pod
-    logging.info('[swap_encryption] Waiting for benchmark pod...')
+
+    if rc == 0 and out.strip():
+      for line in out.strip().splitlines():
+        parts = line.split('\t')
+        if len(parts) == 2:
+          pod_name, phase = parts[0].strip(), parts[1].strip()
+          if phase == 'Running':
+            logging.info('[swap_encryption] Pod %s is Running', pod_name)
+            return pod_name
+          # Log phase change so the user can see progress / diagnose hangs
+          if phase != last_phase:
+            logging.info('[swap_encryption] Pod %s phase: %s', pod_name, phase)
+            last_phase = phase
+            # On Init or Pending, dump events once to surface scheduling errors
+            if phase in ('Pending', 'Init'):
+              _LogPodEvents(pod_name)
+    else:
+      logging.info('[swap_encryption] Waiting for DaemonSet pod to appear...')
+
     time.sleep(15)
+
   logging.warning('[swap_encryption] Benchmark pod not ready after %ds', timeout)
   return None
+
+
+def _LogPodEvents(pod_name: str) -> None:
+  """Dump recent Kubernetes events for the pod to help diagnose startup hangs."""
+  events_out, _, _ = kubectl.RunKubectlCommand([
+      'describe', 'pod', pod_name,
+      '-n', _DS_NAMESPACE,
+  ], raise_on_failure=False)
+  # Only log the Events section to keep output manageable
+  in_events = False
+  lines = []
+  for line in events_out.splitlines():
+    if line.startswith('Events:'):
+      in_events = True
+    if in_events:
+      lines.append(line)
+  if lines:
+    logging.info('[swap_encryption] Pod events:\n%s', '\n'.join(lines[:30]))
+  else:
+    logging.info('[swap_encryption] kubectl describe output:\n%s',
+                 events_out[-2000:] if len(events_out) > 2000 else events_out)
 
 
 def _DeleteDaemonSet() -> None:
