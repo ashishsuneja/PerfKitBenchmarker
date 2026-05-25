@@ -257,14 +257,15 @@ def _DaemonSetYaml(image: str) -> str:
           hostNetwork: true
           tolerations:
           - operator: Exists
-          initContainers:
-          - name: install-tools
+          containers:
+          - name: benchmark
             image: {image}
             command:
             - bash
             - -c
             - |
               set -e
+              echo "[pkb] Installing benchmark tools..."
               apt-get update -qq
               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \\
                 fio \\
@@ -287,18 +288,9 @@ def _DaemonSetYaml(image: str) -> str:
                 nvme-cli \\
                 util-linux \\
                 2>&1
-              echo "install-tools done"
-            securityContext:
-              privileged: true
-            volumeMounts:
-            - name: dev
-              mountPath: /dev
-            - name: sys
-              mountPath: /sys
-          containers:
-          - name: benchmark
-            image: {image}
-            command: ["sleep", "infinity"]
+              echo "[pkb] Tools installed. Writing ready sentinel."
+              touch /tmp/pkb_ready
+              sleep infinity
             securityContext:
               privileged: true
               capabilities:
@@ -441,41 +433,60 @@ def _DeployDaemonSet() -> None:
   logging.info('[swap_encryption] DaemonSet applied')
 
 
-def _WaitForBenchmarkPod(timeout: int = 600) -> str | None:
-  """Wait until the DaemonSet pod is Running and return its name.
+def _WaitForBenchmarkPod(timeout: int = 900) -> str | None:
+  """Wait until the DaemonSet pod is Running AND tools are installed.
 
-  Uses a tab-separated name/phase listing so kubectl always exits 0 whether
-  or not any pods exist, avoiding the jsonpath-index-out-of-bounds error that
-  occurs when --field-selector returns an empty list.
+  The benchmark container installs apt packages on first start and writes
+  /tmp/pkb_ready when done (~2-4 min on a cold node).  We must wait for
+  that sentinel before exec-ing any commands, otherwise tools like
+  cryptsetup / fio may not yet be on PATH.
+
+  Uses tab-separated name/phase output so kubectl always exits 0 regardless
+  of whether any pods are present, avoiding jsonpath index errors.
   """
   deadline = time.time() + timeout
   last_phase = ''
-  while time.time() < deadline:
-    out, _, rc = kubectl.RunKubectlCommand([
-        'get', 'pods',
-        '-l', f'app={_DS_LABEL}',
-        '-n', _DS_NAMESPACE,
-        '-o',
-        r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}',
-    ], raise_on_failure=False)
+  ready_pod  = None   # pod name once phase == Running
 
-    if rc == 0 and out.strip():
-      for line in out.strip().splitlines():
-        parts = line.split('\t')
-        if len(parts) == 2:
-          pod_name, phase = parts[0].strip(), parts[1].strip()
-          if phase == 'Running':
-            logging.info('[swap_encryption] Pod %s is Running', pod_name)
-            return pod_name
-          # Log phase change so the user can see progress / diagnose hangs
-          if phase != last_phase:
-            logging.info('[swap_encryption] Pod %s phase: %s', pod_name, phase)
-            last_phase = phase
-            # On Init or Pending, dump events once to surface scheduling errors
-            if phase in ('Pending', 'Init'):
-              _LogPodEvents(pod_name)
-    else:
-      logging.info('[swap_encryption] Waiting for DaemonSet pod to appear...')
+  while time.time() < deadline:
+    # ── Step 1: wait for Running phase ──────────────────────────────────────
+    if ready_pod is None:
+      out, _, rc = kubectl.RunKubectlCommand([
+          'get', 'pods',
+          '-l', f'app={_DS_LABEL}',
+          '-n', _DS_NAMESPACE,
+          '-o',
+          r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}',
+      ], raise_on_failure=False)
+
+      if rc == 0 and out.strip():
+        for line in out.strip().splitlines():
+          parts = line.split('\t')
+          if len(parts) == 2:
+            pod_name, phase = parts[0].strip(), parts[1].strip()
+            if phase == 'Running':
+              logging.info('[swap_encryption] Pod %s is Running – '
+                           'waiting for tool install to finish...', pod_name)
+              ready_pod = pod_name
+              break
+            if phase != last_phase:
+              logging.info('[swap_encryption] Pod %s phase: %s', pod_name, phase)
+              last_phase = phase
+              if phase in ('Pending',):
+                _LogPodEvents(pod_name)
+      else:
+        logging.info('[swap_encryption] Waiting for DaemonSet pod to appear...')
+
+    # ── Step 2: poll for /tmp/pkb_ready sentinel ────────────────────────────
+    if ready_pod is not None:
+      sentinel_out, _, sentinel_rc = kubectl.RunKubectlCommand([
+          'exec', ready_pod, '-n', _DS_NAMESPACE,
+          '--', 'test', '-f', '/tmp/pkb_ready',
+      ], raise_on_failure=False)
+      if sentinel_rc == 0:
+        logging.info('[swap_encryption] Pod %s ready (tools installed)', ready_pod)
+        return ready_pod
+      logging.info('[swap_encryption] Pod %s: still installing tools...', ready_pod)
 
     time.sleep(15)
 
@@ -535,27 +546,56 @@ def _PodExec(
 # ---------------------------------------------------------------------------
 
 def _DetectCloud(pod: str) -> str:
-  """Heuristically detect GCP vs AWS from within the pod."""
-  gcp, _ = _PodExec(
+  """Detect GCP vs AWS from DMI product info exposed via /sys hostPath mount.
+
+  DMI is the most reliable in-container detection method because it reads
+  directly from the host kernel's SMBIOS table via /sys (already mounted).
+  It avoids HTTP metadata endpoint quoting issues and network timeouts.
+
+  Falls back to metadata HTTP endpoints if DMI is inconclusive.
+  """
+  # Primary: DMI product name / vendor (available via /sys hostPath mount)
+  dmi_out, _ = _PodExec(
       pod,
-      'curl -s -m 2 --fail '
-      'http://metadata.google.internal/computeMetadata/v1/instance/zone '
-      '-H "Metadata-Flavor: Google" 2>/dev/null || echo ""',
+      'cat /sys/class/dmi/id/product_name 2>/dev/null || '
+      'cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo ""',
       ignore_failure=True,
   )
-  if gcp.strip():
+  dmi = dmi_out.strip().lower()
+  if 'google' in dmi:
+    logging.info('[swap_encryption] Cloud detected via DMI: gcp (%s)', dmi_out.strip())
+    return 'gcp'
+  if any(k in dmi for k in ('amazon', 'ec2', 'aws')):
+    logging.info('[swap_encryption] Cloud detected via DMI: aws (%s)', dmi_out.strip())
+    return 'aws'
+
+  # Secondary: GCP metadata endpoint.
+  # Use -H with no space after colon to avoid shell-quoting issues through
+  # the kubectl exec → bash -c pipeline.
+  gcp_out, _ = _PodExec(
+      pod,
+      'curl -s -m 3 '
+      'http://metadata.google.internal/computeMetadata/v1/instance/zone '
+      '-H Metadata-Flavor:Google 2>/dev/null || echo ""',
+      ignore_failure=True,
+  )
+  if gcp_out.strip():
+    logging.info('[swap_encryption] Cloud detected via metadata: gcp')
     return 'gcp'
 
-  aws, _ = _PodExec(
+  # Tertiary: AWS IMDS
+  aws_out, _ = _PodExec(
       pod,
-      'curl -s -m 2 --fail '
+      'curl -s -m 3 '
       'http://169.254.169.254/latest/meta-data/instance-id '
       '2>/dev/null || echo ""',
       ignore_failure=True,
   )
-  if aws.strip():
+  if aws_out.strip():
+    logging.info('[swap_encryption] Cloud detected via IMDS: aws')
     return 'aws'
 
+  logging.warning('[swap_encryption] Could not detect cloud from DMI or metadata')
   return 'unknown'
 
 
@@ -783,13 +823,21 @@ def _SetupEKSIo2Swap(pod: str) -> None:
 
 
 def _SetupPlainSwapFile(pod: str, size_gb: int) -> None:
-  """Fallback: create a plain swapfile when no suitable device is found."""
-  logging.info('[swap_encryption] Creating plain %dGB swapfile', size_gb)
+  """Fallback: create a loop-device-backed swapfile.
+
+  A plain file on overlayfs (the container root) cannot be used as swap —
+  the kernel rejects it with EINVAL.  Routing it through a loop device
+  presents a proper block device to the mm subsystem and succeeds.
+  """
+  logging.info('[swap_encryption] Creating %dGB loop-device swap', size_gb)
   _PodExec(pod, textwrap.dedent(f"""
-    fallocate -l {size_gb}G /swapfile && \\
-    chmod 600 /swapfile && \\
-    mkswap /swapfile && \\
-    swapon /swapfile
+    fallocate -l {size_gb}G /tmp/pkb_swapfile && \\
+    chmod 600 /tmp/pkb_swapfile && \\
+    LOOP=$(losetup -f) && \\
+    losetup "$LOOP" /tmp/pkb_swapfile && \\
+    mkswap "$LOOP" && \\
+    swapon "$LOOP" && \\
+    echo "swap loop device: $LOOP"
   """))
 
 
