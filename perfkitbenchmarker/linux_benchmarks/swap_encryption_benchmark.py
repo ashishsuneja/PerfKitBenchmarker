@@ -60,6 +60,7 @@ containerd cgroup hierarchy, etc.).
     Bulk-index + search query under swap pressure (esrally or curl).
 """
 
+import base64
 import json
 import logging
 import re
@@ -696,58 +697,62 @@ def _SetupGKEHyperdiskSwap(pod: str) -> None:
 
 
 def _SetupGKELoopDeviceSwap(pod: str) -> None:
-  """dm-crypt swap over a loop device backed by a file on the hyperdisk.
+  """dm-crypt swap via a loop device, executed in the HOST mount namespace.
 
-  Used when no dedicated data disk is attached (single-disk GKE node).
-  dm-crypt is still exercised and all I/O ultimately lands on the
-  hyperdisk-balanced boot volume, so the measurement is representative of
-  GKE's encryption overhead on that storage tier.
+  Root cause of the cryptsetup hang: when the loop device's backing file
+  lives on the container's overlayfs layer, the kernel dm-crypt probe stalls
+  trying to read device geometry through the overlayfs→loop chain.
 
-  Steps are intentionally separated into individual _PodExec calls so that:
-  - Each step has its own PKB IssueCommand timeout budget.
-  - Progress is visible in logs (easier to spot which step is slow).
+  Fix: run the entire setup script inside the host mount namespace using
+    nsenter --mount --target 1
+  The host's root filesystem IS the hyperdisk-balanced volume (no overlayfs),
+  so all block operations complete normally.  The privileged pod with
+  hostPID: true makes PID 1 visible and nsenter work.
 
-  Uses truncate -s (sparse file) instead of fallocate so the backing file is
-  created instantly without any disk writes.  fallocate inside an overlayfs
-  container layer triggers synchronous block pre-allocation on the underlying
-  hyperdisk which can exceed PKB's 300 s IssueCommand timeout.
+  The setup script is base64-encoded before being written to the pod so that
+  no shell-quoting issues occur passing it through kubectl exec → bash -c.
   """
   size_gb = _SWAP_SIZE_GB.value
-  backing   = '/var/pkb_swap_backing'
-  logging.info('[swap_encryption] GKE: creating %d GB sparse backing file', size_gb)
+  backing  = '/var/pkb_swap_backing'
 
-  # Step 1 – create sparse backing file (instant – no disk writes)
-  _PodExec(pod, f'truncate -s {size_gb}G {backing}')
-  logging.info('[swap_encryption] GKE: backing file created')
+  script = '\n'.join([
+      '#!/bin/bash',
+      'set -euo pipefail',
+      f'truncate -s {size_gb}G {backing}',
+      'LOOP=$(losetup -f)',
+      f'losetup "$LOOP" {backing}',
+      # --batch-mode suppresses any interactive confirmation prompts
+      'dd if=/dev/urandom bs=32 count=1 2>/dev/null |'
+      ' cryptsetup open --type plain'
+      ' --cipher aes-xts-plain64 --key-size 256'
+      ' --batch-mode --key-file=- "$LOOP" swap_encrypted',
+      'mkswap /dev/mapper/swap_encrypted',
+      'swapon /dev/mapper/swap_encrypted',
+      'echo "SWAP_ACTIVE:$LOOP"',
+  ])
 
-  # Step 2 – attach loop device and report the device name
-  loop_out, _ = _PodExec(pod, textwrap.dedent(f"""
-    LOOP=$(losetup -f) && \\
-    losetup "$LOOP" {backing} && \\
-    echo "$LOOP"
-  """))
-  loop_dev = loop_out.strip()
-  if not loop_dev or not loop_dev.startswith('/dev/loop'):
+  # Write script via base64 to avoid multi-level quoting through kubectl exec
+  b64 = base64.b64encode(script.encode()).decode()
+  _PodExec(pod,
+           f'echo {b64} | base64 -d > /tmp/pkb_swap_setup.sh'
+           ' && chmod +x /tmp/pkb_swap_setup.sh')
+  logging.info('[swap_encryption] GKE: running dm-crypt setup in host mount namespace')
+
+  # Execute in host mount namespace – should complete in < 10 s
+  out, _ = _PodExec(
+      pod,
+      'nsenter --mount --target 1 -- bash /tmp/pkb_swap_setup.sh 2>&1',
+      timeout=120,
+  )
+  logging.info('[swap_encryption] GKE: setup output: %s', out.strip())
+
+  if 'SWAP_ACTIVE' not in out:
     raise RuntimeError(
-        f'[swap_encryption] losetup failed – unexpected output: {loop_out!r}'
+        '[swap_encryption] dm-crypt loop-device swap setup failed.\n'
+        f'Script output:\n{out}'
     )
-  logging.info('[swap_encryption] GKE: loop device: %s', loop_dev)
-
-  # Step 3 – open dm-crypt (plain mode, ephemeral key)
-  _PodExec(pod, textwrap.dedent(f"""
-    dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
-    cryptsetup open --type plain \\
-      --cipher aes-xts-plain64 \\
-      --key-size 256 \\
-      --key-file=- \\
-      {loop_dev} swap_encrypted
-  """))
-  logging.info('[swap_encryption] GKE: dm-crypt opened on %s', loop_dev)
-
-  # Step 4 – format and activate swap
-  _PodExec(pod, 'mkswap /dev/mapper/swap_encrypted')
-  _PodExec(pod, 'swapon /dev/mapper/swap_encrypted')
-  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap active')
+  loop_dev = out.strip().split('SWAP_ACTIVE:')[-1].split()[0]
+  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap active on %s', loop_dev)
 
 
 def _SetupGKELSSDSwap(pod: str) -> None:
