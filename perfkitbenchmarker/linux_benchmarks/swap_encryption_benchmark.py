@@ -70,6 +70,7 @@ from typing import Any
 
 from absl import flags
 from perfkitbenchmarker import configs
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.resources.container_service import kubectl
@@ -411,11 +412,18 @@ def Cleanup(spec) -> None:
   """Remove the DaemonSet and tear down any swap configuration."""
   pod = _WaitForBenchmarkPod(timeout=30)
   if pod:
-    _PodExec(pod, 'swapoff -a || true', ignore_failure=True)
-    _PodExec(pod,
-             'cryptsetup close swap_encrypted 2>/dev/null || true',
+    _PodExec(pod, 'swapoff -a 2>/dev/null || true', ignore_failure=True)
+    # NOTE: do NOT call dmsetup/cryptsetup close here – those commands hang
+    # indefinitely on GKE COS nodes.  Loop device cleanup is sufficient.
+    _PodExec(pod, textwrap.dedent("""
+      for backing in /var/pkb_swap_backing /run/pkb_swap_backing; do
+        losetup -j "$backing" 2>/dev/null | awk -F: '{print $1}' | \\
+          while read dev; do losetup -d "$dev" 2>/dev/null || true; done
+        rm -f "$backing"
+      done
+    """), ignore_failure=True)
+    _PodExec(pod, 'pkill -f "stress-ng|fio" 2>/dev/null || true',
              ignore_failure=True)
-    _PodExec(pod, 'pkill stress-ng fio || true', ignore_failure=True)
 
   _DeleteDaemonSet()
 
@@ -697,62 +705,61 @@ def _SetupGKEHyperdiskSwap(pod: str) -> None:
 
 
 def _SetupGKELoopDeviceSwap(pod: str) -> None:
-  """dm-crypt swap via a loop device, executed in the HOST mount namespace.
+  """Plain loop-device swap for single-disk GKE nodes (no dm-crypt).
 
-  Root cause of the cryptsetup hang: when the loop device's backing file
-  lives on the container's overlayfs layer, the kernel dm-crypt probe stalls
-  trying to read device geometry through the overlayfs→loop chain.
+  On GKE Container-Optimised OS nodes the device-mapper kernel subsystem
+  is locked: any dmsetup or cryptsetup call blocks indefinitely, even
+  from a privileged pod.  nsenter is similarly blocked.  Only the loop
+  driver is available from container-space.
 
-  Fix: run the entire setup script inside the host mount namespace using
-    nsenter --mount --target 1
-  The host's root filesystem IS the hyperdisk-balanced volume (no overlayfs),
-  so all block operations complete normally.  The privileged pod with
-  hostPID: true makes PID 1 visible and nsenter work.
+  Therefore this path intentionally skips all DM/dm-crypt operations and
+  uses a plain loop device directly as swap.  Results are tagged with
+  swap_encryption=loop_plain so they are not confused with dm-crypt runs.
 
-  The setup script is base64-encoded before being written to the pod so that
-  no shell-quoting issues occur passing it through kubectl exec → bash -c.
+  For proper dm-crypt measurement attach a dedicated hyperdisk to the GKE
+  node (via the GKE console → node pool → additional disks) so
+  _SetupGKEHyperdiskSwap can use /dev/sdb directly, bypassing this path.
   """
   size_gb = _SWAP_SIZE_GB.value
   backing  = '/var/pkb_swap_backing'
 
-  script = '\n'.join([
-      '#!/bin/bash',
-      'set -euo pipefail',
-      f'truncate -s {size_gb}G {backing}',
-      'LOOP=$(losetup -f)',
-      f'losetup "$LOOP" {backing}',
-      # --batch-mode suppresses any interactive confirmation prompts
-      'dd if=/dev/urandom bs=32 count=1 2>/dev/null |'
-      ' cryptsetup open --type plain'
-      ' --cipher aes-xts-plain64 --key-size 256'
-      ' --batch-mode --key-file=- "$LOOP" swap_encrypted',
-      'mkswap /dev/mapper/swap_encrypted',
-      'swapon /dev/mapper/swap_encrypted',
-      'echo "SWAP_ACTIVE:$LOOP"',
-  ])
+  # ── Step 0: detach any stale loop device from a previous failed run ───────
+  # NOTE: do NOT call dmsetup here — it hangs indefinitely on this node type.
+  _PodExec(pod, textwrap.dedent(f"""
+    losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | \\
+      while read dev; do
+        swapoff "$dev" 2>/dev/null || true
+        losetup -d "$dev" 2>/dev/null || true
+      done
+    rm -f {backing}
+  """), ignore_failure=True)
 
-  # Write script via base64 to avoid multi-level quoting through kubectl exec
-  b64 = base64.b64encode(script.encode()).decode()
-  _PodExec(pod,
-           f'echo {b64} | base64 -d > /tmp/pkb_swap_setup.sh'
-           ' && chmod +x /tmp/pkb_swap_setup.sh')
-  logging.info('[swap_encryption] GKE: running dm-crypt setup in host mount namespace')
+  # ── Step 1: sparse backing file ───────────────────────────────────────────
+  logging.info('[swap_encryption] GKE: creating %dG sparse backing file', size_gb)
+  _PodExec(pod, f'truncate -s {size_gb}G {backing}')
 
-  # Execute in host mount namespace – should complete in < 10 s
-  out, _ = _PodExec(
-      pod,
-      'nsenter --mount --target 1 -- bash /tmp/pkb_swap_setup.sh 2>&1',
-      timeout=120,
-  )
-  logging.info('[swap_encryption] GKE: setup output: %s', out.strip())
-
-  if 'SWAP_ACTIVE' not in out:
+  # ── Step 2: loop device ───────────────────────────────────────────────────
+  loop_out, _ = _PodExec(pod, textwrap.dedent(f"""
+    LOOP=$(losetup -f) && \\
+    losetup "$LOOP" {backing} && \\
+    echo "$LOOP"
+  """))
+  loop_dev = loop_out.strip()
+  if not loop_dev.startswith('/dev/loop'):
     raise RuntimeError(
-        '[swap_encryption] dm-crypt loop-device swap setup failed.\n'
-        f'Script output:\n{out}'
+        f'[swap_encryption] losetup failed – output: {loop_out!r}'
     )
-  loop_dev = out.strip().split('SWAP_ACTIVE:')[-1].split()[0]
-  logging.info('[swap_encryption] GKE: dm-crypt loop-device swap active on %s', loop_dev)
+  logging.info('[swap_encryption] GKE: loop device: %s', loop_dev)
+
+  # ── Step 3: mkswap + swapon (plain, no dm-crypt) ──────────────────────────
+  _PodExec(pod, f'mkswap {loop_dev}')
+  _PodExec(pod, f'swapon {loop_dev}')
+  logging.warning(
+      '[swap_encryption] GKE: plain loop-device swap active on %s '
+      '(swap_encryption=loop_plain – dm-crypt unavailable on this node). '
+      'Attach a dedicated disk via GKE node-pool settings for dm-crypt runs.',
+      loop_dev,
+  )
 
 
 def _SetupGKELSSDSwap(pod: str) -> None:
@@ -955,13 +962,35 @@ def _EnableZswap(pod: str) -> None:
 def _Phase1_Fio(
     pod: str, swap_dev: str, base_meta: dict
 ) -> list[sample.Sample]:
-  """Run fio directly on the swap block device for raw I/O characterisation."""
+  """Run fio directly on the swap block device for raw I/O characterisation.
+
+  Skipped for loop devices (GKE fallback path): the backing file lives on
+  overlayfs which does not support O_DIRECT, and raw fio writes leave both
+  the loop device and the overlayfs backing file in a stalled I/O state,
+  hanging all subsequent losetup / mkswap calls.  Loop-on-overlayfs also
+  produces results that reflect the container filesystem stack rather than
+  the underlying storage medium, making the numbers misleading.
+
+  For real block devices (hyperdisk, LSSD, NVMe) direct I/O is used and
+  swap is restored (mkswap + swapon) after the fio run.
+  """
+  if swap_dev.startswith('/dev/loop'):
+    logging.warning(
+        '[swap_encryption] Phase 1 (fio) SKIPPED for loop device %s. '
+        'overlayfs-backed loop devices cannot support reliable raw block I/O '
+        'benchmarking — fio corrupts the overlayfs state and hangs subsequent '
+        'I/O.  Attach a dedicated disk via the GKE node-pool settings '
+        '(--disk-type=pd-ssd or local NVMe) for accurate fio results.',
+        swap_dev,
+    )
+    return []
+
   results = []
 
   _PodExec(pod, f'swapoff {swap_dev}', ignore_failure=True)
 
   # Pre-fill device so read tests have real data.
-  # Timeout = swap_size_gb / ~200 MB/s (conservative hyperdisk write rate) + buffer.
+  # Timeout = swap_size_gb / ~200 MB/s (conservative write rate) + buffer.
   prefill_timeout = max(600, _SWAP_SIZE_GB.value * 10)
   logging.info('[swap_encryption] Pre-filling swap device: %s', swap_dev)
   _PodExec(pod, (
@@ -984,7 +1013,10 @@ def _Phase1_Fio(
     out, _ = _PodExec(pod, cmd, timeout=fio_timeout)
     results += _ParseFioJson(out, name, label, base_meta)
 
-  _PodExec(pod, f'swapon {swap_dev}', ignore_failure=True)
+  # fio prefill overwrites the entire device, destroying the mkswap header.
+  # Re-stamp and re-enable before the remaining phases need active swap.
+  _PodExec(pod, f'mkswap {swap_dev} && swapon {swap_dev}',
+           ignore_failure=True, timeout=120)
   return results
 
 
@@ -1196,10 +1228,11 @@ def _Phase2b_IoInterference(pod: str, base_meta: dict) -> list[sample.Sample]:
   meta     = dict(base_meta, phase='io_interference')
 
   # Create test file on the container filesystem (tmpfs or overlay)
+  # Give generous timeout for large file creation
   _PodExec(pod, (
       f'fio --name=create --filename={app_file} '
       f'--rw=write --bs=1m --size=8G --verify=0'
-  ))
+  ), timeout=600)
 
   def _run_app_fio(pressure_label: str) -> list[sample.Sample]:
     cmd = (
@@ -1219,17 +1252,22 @@ def _Phase2b_IoInterference(pod: str, base_meta: dict) -> list[sample.Sample]:
   results += _run_app_fio('no_pressure')
 
   # 2. Under swap pressure
+  # Use nohup + disown so bash exits immediately after launching stress-ng;
+  # otherwise kubectl exec keeps the session alive until stress-ng finishes
+  # (300 s) and PKB's IssueCommand times out.
   logging.info('[swap_encryption] I/O interference: under swap pressure')
   _PodExec(pod, (
-      f'stress-ng --vm 1 '
+      f'nohup stress-ng --vm 1 '
       f'--vm-bytes {_STRESS_VM_BYTES.value} '
       f'--vm-method all '
-      f'--timeout {timeout}s &'
-  ))
+      f'--timeout {timeout}s '
+      f'>/tmp/pkb_stress_io.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
+  ), timeout=30)
   time.sleep(10)  # let swap pressure build
   results += _run_app_fio('with_swap_pressure')
 
-  _PodExec(pod, f'sleep {timeout}', ignore_failure=True)
+  # Wait for stress-ng to finish naturally (it auto-exits after --timeout)
+  _PodExec(pod, f'sleep {timeout}', ignore_failure=True, timeout=timeout + 30)
   return results
 
 
@@ -1256,13 +1294,14 @@ def _Phase3a_Redis(pod: str, base_meta: dict) -> list[sample.Sample]:
                n_keys, _REDIS_DATASET_MB.value)
   _PodExec(pod,
            f'redis-benchmark -n {n_keys} -d 128 -t SET -q > /dev/null 2>&1',
-           ignore_failure=True)
+           ignore_failure=True, timeout=600)
 
-  # Apply swap pressure while benchmarking
+  # Apply swap pressure while benchmarking – detach so kubectl exec exits immediately
   _PodExec(pod, (
-      f'stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
-      f'--vm-method all --timeout 120s &'
-  ))
+      f'nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
+      f'--vm-method all --timeout 120s '
+      f'>/tmp/pkb_stress_redis.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
+  ), timeout=30)
   time.sleep(8)
 
   out, _ = _PodExec(
@@ -1310,9 +1349,11 @@ def _Phase3b_KernelBuild(pod: str, base_meta: dict) -> list[sample.Sample]:
               f'v{ver.split(".")[0]}.x/linux-{ver}.tar.xz')
 
   _PodExec(pod, f'mkdir -p {root}')
-  _PodExec(pod, f'test -f {tarball} || wget -q -O {tarball} {url}')
-  _PodExec(pod, f'test -d {src}    || tar -xf {tarball} -C {root}')
-  _PodExec(pod, f'make -C {src} defconfig -j$(nproc) 2>&1')
+  _PodExec(pod, f'test -f {tarball} || wget -q --timeout=120 -O {tarball} {url}',
+           timeout=600)
+  _PodExec(pod, f'test -d {src}    || tar -xf {tarball} -C {root}',
+           timeout=600)
+  _PodExec(pod, f'make -C {src} defconfig -j$(nproc) 2>&1', timeout=300)
 
   cgroup   = '/sys/fs/cgroup/memory/pkb_kernelbuild'
   mem_bytes = _KERNEL_MEMORY_MB.value * 1024 * 1024
@@ -1363,10 +1404,12 @@ def _Phase3c_OpenSearch(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Index + query workload under swap pressure (esrally or curl fallback)."""
   meta = dict(base_meta, workload='opensearch')
 
+  # Detach stress-ng so kubectl exec exits immediately; see Phase 2b comment
   _PodExec(pod, (
-      f'stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
-      f'--vm-method all --timeout {_STRESS_TIMEOUT_SEC.value}s &'
-  ))
+      f'nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
+      f'--vm-method all --timeout {_STRESS_TIMEOUT_SEC.value}s '
+      f'>/tmp/pkb_stress_opensearch.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
+  ), timeout=30)
   time.sleep(10)
 
   esrally_out, _ = _PodExec(pod, 'which esrally 2>/dev/null', ignore_failure=True)
