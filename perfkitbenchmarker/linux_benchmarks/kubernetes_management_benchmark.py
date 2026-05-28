@@ -492,10 +492,7 @@ def _RunScenarioB(
     samples += _OpSamples(entry.name, [entry], attempted_ops=1)
 
   # Remove test pool (best-effort).
-  try:
-    cluster.DeleteNodePool(_SCENARIO_B_NAME)
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Scenario B: failed to delete test pool')
+  cluster.DeleteNodePool(_SCENARIO_B_NAME)
   return samples
 
 
@@ -554,9 +551,9 @@ def _RunScenarioC(
       scale - len(alive),
   )
   if not alive:
-    logging.warning(
-        'Scenario C scale=%d: 0 live pools — all timed-out creates were'
-        + ' rolled back. Recording 0%% delete success rate.', scale)
+    logging.info(
+        'Scenario C scale=%d: 0 live pools — all creates rolled back.'
+        ' Recording 0%% delete success rate.', scale)
     samples += _OpSamples('ScenarioC_Delete', [], attempted_ops=scale)
     return samples
 
