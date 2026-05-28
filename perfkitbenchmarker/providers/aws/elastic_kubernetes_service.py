@@ -27,6 +27,7 @@ import logging
 import math
 import re
 import threading
+import time
 from typing import Any
 from urllib import parse
 
@@ -1056,12 +1057,9 @@ class EksCluster(BaseEksCluster):
         'nodeRole': self._DiscoverNodeRoleArn(),
         'labels': {'pkb_nodepool': nodepool_config.name},
         'tags': util.MakeDefaultTags(),
-        # Target open capacity reservations first before falling back to
-        # regular on-demand. Ensures EC2 capacity reservations created
-        # before the benchmark are actually used by EKS nodegroups.
-        'capacityReservationSpecification': {
-            'capacityReservationPreference': 'open',
-        },
+        # Note: capacity reservation targeting is handled via the launch
+        # template (capacityReservationPreference in LT) — not in payload
+        # since older AWS CLI versions reject capacityReservationSpecification.
     }
     _az = assigned_az if az_subnets and len(az_subnets) > 1 else f'{self.region}a'
     # Only look up launch templates and capacity reservations when
