@@ -655,24 +655,22 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         'ConflictingOperationInProgress',
         'MaxAgentPoolCountReached',
     )
-    _MAX_RETRIES = 5
-    _RETRY_SLEEP_S = 30
-    for attempt in range(_MAX_RETRIES + 1):
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.RetryableCreationError,),
+        max_retries=5,
+        sleep_interval=30,
+        log_errors=True,
+    )
+    def _IssueWithRetry():
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=600, raise_on_failure=False
       )
-      if not retcode:
-        break
-      if attempt < _MAX_RETRIES and any(e in stderr for e in _RETRYABLE):
-        logging.warning(
-            '[AKS] CreateNodePoolAsync %s: retryable error (attempt %d/%d),'
-            ' sleeping %ds: %s',
-            _AzureNodePoolName(nodepool_config.name),
-            attempt + 1, _MAX_RETRIES, _RETRY_SLEEP_S, stderr[:120],
-        )
-        time.sleep(_RETRY_SLEEP_S)
-        continue
-      raise errors.Resource.CreationError(stderr)
+      if retcode:
+        if any(e in stderr for e in _RETRYABLE):
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+
+    _IssueWithRetry()
     return f'np_succeeded:{_AzureNodePoolName(nodepool_config.name)}'
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
@@ -769,9 +767,9 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
             )
             return 'cluster_succeeded'
       except (ValueError, KeyError, json.JSONDecodeError) as e:
-        logging.warning('[AKS] UpdateClusterAsync: pool parse error: %s', e)
+        logging.info('[AKS] UpdateClusterAsync: pool parse error: %s', e)
     # Fallback: tag update
-    logging.warning('[AKS] UpdateClusterAsync: falling back to tag update')
+    logging.info('[AKS] UpdateClusterAsync: falling back to tag update')
     cmd = [
         azure.AZURE_PATH, 'aks', 'update',
         '--name', self.name,
