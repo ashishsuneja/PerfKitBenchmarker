@@ -210,19 +210,11 @@ def Prepare(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
 
 def _CleanStartSweep(cluster: kubernetes_cluster.KubernetesCluster) -> None:
   """Deletes any stale pkbm* node pools so each run starts clean (spec C.2)."""
-  try:
-    stale = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('CleanStart: failed to list node pools')
-    return
+  stale = [n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)]
   if not stale:
-    logging.info(
-        'CleanStart: no stale pools found — clean start confirmed.')
+    logging.info('CleanStart: no stale pools found — clean start confirmed.')
     return
-  logging.warning('CleanStart: deleting %d stale pools: %s', len(stale),
-                  stale)
+  logging.info('CleanStart: deleting %d stale pools: %s', len(stale), stale)
   background_tasks.RunThreaded(cluster.DeleteNodePool, stale)
 
 
@@ -238,14 +230,12 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
   # Google spec: initial=N-1, target=N (adjacent minor upgrade).
   flag_initial = _INITIAL_VERSION.value
   flag_target = _TARGET_VERSION.value
-  if flag_initial and flag_target:
-    initial, target = flag_initial, flag_target
-    source = 'flags'
-  else:
+  if not (flag_initial and flag_target):
     resolved_initial, resolved_target = cluster.ResolveNodePoolVersions()
-    initial = flag_initial or resolved_initial
-    target = flag_target or resolved_target
-    source = 'auto-resolved' if not (flag_initial or flag_target) else 'mixed'
+    flag_initial = flag_initial or resolved_initial
+    flag_target = flag_target or resolved_target
+  initial, target = flag_initial, flag_target
+  source = 'flags' if (_INITIAL_VERSION.value and _TARGET_VERSION.value) else 'auto-resolved'
 
   logging.info(
       'NodePool versions (%s): initial=%s -> target=%s '

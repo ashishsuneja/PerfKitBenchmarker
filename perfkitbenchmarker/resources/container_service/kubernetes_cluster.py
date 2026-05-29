@@ -321,32 +321,36 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
       nodepool_config: container_lib.BaseNodePoolConfig,
       node_version: str | None = None,
   ) -> None:
-    """Creates a single named node pool on the cluster (blocks until ready).
+    """Creates a node pool and blocks until ready (sync wrapper).
 
     Args:
       nodepool_config: Node pool definition (name, machine type, node count).
       node_version: Optional Kubernetes version to pin the node pool to. None
         means use the cluster default.
     """
-    raise NotImplementedError
+    op = self.CreateNodePoolAsync(nodepool_config, node_version)
+    self.WaitForOperation(op)
 
   def DeleteNodePool(self, name: str) -> None:
-    """Deletes the named node pool (blocks until removed)."""
-    raise NotImplementedError
+    """Deletes the named node pool and blocks until removed (sync wrapper)."""
+    op = self.DeleteNodePoolAsync(name)
+    self.WaitForOperation(op)
 
   def UpgradeNodePool(self, name: str, target_version: str) -> None:
-    """Upgrades the named node pool to the given Kubernetes version."""
-    raise NotImplementedError
+    """Upgrades the named node pool and blocks until done (sync wrapper)."""
+    op = self.UpgradeNodePoolAsync(name, target_version)
+    self.WaitForOperation(op)
 
   def UpdateCluster(self) -> None:
-    """Performs a lightweight cluster-level update operation (blocks).
+    """Performs a cluster-level update and blocks until done (sync wrapper).
 
     Intended for management-plane benchmarks that need to overlap a real
     cluster-level operation with a node-pool operation. The implementation
     should issue a control-plane mutation (so an actual operation runs) that
     is non-destructive and idempotent across repeated invocations.
     """
-    raise NotImplementedError
+    op = self.UpdateClusterAsync()
+    self.WaitForOperation(op)
 
   def CreateNodePoolAsync(
       self,

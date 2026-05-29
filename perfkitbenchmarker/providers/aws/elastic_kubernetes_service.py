@@ -27,6 +27,7 @@ import logging
 import math
 import re
 import threading
+import time
 from typing import Any
 from urllib import parse
 
@@ -235,10 +236,7 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
     # Clean up SSH key pair — safety net in case _DeleteDependencies didn't run
-    try:
-      aws_virtual_machine.AwsKeyFileManager.DeleteKeyfile(self.region)
-    except Exception:  # pylint: disable=broad-except
-      pass
+    aws_virtual_machine.AwsKeyFileManager.DeleteKeyfile(self.region)
     # Clean up dynamically created launch templates and capacity reservations
     # Only runs if capacity reservations were actually created this run.
     if getattr(FLAGS, 'eks_reserve_capacity_per_az', False):
@@ -398,14 +396,11 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     ]
     stdout, stderr, retcode = vm_util.IssueCommand(cmd)
     if retcode:
-      logging.warning('Failed to get nodegroups: %s, error: %s', stdout, stderr)
-      return []
+      raise errors.Resource.GetError(
+          f'Failed to get nodegroups: {stdout}, error: {stderr}'
+      )
     nodegroups = json.loads(stdout)
     return [ng['Name'] for ng in nodegroups]
-
-  def AddNodepool(self, batch_name, pool_id):
-    pass
-
 
 class EksCluster(BaseEksCluster):
   """Class representing an Elastic Kubernetes Service cluster."""
@@ -481,7 +476,7 @@ class EksCluster(BaseEksCluster):
             if self.control_plane_zones
             else [f'{self.region}a', f'{self.region}b', f'{self.region}c']
         )
-    except Exception:  # pylint: disable=broad-except
+    except errors.VmUtil.IssueCommandError:
       cluster_azs = (
           self.control_plane_zones
           if self.control_plane_zones
@@ -1056,12 +1051,9 @@ class EksCluster(BaseEksCluster):
         'nodeRole': self._DiscoverNodeRoleArn(),
         'labels': {'pkb_nodepool': nodepool_config.name},
         'tags': util.MakeDefaultTags(),
-        # Target open capacity reservations first before falling back to
-        # regular on-demand. Ensures EC2 capacity reservations created
-        # before the benchmark are actually used by EKS nodegroups.
-        'capacityReservationSpecification': {
-            'capacityReservationPreference': 'open',
-        },
+        # Note: capacity reservation targeting is handled via the launch
+        # template (capacityReservationPreference in LT) — not in payload
+        # since older AWS CLI versions reject capacityReservationSpecification.
     }
     _az = assigned_az if az_subnets and len(az_subnets) > 1 else f'{self.region}a'
     # Only look up launch templates and capacity reservations when
@@ -1111,28 +1103,24 @@ class EksCluster(BaseEksCluster):
         f'file://{filename}',
     ]
     # Retry on EC2 RunInstances throttling at high concurrency (99 pools).
-    max_retries = 5
-    base_delay = 10
-    for attempt in range(max_retries):
+    # vm_util.Retry handles exponential backoff automatically.
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.CreationError,),
+        max_retries=5,
+        exponential_sleep_multiplier=2,
+        sleep_interval=10,
+        log_errors=True,
+    )
+    def _IssueWithRetry():
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=300, raise_on_failure=False
       )
-      if retcode == 0:
-        break
-      if 'Request limit exceeded' in stderr or 'ThrottlingException' in stderr:
-        if attempt < max_retries - 1:
-          delay = base_delay * (2 ** attempt)
-          logging.warning(
-              '[EKS] CreateNodegroup %s throttled — retry %d/%d in %ds',
-              nodepool_config.name, attempt + 1, max_retries, delay,
-          )
-          time.sleep(delay)
-          continue
-      raise errors.Resource.CreationError(stderr)
-    else:
-      raise errors.Resource.CreationError(
-          f'CreateNodegroup {nodepool_config.name} failed after retries: {stderr}'
-      )
+      if retcode:
+        if 'Request limit exceeded' in stderr or 'ThrottlingException' in stderr:
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+
+    _IssueWithRetry()
     return f'ng_active:{nodepool_config.name}'
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
@@ -1268,24 +1256,25 @@ class EksCluster(BaseEksCluster):
         break
       logging.info('[EKS] Cluster status=%s — waiting 5s...', status_out.strip())
       time.sleep(5)
-    # Retry on ResourceInUseException race condition
-    upd_max_retries = 10
-    upd_base_delay = 30
-    for upd_attempt in range(upd_max_retries):
+    # Retry on ResourceInUseException — EKS may start a background operation
+    # between our ACTIVE check and this API call causing a race condition.
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.RetryableCreationError,),
+        max_retries=10,
+        sleep_interval=30,
+        log_errors=True,
+    )
+    def _UpdateWithRetry():
       stdout, stderr, retcode = vm_util.IssueCommand(
           upd, timeout=300, raise_on_failure=False
       )
-      if retcode == 0:
-        break
-      if 'ResourceInUseException' in stderr and upd_attempt < upd_max_retries - 1:
-        delay = upd_base_delay * (upd_attempt + 1)
-        logging.warning(
-            '[EKS] UpdateClusterConfig ResourceInUseException — retry %d/%d in %ds',
-            upd_attempt + 1, upd_max_retries, delay,
-        )
-        time.sleep(delay)
-        continue
-      raise errors.Resource.CreationError(stderr)
+      if retcode:
+        if 'ResourceInUseException' in stderr:
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+      return stdout
+
+    stdout = _UpdateWithRetry()
     update_id = json.loads(stdout)['update']['id']
     return f'cluster_update:{update_id}'
 
@@ -1528,10 +1517,7 @@ class EksAutoCluster(BaseEksCluster):
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
     # Clean up SSH key pair — safety net in case _DeleteDependencies didn't run
-    try:
-      aws_virtual_machine.AwsKeyFileManager.DeleteKeyfile(self.region)
-    except Exception:  # pylint: disable=broad-except
-      pass
+    aws_virtual_machine.AwsKeyFileManager.DeleteKeyfile(self.region)
     # Clean up dynamically created launch templates and capacity reservations
     # Only runs if capacity reservations were actually created this run.
     if getattr(FLAGS, 'eks_reserve_capacity_per_az', False):
