@@ -88,21 +88,24 @@ BENCHMARK_CONFIG = """
 swap_encryption:
   description: >
     GKE vs. EKS swap encryption and LSSD performance comparison.
-    Provisions a Kubernetes cluster, deploys a privileged DaemonSet,
-    and runs fio microbenchmarks, stress-ng CPU overhead, I/O
-    interference, and real-world workloads (Redis, kernel build,
-    OpenSearch) on the cluster node.
+    Two-step nodepool setup: PKB provisions a minimal cluster with a cheap
+    default nodepool (Step 1), then Prepare() adds the real benchmark
+    nodepool (n4-highmem-32 / c4-*-lssd, COS_CONTAINERD, 80k IOPS) with a
+    node-level startup script that configures dm-crypt swap before any pod
+    is scheduled, then removes the default nodepool (Step 2).  All benchmark
+    phases run inside a privileged DaemonSet pinned to the benchmark nodepool.
   container_cluster:
     type: Kubernetes
     vm_count: 1
     vm_spec:
       GCP:
-        machine_type: n4-highmem-32
-        boot_disk_size: 100
-        boot_disk_type: hyperdisk-balanced
+        # Cheap placeholder — the benchmark nodepool is created in Prepare().
+        machine_type: e2-medium
+        boot_disk_size: 20
       AWS:
-        machine_type: i4i.4xlarge
-        boot_disk_size: 100
+        # Cheap placeholder — the benchmark nodegroup is added in Prepare().
+        machine_type: t3.medium
+        boot_disk_size: 20
 """
 
 # ---------------------------------------------------------------------------
@@ -210,12 +213,60 @@ _COLLECT_COST = flags.DEFINE_boolean(
 )
 
 # ---------------------------------------------------------------------------
+# New flags — benchmark nodepool, COS image, encryption toggle, IOPS
+# ---------------------------------------------------------------------------
+
+_BENCHMARK_MACHINE_TYPE = flags.DEFINE_string(
+    'swap_encryption_benchmark_machine_type',
+    'n4-highmem-32',
+    'Machine type for the benchmark nodepool created in Prepare(). '
+    'Use n4-highmem-32 (hyperdisk, default) or c4-standard-8-lssd '
+    '(LSSD RAID-0).  The matching swap setup is selected automatically.',
+)
+_BENCHMARK_LSSD = flags.DEFINE_boolean(
+    'swap_encryption_lssd',
+    False,
+    'Force LSSD RAID-0 swap path even when the machine type name does not '
+    'contain "lssd".  Auto-detected from machine type when False.',
+)
+_ENABLE_DMCRYPT = flags.DEFINE_boolean(
+    'swap_encryption_enable_dmcrypt',
+    True,
+    'When True (default), configure dm-crypt on the swap device — the '
+    '"encryption enabled" column of the test matrix.  Set False to use '
+    'plain swap (encryption disabled column).',
+)
+_NODE_IMAGE_TYPE = flags.DEFINE_string(
+    'swap_encryption_node_image_type',
+    'COS_CONTAINERD',
+    'GKE node image type for the benchmark nodepool.  COS_CONTAINERD '
+    '(default) matches typical customer clusters.  AL2 on EKS.',
+)
+_BOOT_DISK_IOPS = flags.DEFINE_integer(
+    'swap_encryption_boot_disk_iops',
+    80000,
+    'Provisioned IOPS for the hyperdisk-balanced boot disk on the '
+    'benchmark nodepool.  80 000 is the COS max-IOPS target from the '
+    'discussion with the team.',
+)
+_BOOT_DISK_SIZE_GB = flags.DEFINE_integer(
+    'swap_encryption_boot_disk_size_gb',
+    500,
+    'Boot disk size in GiB for the benchmark nodepool.  500 GiB is '
+    'required for the n4-highmem-32 + hyperdisk-balanced Config 2 run '
+    '(see Engineer Assignments table in execution-plan.md).  '
+    'For LSSD configs the boot disk is smaller; 100 GiB is fine.',
+)
+
+# ---------------------------------------------------------------------------
 # Internal constants
 # ---------------------------------------------------------------------------
 
-_DS_NAME      = 'pkb-swap-benchmark'
-_DS_NAMESPACE = 'default'
-_DS_LABEL     = 'pkb-swap-benchmark'
+_DS_NAME           = 'pkb-swap-benchmark'
+_DS_NAMESPACE      = 'default'
+_DS_LABEL          = 'pkb-swap-benchmark'
+_BENCHMARK_NODEPOOL = 'benchmark'   # name of the nodepool created in Prepare()
+_DEFAULT_NODEPOOL   = 'default-pool'  # GKE default nodepool name to delete
 
 # fio jobs: (name, rw_mode, blocksize, iodepth, description)
 _FIO_JOBS = [
@@ -237,7 +288,13 @@ _CRYPTO_PROCS = ('kswapd', 'kworker', 'kcryptd', 'dmcrypt_write')
 # ---------------------------------------------------------------------------
 
 def _DaemonSetYaml(image: str) -> str:
-  """Return the privileged benchmark DaemonSet manifest as a YAML string."""
+  """Return the privileged benchmark DaemonSet manifest as a YAML string.
+
+  The DaemonSet is pinned to the benchmark nodepool via nodeSelector so it
+  never lands on the cheap dummy default nodepool.  By the time this pod
+  starts, the node startup script has already configured dm-crypt swap at
+  the OS level, so the pod only needs to verify/use that device.
+  """
   return textwrap.dedent(f"""\
     apiVersion: apps/v1
     kind: DaemonSet
@@ -257,6 +314,9 @@ def _DaemonSetYaml(image: str) -> str:
         spec:
           hostPID: true
           hostNetwork: true
+          # Pin to the benchmark nodepool — never schedule on the dummy default pool.
+          nodeSelector:
+            pkb_nodepool: {_BENCHMARK_NODEPOOL}
           tolerations:
           - operator: Exists
           containers:
@@ -277,6 +337,7 @@ def _DaemonSetYaml(image: str) -> str:
                 mdadm \\
                 redis-server \\
                 redis-tools \\
+                memtier-benchmark \\
                 wget \\
                 curl \\
                 make \\
@@ -289,7 +350,10 @@ def _DaemonSetYaml(image: str) -> str:
                 cgroup-tools \\
                 nvme-cli \\
                 util-linux \\
+                python3-pip \\
                 2>&1
+              echo "[pkb] Installing esrally..."
+              pip3 install esrally --quiet --break-system-packages 2>&1 || true
               echo "[pkb] Tools installed. Writing ready sentinel."
               touch /tmp/pkb_ready
               sleep infinity
@@ -340,10 +404,37 @@ def GetConfig(user_config: dict[str, Any]) -> dict[str, Any]:
 
 
 def Prepare(spec) -> None:
-  """Deploy privileged DaemonSet and configure swap on the cluster node."""
+  """Two-step nodepool setup then DaemonSet deployment.
+
+  Step 1 (handled by PKB infrastructure): cluster provisioned with a cheap
+  e2-medium default nodepool.
+
+  Step 2 (this function):
+    a. Create the benchmark nodepool (n4-highmem-32 or c4-*-lssd) with
+       COS_CONTAINERD, 80 000 IOPS, and a node startup script that configures
+       dm-crypt swap at the OS level — before any pod is scheduled.
+    b. Delete the dummy default nodepool to stop its cost immediately.
+    c. Deploy the privileged DaemonSet (pinned via nodeSelector to the
+       benchmark nodepool) and wait for tools to install.
+  """
   cluster = spec.container_cluster
 
-  logging.info('[swap_encryption] Deploying privileged DaemonSet on cluster')
+  # ── Step 2a: add real benchmark nodepool ────────────────────────────────
+  if getattr(cluster, 'project', None):
+    # GCP path: true two-step nodepool setup
+    logging.info('[swap_encryption] Step 2a: creating benchmark nodepool')
+    _CreateBenchmarkNodePool(cluster)
+
+    # ── Step 2b: remove the cheap default nodepool ─────────────────────────
+    logging.info('[swap_encryption] Step 2b: deleting dummy default nodepool')
+    _DeleteDefaultNodePool(cluster)
+  else:
+    # AWS / unknown: nodepool management is done externally; log and continue.
+    logging.info('[swap_encryption] Non-GCP cluster — skipping nodepool '
+                 'create/delete steps; ensure a benchmark node is available.')
+
+  # ── Step 2c: deploy DaemonSet ────────────────────────────────────────────
+  logging.info('[swap_encryption] Step 2c: deploying privileged DaemonSet')
   _DeployDaemonSet()
 
   pod = _WaitForBenchmarkPod()
@@ -373,7 +464,25 @@ def Prepare(spec) -> None:
 
 
 def Run(spec) -> list[sample.Sample]:
-  """Execute all benchmark phases and return collected samples."""
+  """Execute all benchmark phases with gate logic.
+
+  Execution is structured in three gated tiers matching the execution plan:
+
+    Tier 1 (Gate 1) — fio microbenchmarks
+      Raw I/O ceiling of the swap device.  Gate 1 fails if fio produces
+      zero samples (device not found, O_DIRECT error, etc.).
+
+    Tier 2 (Gate 2) — stress-ng CPU overhead + I/O interference
+      Requires an active swap device (Gate 1 must pass).  Gate 2 fails if
+      stress-ng does not complete within timeout.
+
+    Tier 3 (Gate 3) — real-world workloads (Redis, kernel build, OpenSearch)
+      Independent of Tier 2 results; always attempted if Gate 1 passed.
+      Individual workload failures are logged but do not abort the others.
+
+  If Gate 1 fails, Tiers 2 and 3 are skipped — there is no point measuring
+  application-level swap performance when the raw device is inaccessible.
+  """
   pod = _WaitForBenchmarkPod()
   swap_dev = _DetectSwapDevice(pod)
   base_meta = _BuildMetadata(pod, swap_dev)
@@ -382,25 +491,50 @@ def Run(spec) -> list[sample.Sample]:
 
   logging.info('[swap_encryption] swap device: %s', swap_dev)
 
-  logging.info('[swap_encryption] ── Phase 1: fio microbenchmarks ──')
-  results += _Phase1_Fio(pod, swap_dev, base_meta)
+  # ── Tier 1 / Gate 1: fio microbenchmarks ─────────────────────────────────
+  logging.info('[swap_encryption] ── Tier 1 / Gate 1: fio microbenchmarks ──')
+  tier1_results = []
+  try:
+    tier1_results = _Phase1_Fio(pod, swap_dev, base_meta)
+    results += tier1_results
+  except Exception as e:  # pylint: disable=broad-except
+    logging.error('[swap_encryption] Gate 1 FAILED — fio phase error: %s', e)
+    logging.error('[swap_encryption] Skipping Tiers 2 and 3 (no swap device)')
+    return results
 
-  logging.info('[swap_encryption] ── Phase 2a: CPU overhead ──')
-  results += _Phase2a_CpuOverhead(pod, base_meta)
+  if not tier1_results:
+    logging.warning('[swap_encryption] Gate 1 produced no samples '
+                    '(loop-device skip or parse error) — '
+                    'continuing to Tier 2 with caution')
 
-  logging.info('[swap_encryption] ── Phase 2b: I/O interference ──')
-  results += _Phase2b_IoInterference(pod, base_meta)
+  # ── Tier 2 / Gate 2: stress-ng CPU overhead + I/O interference ───────────
+  logging.info('[swap_encryption] ── Tier 2 / Gate 2: stress-ng phases ──')
+  try:
+    logging.info('[swap_encryption] Phase 2a: CPU overhead')
+    results += _Phase2a_CpuOverhead(pod, base_meta)
+    logging.info('[swap_encryption] Phase 2b: I/O interference')
+    results += _Phase2b_IoInterference(pod, base_meta)
+  except Exception as e:  # pylint: disable=broad-except
+    logging.error('[swap_encryption] Gate 2 FAILED — stress phase error: %s',
+                  e)
+    logging.warning('[swap_encryption] Proceeding to Tier 3 (workloads are '
+                    'independent of stress-ng results)')
 
-  logging.info('[swap_encryption] ── Phase 3a: Redis latency ──')
-  results += _Phase3a_Redis(pod, base_meta)
+  # ── Tier 3 / Gate 3: real-world workloads ────────────────────────────────
+  logging.info('[swap_encryption] ── Tier 3 / Gate 3: workloads ──')
+  for phase_name, phase_fn in [
+      ('Redis latency (3a)',   lambda: _Phase3a_Redis(pod, base_meta)),
+      ('Kernel build (3b)',    lambda: _Phase3b_KernelBuild(pod, base_meta)),
+      ('OpenSearch (3c)',      lambda: _Phase3c_OpenSearch(pod, base_meta)),
+  ]:
+    try:
+      logging.info('[swap_encryption] Phase %s', phase_name)
+      results += phase_fn()
+    except Exception as e:  # pylint: disable=broad-except
+      logging.error('[swap_encryption] %s FAILED: %s — continuing with '
+                    'remaining workloads', phase_name, e)
 
-  logging.info('[swap_encryption] ── Phase 3b: Kernel build ──')
-  results += _Phase3b_KernelBuild(pod, base_meta)
-
-  logging.info('[swap_encryption] ── Phase 3c: OpenSearch ──')
-  results += _Phase3c_OpenSearch(pod, base_meta)
-
-  # Gap 7: cloud cost estimate for the full benchmark run
+  # ── Cost estimate ─────────────────────────────────────────────────────────
   if _COLLECT_COST.value:
     elapsed = time.time() - t_run_start
     results += _CollectCostSample(pod, elapsed, base_meta)
@@ -532,6 +666,196 @@ def _DeleteDaemonSet() -> None:
       '--ignore-not-found',
   ], raise_on_failure=False)
   logging.info('[swap_encryption] DaemonSet deleted')
+
+
+# ---------------------------------------------------------------------------
+# Two-step GKE nodepool helpers
+# ---------------------------------------------------------------------------
+
+def _BuildNodeStartupScript(enable_dmcrypt: bool, lssd: bool) -> str:
+  """Return the bash startup script injected into the benchmark nodepool.
+
+  The script runs as root on the COS node at first boot — before any pod is
+  scheduled — so cryptsetup and mdadm work at the host kernel level without
+  the device-mapper restrictions that block privileged pods on COS nodes.
+
+  Args:
+    enable_dmcrypt: When True, wrap the swap device in dm-crypt plain mode
+                    (aes-xts-plain64, ephemeral random key) matching GKE's
+                    go/node:swap-encryption implementation.
+    lssd:           When True, build a RAID-0 array across all local SSDs
+                    before setting up swap (matches go/gke-swap-lssd).
+  """
+  dmcrypt_str = 'true' if enable_dmcrypt else 'false'
+  lssd_str    = 'true' if lssd else 'false'
+
+  return textwrap.dedent(f"""\
+    #!/bin/bash
+    # PKB swap_encryption_benchmark — nodepool startup script.
+    # Configures swap once at node boot so all benchmark phases see a
+    # pre-warmed swap device.  Runs as root on the COS host.
+    set -euo pipefail
+    ENABLE_DMCRYPT={dmcrypt_str}
+    LSSD={lssd_str}
+
+    _wait_dev() {{
+      local d=$1 i
+      for i in $(seq 1 30); do [ -b "$d" ] && return 0; sleep 2; done
+      echo "[pkb-startup] device $d not ready" >&2; return 1
+    }}
+
+    _boot_dev() {{
+      lsblk -no pkname "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1 || echo nvme0n1
+    }}
+
+    if $LSSD; then
+      BOOT=$(_boot_dev)
+      # Collect all non-rotational non-boot block devices (local SSDs)
+      DEVS=$(lsblk -d -o NAME,ROTA | awk '$2=="0"{{print "/dev/"$1}}' | grep -v "/dev/$BOOT" || true)
+      N=$(echo "$DEVS" | grep -c /dev/ || true)
+      if [ "$N" -gt 1 ]; then
+        modprobe raid0 || true
+        # shellcheck disable=SC2086
+        mdadm --create /dev/md0 --level=0 --raid-devices="$N" $DEVS --force
+        TARGET=/dev/md0
+      elif [ "$N" -eq 1 ]; then
+        TARGET=$(echo "$DEVS" | head -1)
+      else
+        echo "[pkb-startup] no LSSD devices found; skipping swap setup" >&2
+        exit 0
+      fi
+    else
+      BOOT=$(_boot_dev)
+      RAW=$(lsblk -d -o NAME,TYPE | awk '$2=="disk"{{print $1}}' | grep -v "^$BOOT$" | head -1 || true)
+      if [ -z "$RAW" ]; then
+        echo "[pkb-startup] no secondary disk found for hyperdisk swap" >&2
+        exit 0
+      fi
+      TARGET=/dev/$RAW
+    fi
+
+    _wait_dev "$TARGET"
+
+    if $ENABLE_DMCRYPT; then
+      modprobe dm-crypt || true
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
+        cryptsetup open --type plain \\
+          --cipher aes-xts-plain64 --key-size 256 \\
+          --key-file=- "$TARGET" pkb_swap
+      SWAP_DEV=/dev/mapper/pkb_swap
+    else
+      SWAP_DEV=$TARGET
+    fi
+
+    mkswap "$SWAP_DEV"
+    swapon "$SWAP_DEV"
+    echo "[pkb-startup] swap active on $SWAP_DEV (dmcrypt=$ENABLE_DMCRYPT lssd=$LSSD)"
+  """)
+
+
+def _CreateBenchmarkNodePool(cluster) -> None:
+  """Add the benchmark nodepool to the existing cluster (Step 2 of setup).
+
+  Uses:
+    --swap_encryption_benchmark_machine_type  (default n4-highmem-32)
+    --swap_encryption_node_image_type         (default COS_CONTAINERD)
+    --swap_encryption_boot_disk_iops          (default 80000)
+    --swap_encryption_enable_dmcrypt          (default True)
+
+  The nodepool is labelled pkb_nodepool=benchmark so the DaemonSet
+  nodeSelector targets it exclusively.  A node-level startup script
+  configures dm-crypt swap before any pod is scheduled, bypassing the
+  COS device-mapper restriction that affects privileged pods.
+  """
+  machine_type = _BENCHMARK_MACHINE_TYPE.value
+  is_lssd      = _BENCHMARK_LSSD.value if hasattr(_BENCHMARK_LSSD, 'value') else (
+      'lssd' in machine_type.lower()
+  )
+
+  startup_script = _BuildNodeStartupScript(
+      enable_dmcrypt=_ENABLE_DMCRYPT.value,
+      lssd=is_lssd,
+  )
+
+  # Determine zone/region from the cluster object.
+  zone_flags: list[str] = []
+  if getattr(cluster, 'zones', None):
+    zone_flags = ['--zone', cluster.zones[0]]
+  elif getattr(cluster, 'region', None):
+    zone_flags = ['--region', cluster.region]
+
+  # LSSD configs only need a small boot disk (OS only; swap is on local NVMe).
+  # Hyperdisk configs need 500 GiB to hit 80 000 IOPS (the IOPS/GiB ratio on
+  # hyperdisk-balanced is 1:1 up to the provisioned ceiling, so a 100 GiB disk
+  # can only provision up to 100 000 IOPS but a 500 GiB gives comfortable
+  # headroom and matches the Config 2 spec in the Engineer Assignments table).
+  disk_size_gb = 100 if is_lssd else _BOOT_DISK_SIZE_GB.value
+
+  cmd = [
+      'gcloud', 'container', 'node-pools', 'create', _BENCHMARK_NODEPOOL,
+      '--cluster',      cluster.name,
+      '--project',      cluster.project,
+      '--machine-type', machine_type,
+      '--image-type',   _NODE_IMAGE_TYPE.value,
+      '--disk-type',    'hyperdisk-balanced',
+      '--disk-size',    str(disk_size_gb),
+      '--disk-provisioned-iops', str(_BOOT_DISK_IOPS.value),
+      '--num-nodes',    '1',
+      '--node-labels',  f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+      '--no-enable-autoupgrade',
+      '--no-enable-autorepair',
+      '--metadata',     f'startup-script={startup_script}',
+  ] + zone_flags
+
+  # For LSSD machines, expose local NVMe as raw block devices so fio/mdadm
+  # can access them directly (go/gke-swap-lssd uses local-nvme-ssd-block).
+  if is_lssd:
+    cmd += ['--local-nvme-ssd-block', 'count=4']
+
+  logging.info('[swap_encryption] Creating benchmark nodepool: %s / %s / '
+               'image=%s / disk=%dGiB / iops=%d / dmcrypt=%s / lssd=%s',
+               _BENCHMARK_NODEPOOL, machine_type, _NODE_IMAGE_TYPE.value,
+               disk_size_gb, _BOOT_DISK_IOPS.value,
+               _ENABLE_DMCRYPT.value, is_lssd)
+
+  stdout, stderr, rc = vm_util.IssueCommand(cmd, timeout=600,
+                                            raise_on_failure=False)
+  if rc != 0:
+    raise errors.Benchmarks.RunError(
+        f'[swap_encryption] Failed to create benchmark nodepool '
+        f'(rc={rc}): {stderr}'
+    )
+  logging.info('[swap_encryption] Benchmark nodepool ready')
+
+
+def _DeleteDefaultNodePool(cluster) -> None:
+  """Delete the dummy default nodepool after the benchmark pool is ready.
+
+  The default nodepool (e2-medium) was only needed to satisfy GKE's
+  requirement that a cluster must have at least one nodepool at creation time.
+  Removing it stops the clock on its cost immediately.
+  """
+  zone_flags: list[str] = []
+  if getattr(cluster, 'zones', None):
+    zone_flags = ['--zone', cluster.zones[0]]
+  elif getattr(cluster, 'region', None):
+    zone_flags = ['--region', cluster.region]
+
+  cmd = [
+      'gcloud', 'container', 'node-pools', 'delete', _DEFAULT_NODEPOOL,
+      '--cluster', cluster.name,
+      '--project', cluster.project,
+      '--quiet',
+  ] + zone_flags
+
+  logging.info('[swap_encryption] Deleting default nodepool: %s', _DEFAULT_NODEPOOL)
+  stdout, stderr, rc = vm_util.IssueCommand(cmd, timeout=300,
+                                            raise_on_failure=False)
+  if rc != 0:
+    logging.warning('[swap_encryption] Could not delete default nodepool '
+                    '(rc=%d): %s', rc, stderr)
+  else:
+    logging.info('[swap_encryption] Default nodepool deleted')
 
 
 # ---------------------------------------------------------------------------
@@ -689,19 +1013,30 @@ def _SetupGKEHyperdiskSwap(pod: str) -> None:
     return
 
   disk = f'/dev/{disk_name}'
-  logging.info('[swap_encryption] GKE: dm-crypt target disk: %s', disk)
+  logging.info('[swap_encryption] GKE: swap target disk: %s  dmcrypt=%s',
+               disk, _ENABLE_DMCRYPT.value)
 
-  _PodExec(pod, textwrap.dedent(f"""
-    dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
-    cryptsetup open --type plain \\
-      --cipher aes-xts-plain64 \\
-      --key-size 256 \\
-      --key-file=- \\
-      {disk} swap_encrypted && \\
-    mkswap /dev/mapper/swap_encrypted && \\
-    swapon /dev/mapper/swap_encrypted
-  """))
-  logging.info('[swap_encryption] GKE: dm-crypt swap active on /dev/mapper/swap_encrypted')
+  if _ENABLE_DMCRYPT.value:
+    _PodExec(pod, textwrap.dedent(f"""
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
+      cryptsetup open --type plain \\
+        --cipher aes-xts-plain64 \\
+        --key-size 256 \\
+        --key-file=- \\
+        {disk} swap_encrypted && \\
+      mkswap /dev/mapper/swap_encrypted && \\
+      swapon /dev/mapper/swap_encrypted
+    """))
+    logging.info('[swap_encryption] GKE: dm-crypt swap active on '
+                 '/dev/mapper/swap_encrypted')
+  else:
+    # Encryption-disabled column of the test matrix
+    _PodExec(pod, textwrap.dedent(f"""
+      mkswap {disk} && \\
+      swapon {disk}
+    """))
+    logging.info('[swap_encryption] GKE: plain (unencrypted) swap active '
+                 'on %s', disk)
 
 
 def _SetupGKELoopDeviceSwap(pod: str) -> None:
@@ -781,24 +1116,36 @@ def _SetupGKELSSDSwap(pod: str) -> None:
 
   device_list = ' '.join(devices)
   n = len(devices)
-  logging.info('[swap_encryption] GKE: LSSD RAID-0 across %d devices: %s', n, device_list)
+  logging.info('[swap_encryption] GKE: LSSD RAID-0 across %d devices: %s  '
+               'dmcrypt=%s', n, device_list, _ENABLE_DMCRYPT.value)
 
-  # Create RAID-0 array then dm-crypt on top (matches GKE node provisioner)
+  # Build RAID-0, then optionally wrap in dm-crypt (test matrix enc on/off)
   _PodExec(pod, textwrap.dedent(f"""
     modprobe dm-crypt || true
     yes | mdadm --create /dev/md0 \\
       --level=0 --raid-devices={n} \\
       {device_list} 2>&1 || true
-    dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
-    cryptsetup open --type plain \\
-      --cipher aes-xts-plain64 \\
-      --key-size 256 \\
-      --key-file=- \\
-      /dev/md0 swap_encrypted && \\
-    mkswap /dev/mapper/swap_encrypted && \\
-    swapon /dev/mapper/swap_encrypted
   """))
-  logging.info('[swap_encryption] GKE: LSSD RAID-0 dm-crypt swap active')
+
+  if _ENABLE_DMCRYPT.value:
+    _PodExec(pod, textwrap.dedent("""
+      dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
+      cryptsetup open --type plain \\
+        --cipher aes-xts-plain64 \\
+        --key-size 256 \\
+        --key-file=- \\
+        /dev/md0 swap_encrypted && \\
+      mkswap /dev/mapper/swap_encrypted && \\
+      swapon /dev/mapper/swap_encrypted
+    """))
+    logging.info('[swap_encryption] GKE: LSSD RAID-0 dm-crypt swap active')
+  else:
+    _PodExec(pod, textwrap.dedent("""
+      mkswap /dev/md0 && \\
+      swapon /dev/md0
+    """))
+    logging.info('[swap_encryption] GKE: LSSD RAID-0 plain (unencrypted) '
+                 'swap active on /dev/md0')
 
 
 def _SetupEKSSwap(pod: str) -> None:
@@ -1276,9 +1623,15 @@ def _Phase2b_IoInterference(pod: str, base_meta: dict) -> list[sample.Sample]:
 # ---------------------------------------------------------------------------
 
 def _Phase3a_Redis(pod: str, base_meta: dict) -> list[sample.Sample]:
-  """Load Redis beyond its memory cap and measure GET/SET throughput."""
+  """Load Redis beyond its memory cap and measure GET/SET P50/P90/P99 latency.
+
+  Uses memtier_benchmark (installed in the DaemonSet) instead of the built-in
+  redis-benchmark because memtier reports per-percentile latency (P50/P90/P99)
+  which is required by the test plan (redis SET/GET P90/P99 under memory
+  pressure).  This mirrors the approach in PKB's redis_memtier_benchmark.
+  """
   results = []
-  meta = dict(base_meta, workload='redis')
+  meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
 
   _PodExec(pod,
            'service redis-server start 2>/dev/null || redis-server --daemonize yes',
@@ -1289,14 +1642,15 @@ def _Phase3a_Redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   _PodExec(pod, f'redis-cli CONFIG SET maxmemory {maxmem}',      ignore_failure=True)
   _PodExec(pod,  'redis-cli CONFIG SET maxmemory-policy allkeys-lru', ignore_failure=True)
 
+  # Pre-load dataset (forces eviction/swap once dataset > maxmemory)
   n_keys = (_REDIS_DATASET_MB.value * 1024 * 1024) // 128
   logging.info('[swap_encryption] Loading %d Redis keys (%d MB)',
                n_keys, _REDIS_DATASET_MB.value)
   _PodExec(pod,
-           f'redis-benchmark -n {n_keys} -d 128 -t SET -q > /dev/null 2>&1',
+           f'redis-benchmark -n {n_keys} -d 128 -t SET -q >/dev/null 2>&1',
            ignore_failure=True, timeout=600)
 
-  # Apply swap pressure while benchmarking – detach so kubectl exec exits immediately
+  # Apply swap pressure — detach so kubectl exec returns immediately
   _PodExec(pod, (
       f'nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
       f'--vm-method all --timeout 120s '
@@ -1304,33 +1658,70 @@ def _Phase3a_Redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   ), timeout=30)
   time.sleep(8)
 
-  out, _ = _PodExec(
-      pod,
-      'redis-benchmark -n 100000 -d 128 -t GET,SET --csv -q 2>&1',
-      ignore_failure=True,
+  # memtier_benchmark: JSON output for per-percentile latency
+  mt_cmd = (
+      'memtier_benchmark '
+      '--server 127.0.0.1 --port 6379 --protocol redis '
+      '--clients 50 --threads 4 --test-time 60 '
+      '--data-size 128 '
+      '--ratio 1:1 '           # equal GET/SET mix
+      '--hide-histogram '
+      '--json-out-file /tmp/pkb_memtier.json '
+      '2>&1'
   )
-  results += _ParseRedisBenchmark(out, meta)
+  mt_out, _ = _PodExec(pod, mt_cmd, ignore_failure=True, timeout=120)
+  results += _ParseMemtierJson('/tmp/pkb_memtier.json', pod, meta)
+
   return results
 
 
-def _ParseRedisBenchmark(output: str, base_meta: dict) -> list[sample.Sample]:
-  """Parse redis-benchmark --csv output (op, rps)."""
+def _ParseMemtierJson(
+    json_path: str, pod: str, base_meta: dict
+) -> list[sample.Sample]:
+  """Parse memtier_benchmark JSON output into PKB Samples.
+
+  Extracts throughput (ops/s) and latency percentiles (P50, P90, P99)
+  for both GET and SET operations, as required by the test plan.
+  """
+  raw, _ = _PodExec(pod, f'cat {json_path} 2>/dev/null || echo ""',
+                    ignore_failure=True)
   results = []
-  for line in output.splitlines():
-    line = line.strip()
-    if not line or not line.startswith('"'):
+  try:
+    data = json.loads(raw)
+  except (json.JSONDecodeError, ValueError):
+    logging.warning('[swap_encryption] memtier JSON parse failed')
+    return results
+
+  for run in data.get('ALL STATS', {}).values() if isinstance(
+      data.get('ALL STATS'), dict) else []:
+    pass  # handled below
+
+  # memtier JSON structure: {"ALL STATS": {"Sets": {...}, "Gets": {...}, ...}}
+  all_stats = data.get('ALL STATS', {})
+  op_map = {
+      'Sets': 'set',
+      'Gets': 'get',
+      'Totals': 'total',
+  }
+  for json_key, op_label in op_map.items():
+    section = all_stats.get(json_key, {})
+    if not section:
       continue
-    parts = [p.strip('"') for p in line.split(',')]
-    if len(parts) < 2:
-      continue
-    op = parts[0].lower()
-    try:
-      results.append(
-          sample.Sample(f'redis_{op}_rps', float(parts[1]), 'req/s',
-                        dict(base_meta, operation=op))
-      )
-    except ValueError:
-      pass
+    m = dict(base_meta, operation=op_label)
+    ops_sec  = section.get('Ops/sec', 0)
+    lat_avg  = section.get('Latency', {}).get('Average Latency', 0)
+    lat_p50  = section.get('Latency', {}).get('50th Percentile Latency', 0)
+    lat_p90  = section.get('Latency', {}).get('90th Percentile Latency', 0)
+    lat_p99  = section.get('Latency', {}).get('99th Percentile Latency', 0)
+    lat_p999 = section.get('Latency', {}).get('99.9th Percentile Latency', 0)
+    results += [
+        sample.Sample(f'redis_{op_label}_ops_per_sec',   float(ops_sec),  'ops/s', m),
+        sample.Sample(f'redis_{op_label}_lat_avg_ms',    float(lat_avg),  'ms',    m),
+        sample.Sample(f'redis_{op_label}_lat_p50_ms',    float(lat_p50),  'ms',    m),
+        sample.Sample(f'redis_{op_label}_lat_p90_ms',    float(lat_p90),  'ms',    m),
+        sample.Sample(f'redis_{op_label}_lat_p99_ms',    float(lat_p99),  'ms',    m),
+        sample.Sample(f'redis_{op_label}_lat_p999_ms',   float(lat_p999), 'ms',    m),
+    ]
   return results
 
 
@@ -1421,13 +1812,45 @@ def _Phase3c_OpenSearch(pod: str, base_meta: dict) -> list[sample.Sample]:
 
 
 def _RunEsrally(pod: str, meta: dict) -> list[sample.Sample]:
-  _PodExec(pod, (
-      'esrally race --track=geonames '
-      '--target-hosts=localhost:9200 '
-      '--pipeline=benchmark-only '
-      '--report-format=csv '
-      '--report-file=/tmp/pkb_esrally.csv 2>&1'
-  ), ignore_failure=True)
+  """Run esrally geonames track with a capped JVM heap to induce swap pressure.
+
+  esrally is installed via pip3 in the DaemonSet init script and uses the
+  same geonames track as PKB's standalone esrally_benchmark.py, so results
+  are directly comparable.  The JVM heap is capped to 512 MB so the OS page
+  cache overflows to swap during indexing — the key swap pressure scenario
+  described in the methodology doc.
+  """
+  jvm_heap_mb = 512
+  # Patch jvm.options before starting Elasticsearch/OpenSearch
+  _PodExec(pod, textwrap.dedent(f"""
+    for f in /etc/elasticsearch/jvm.options /etc/opensearch/jvm.options \\
+              /usr/share/elasticsearch/config/jvm.options \\
+              /usr/share/opensearch/config/jvm.options; do
+      [ -f "$f" ] || continue
+      sed -i 's/^-Xms.*/-Xms{jvm_heap_mb}m/' "$f"
+      sed -i 's/^-Xmx.*/-Xmx{jvm_heap_mb}m/' "$f"
+    done
+    export ES_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
+    export OPENSEARCH_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
+  """), ignore_failure=True)
+
+  _PodExec(pod,
+           'systemctl start elasticsearch 2>/dev/null || '
+           'systemctl start opensearch 2>/dev/null || true',
+           ignore_failure=True)
+  time.sleep(15)  # wait for the engine to be ready
+
+  _PodExec(pod, textwrap.dedent("""
+    esrally race \\
+      --track=geonames \\
+      --target-hosts=localhost:9200 \\
+      --pipeline=benchmark-only \\
+      --report-format=csv \\
+      --report-file=/tmp/pkb_esrally.csv \\
+      --track-param="number_of_replicas:0" \\
+      2>&1
+  """), ignore_failure=True, timeout=3600)
+
   csv_out, _ = _PodExec(pod, 'cat /tmp/pkb_esrally.csv 2>/dev/null || echo ""')
   results = []
   for line in csv_out.splitlines():
@@ -1439,7 +1862,8 @@ def _RunEsrally(pod: str, meta: dict) -> list[sample.Sample]:
       value = float(parts[2])
       unit  = parts[3].strip() if len(parts) > 3 else 'unknown'
       results.append(sample.Sample(f'opensearch_{metric}', value, unit,
-                                   dict(meta, tool='esrally')))
+                                   dict(meta, tool='esrally',
+                                        jvm_heap_mb=jvm_heap_mb)))
     except (ValueError, IndexError):
       pass
   return results
@@ -1684,17 +2108,23 @@ def _BuildMetadata(pod: str, swap_dev: str) -> dict:
       'benchmark':             BENCHMARK_NAME,
       'execution_mode':        'kubernetes_privileged_pod',
       'cloud':                 cloud,
-      'instance_size':         instance_label,   # gap 6
+      'instance_size':         instance_label,
       'kernel_version':        kernel_out.strip(),
       'host_memory_gb':        mem_gb,
       'swap_device':           swap_dev,
       'swap_size_gb':          swap_gb,
       'swap_encryption':       enc,
+      # Test-matrix columns: encryption on/off, node image type, IOPS target
+      'dmcrypt_enabled':       _ENABLE_DMCRYPT.value,
+      'node_image_type':       _NODE_IMAGE_TYPE.value,
+      'boot_disk_iops_target': _BOOT_DISK_IOPS.value,
+      'benchmark_machine_type': _BENCHMARK_MACHINE_TYPE.value,
+      # Other config
       'zswap_enabled':         _ENABLE_ZSWAP.value,
       'min_free_kbytes':       _MIN_FREE_KBYTES.value,
       'fio_runtime_sec':       _FIO_RUNTIME_SEC.value,
       'stress_vm_bytes':       _STRESS_VM_BYTES.value,
-      'stress_vm_bytes_list':  _STRESS_VM_BYTES_LIST.value,  # gap 5
+      'stress_vm_bytes_list':  _STRESS_VM_BYTES_LIST.value,
       'stress_timeout_sec':    _STRESS_TIMEOUT_SEC.value,
       'nodepool':              _NODEPOOL.value,
   }
