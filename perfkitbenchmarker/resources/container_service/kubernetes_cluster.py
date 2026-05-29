@@ -11,7 +11,8 @@ from perfkitbenchmarker import units
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import container_spec as container_spec_lib
 from perfkitbenchmarker.resources import kubernetes_inference_server
-from perfkitbenchmarker.resources.container_service import (container as container_lib)
+from perfkitbenchmarker.resources.container_service import (
+    container as container_lib)
 from perfkitbenchmarker.resources.container_service import container_cluster
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes
@@ -28,6 +29,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
   CLUSTER_TYPE = container_lib.KUBERNETES
 
   def __init__(self, cluster_spec: container_spec_lib.ContainerClusterSpec):
+    """Initializes a Kubernetes cluster with the given spec."""
     super().__init__(cluster_spec)
     self.event_poller: kubernetes_events.KubernetesEventPoller | None = None
     self.cluster_spec = cluster_spec
@@ -39,10 +41,12 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     )
 
   def _InitializeEventPoller(self):
+    """Sets up the Kubernetes event poller if event polling is enabled."""
     if not self.cluster_spec.poll_for_events:
       return
 
     def _GetEventsNoLogging():
+      """Returns cluster events with logging suppressed."""
       return kubernetes_commands.GetEvents(suppress_logging=True)
 
     self.event_poller = kubernetes_events.KubernetesEventPoller(
@@ -50,6 +54,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     )
 
   def Create(self, restore: bool = False) -> None:
+    """Creates the cluster and starts the event poller if configured."""
     super().Create(restore)
     if self.inference_server:
       self.inference_server.Create()
@@ -61,14 +66,17 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
       self.event_poller.StartPolling()
 
   def Delete(self, freeze: bool = False) -> None:
+    """Deletes the cluster and stops the event poller."""
     if self.inference_server:
       self.inference_server.Delete()
     super().Delete(freeze)
 
   def _PreDelete(self):
+    """Deletes all resources from default namespace before cluster deletion."""
     _DeleteAllFromDefaultNamespace()
 
   def _Delete(self):
+    """Stops event polling and deletes all resources from default namespace."""
     if self.event_poller:
       self.event_poller.StopPolling()
     _DeleteAllFromDefaultNamespace()
@@ -80,12 +88,14 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     return kubernetes_commands.GetEvents()
 
   def __getstate__(self):
+    """Returns picklable state excluding the event poller."""
     state = self.__dict__.copy()
     if 'event_poller' in state:
       del state['event_poller']
     return state
 
   def __setstate__(self, state):
+    """Restores state and reinitializes the event poller."""
     self.__dict__ = state
     self._InitializeEventPoller()
 
