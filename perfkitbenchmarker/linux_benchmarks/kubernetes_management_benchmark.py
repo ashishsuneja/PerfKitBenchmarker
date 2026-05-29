@@ -235,7 +235,10 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
     flag_initial = flag_initial or resolved_initial
     flag_target = flag_target or resolved_target
   initial, target = flag_initial, flag_target
-  source = 'flags' if (_INITIAL_VERSION.value and _TARGET_VERSION.value) else 'auto-resolved'
+  source = (
+      'flags' if (_INITIAL_VERSION.value and _TARGET_VERSION.value)
+      else 'auto-resolved'
+  )
 
   logging.info(
       'NodePool versions (%s): initial=%s -> target=%s '
@@ -417,6 +420,7 @@ def _RunScenarioAPipelined(
   deletes = _Results()
 
   def DoPool(name: str):
+    """Runs create/upgrade/delete pipeline for one pool."""
     cfg = _MakeNodePoolConfig(cluster, name)
     init, e2e, err = _TimedAsync(
         lambda: cluster.CreateNodePoolAsync(cfg, node_version=initial),
@@ -469,6 +473,7 @@ def _RunScenarioB(
   results = _Results()
 
   def DoClusterUpdate():
+    """Times a cluster-level update for Scenario B."""
     init, e2e, err = _TimedAsync(cluster.UpdateClusterAsync,
                                  cluster.WaitForOperation)
     results.add('ScenarioB_ClusterUpdate', init, e2e, err)
@@ -476,6 +481,7 @@ def _RunScenarioB(
                  init, e2e, err is None)
 
   def DoCreate():
+    """Times a node pool create for Scenario B."""
     init, e2e, err = _TimedAsync(
         lambda: cluster.CreateNodePoolAsync(cfg, node_version=initial),
         cluster.WaitForOperation,
