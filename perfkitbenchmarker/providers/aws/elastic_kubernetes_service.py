@@ -1028,6 +1028,7 @@ class EksCluster(BaseEksCluster):
       nodepool_config: container.BaseNodePoolConfig,
       node_version: str | None = None,
   ) -> str:
+    """Initiates node pool create; returns op handle. Does NOT wait."""
     # Pass the full request via --cli-input-json so that we can specify both
     # `version` (e.g. "1.33") and `releaseVersion` (e.g. "1.33.11-...") in
     # the same call. Two reasons this matters:
@@ -1362,6 +1363,7 @@ class EksCluster(BaseEksCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _wait_ng_active():
+      """Polls until the node group reaches ACTIVE state."""
       out, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
@@ -1396,6 +1398,7 @@ class EksCluster(BaseEksCluster):
         retryable_exceptions=(errors.Resource.RetryableDeletionError,),
     )
     def _wait_ng_gone():
+      """Polls until the node group is fully deleted."""
       _, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
@@ -1425,6 +1428,7 @@ class EksCluster(BaseEksCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _wait_cluster_update():
+      """Polls until the cluster update reaches SUCCESSFUL state."""
       out, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
@@ -1505,6 +1509,7 @@ class EksCluster(BaseEksCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _wait_active():
+      """Polls until the cluster status returns to ACTIVE."""
       query = util.AWS_PREFIX + [
           'eks', 'describe-cluster',
           '--name', self.name,
@@ -1535,6 +1540,7 @@ class EksAutoCluster(BaseEksCluster):
   CLUSTER_TYPE = 'Auto'
 
   def __init__(self, spec):
+    """Initializes the GPU EKS cluster."""
     super().__init__(spec)
     self._ChooseSecondZone()
     is_rare_gpu = virtual_machine.GPU_TYPE.value in _RARE_GPU_TYPES
@@ -1657,6 +1663,7 @@ class EksKarpenterCluster(BaseEksCluster):
   CLUSTER_TYPE = 'Karpenter'
 
   def __init__(self, spec):
+    """Initializes the Karpenter EKS cluster."""
     super().__init__(spec)
     self._ChooseSecondZone()
     self.stack_name = f'Karpenter-{self.name}'
@@ -2412,6 +2419,7 @@ class EksKarpenterCluster(BaseEksCluster):
         # Bind eni_id by default to avoid loop closure issues if
         # this is refactored.
         def _delete_one_eni(eni_id=eni_id) -> None:
+          """Deletes a single ENI by ID."""
           _, stderr, retcode = vm_util.IssueCommand(
               [
                   'aws',
@@ -2494,6 +2502,7 @@ class EksKarpenterCluster(BaseEksCluster):
     return [item['metadata']['name'] for item in nodepools.get('items', [])]
 
   def AddNodepool(self, batch_name, pool_id):
+    """Applies a Karpenter NodePool manifest for the given batch and pool."""
     kubernetes_commands.ApplyManifest(
         'provision_node_pools/karpenter/nodepool.yaml.j2',
         batch_name=batch_name,
