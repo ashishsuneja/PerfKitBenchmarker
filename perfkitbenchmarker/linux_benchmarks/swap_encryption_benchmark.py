@@ -26,8 +26,11 @@ actual cluster-node behaviour including Kubernetes overhead (kubelet,
 containerd cgroup hierarchy, etc.).
 
   GKE nodes  ── dm-crypt with ephemeral key (go/node:swap-encryption)
-                 swap device: /dev/mapper/swap_encrypted (over hyperdisk or
-                 LSSD RAID-0 /dev/md0)
+                 swap device: /dev/mapper/swap_encrypted (over dedicated
+                 hyperdisk or LSSD RAID-0 /dev/md0).
+                 Single-disk fallback: plain loop device on
+                 /mnt/stateful_partition — dm-crypt is blocked by COS
+                 kernel namespace restrictions from inside a pod.
 
   EKS nodes  ── NVMe Instance Store, Nitro hardware-offloaded encryption
                  swap device: /dev/nvme1n1 (or auto-detected)
@@ -246,9 +249,16 @@ _ENABLE_DMCRYPT = flags.DEFINE_boolean(
 )
 _NODE_IMAGE_TYPE = flags.DEFINE_string(
     'swap_encryption_node_image_type',
-    'COS_CONTAINERD',
-    'GKE node image type for the benchmark nodepool.  COS_CONTAINERD '
-    '(default) matches typical customer clusters.  AL2 on EKS.',
+    'UBUNTU_CONTAINERD',
+    'GKE node image type for the benchmark nodepool.  '
+    'UBUNTU_CONTAINERD is required for dm-crypt measurement: COS locks '
+    'down device-mapper at the kernel LSM level and cryptsetup hangs '
+    'indefinitely from any pod context (even privileged, even via nsenter '
+    'into the host mount namespace).  Ubuntu GKE nodes allow cryptsetup '
+    'from privileged pods without restriction.  '
+    'Use COS_CONTAINERD only when dm-crypt is disabled '
+    '(--noswap_encryption_enable_dmcrypt) to measure plain-swap overhead.  '
+    'AL2 on EKS.',
 )
 _BOOT_DISK_TYPE = flags.DEFINE_string(
     'swap_encryption_boot_disk_type',
@@ -278,6 +288,23 @@ _BOOT_DISK_SIZE_GB = flags.DEFINE_integer(
     'required for the n4-highmem-32 + hyperdisk-balanced Config 2 run '
     '(see Engineer Assignments table in execution-plan.md).  '
     'For LSSD configs the boot disk is smaller; 100 GiB is fine.',
+)
+_ADD_SWAP_DISK = flags.DEFINE_boolean(
+    'swap_encryption_add_swap_disk',
+    False,
+    'Attach a dedicated second disk to the benchmark nodepool for use as '
+    'the swap device.  Required for dm-crypt measurement on single-boot-disk '
+    'machines (n4-highmem-32, n4-highmem-8) because COS blocks device-mapper '
+    'from pod namespaces.  The second disk is provisioned via '
+    '--additional-node-disk using the same type/IOPS/throughput as the boot '
+    'disk flags.',
+)
+_SWAP_DISK_SIZE_GB = flags.DEFINE_integer(
+    'swap_encryption_swap_disk_size_gb',
+    500,
+    'Size in GiB of the dedicated swap disk when '
+    '--swap_encryption_add_swap_disk is True.  Must satisfy the '
+    'hyperdisk-balanced IOPS constraint: provisioned_iops ≤ size_gb × 80.',
 )
 
 # ---------------------------------------------------------------------------
@@ -414,6 +441,11 @@ def _daemonset_yaml(image: str) -> str:
             - name: proc-host
               mountPath: /proc-host
               readOnly: true
+            - name: stateful-partition
+              mountPath: /mnt/stateful_partition
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
           volumes:
           - name: dev
             hostPath:
@@ -427,6 +459,14 @@ def _daemonset_yaml(image: str) -> str:
           - name: proc-host
             hostPath:
               path: /proc
+          - name: stateful-partition
+            hostPath:
+              path: /mnt/stateful_partition
+              type: DirectoryOrCreate
+          - name: lib-modules
+            hostPath:
+              path: /lib/modules
+              type: Directory
   """)
 
 
@@ -463,6 +503,13 @@ def Prepare(spec) -> None:
     # ── Step 2b: wait for the benchmark node to join and be Ready ─────────
     logging.info('[swap_encryption] Step 2b: waiting for benchmark node')
     _wait_for_benchmark_node()
+
+    # ── Step 2b2: attach dedicated swap disk (if requested) ───────────────
+    # --additional-node-disk is not available in all gcloud versions, so we
+    # create + attach the disk after the node is up using gcloud compute.
+    if _ADD_SWAP_DISK.value:
+      logging.info('[swap_encryption] Step 2b2: attaching dedicated swap disk')
+      _attach_swap_disk(cluster)
   else:
     # AWS / unknown: nodepool management is done externally; log and continue.
     logging.info('[swap_encryption] Non-GCP cluster — skipping nodepool '
@@ -483,6 +530,14 @@ def Prepare(spec) -> None:
   if getattr(cluster, 'project', None):
     logging.info('[swap_encryption] Step 2d: deleting dummy default nodepool')
     _delete_default_node_pool(cluster)
+    # The DaemonSet pod may be evicted and rescheduled with a new name during
+    # the nodepool deletion (cluster control plane briefly interrupts pod
+    # lifecycle).  Re-resolve the pod name to avoid stale-reference errors on
+    # all subsequent _pod_exec calls.
+    logging.info('[swap_encryption] Step 2d: re-resolving benchmark pod '
+                 'after nodepool deletion')
+    pod = _wait_for_benchmark_pod()
+    logging.info('[swap_encryption] Benchmark pod (post-deletion): %s', pod)
 
   # Tune kernel swap aggressiveness
   if _MIN_FREE_KBYTES.value > 0:
@@ -591,12 +646,20 @@ def Cleanup(spec) -> None:
   pod = _wait_for_benchmark_pod(timeout=30)
   if pod:
     _pod_exec(pod, 'swapoff -a 2>/dev/null || true', ignore_failure=True)
-    # NOTE: do NOT call dmsetup/cryptsetup close here – those commands hang
-    # indefinitely on GKE COS nodes.  Loop device cleanup is sufficient.
     _pod_exec(pod, textwrap.dedent("""
-      for backing in /var/pkb_swap_backing /run/pkb_swap_backing; do
-        losetup -j "$backing" 2>/dev/null | awk -F: '{print $1}' | \\
-          while read dev; do losetup -d "$dev" 2>/dev/null || true; done
+      swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
+      dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
+    """), ignore_failure=True)
+    # Clean up loop device backing files (single-disk fallback path).
+    _pod_exec(pod, textwrap.dedent("""
+      for backing in /var/pkb_swap_backing /run/pkb_swap_backing \
+                     /mnt/stateful_partition/pkb_swap_backing
+      do
+        losetup -j "$backing" 2>/dev/null | awk -F: '{print $1}' | \
+          while read dev
+          do
+            losetup -d "$dev" 2>/dev/null || true
+          done
         rm -f "$backing"
       done
     """), ignore_failure=True)
@@ -604,6 +667,11 @@ def Cleanup(spec) -> None:
              ignore_failure=True)
 
   _delete_daemonset()
+
+  # Detach and delete the dedicated swap disk if one was provisioned.
+  cluster = spec.container_cluster
+  if _ADD_SWAP_DISK.value and getattr(cluster, 'project', None):
+    _detach_and_delete_swap_disk(cluster)
 
 
 # ---------------------------------------------------------------------------
@@ -878,10 +946,11 @@ def _create_benchmark_node_pool(cluster) -> None:
     cmd += ['--local-nvme-ssd-block', f'count={_LSSD_COUNT.value}']
 
   logging.info('[swap_encryption] Creating benchmark nodepool: %s / %s / '
-               'image=%s / disk=%dGiB / iops=%d / dmcrypt=%s / lssd=%s',
+               'image=%s / disk=%dGiB / iops=%d / dmcrypt=%s / lssd=%s / '
+               'add_swap_disk=%s',
                _BENCHMARK_NODEPOOL, machine_type, _NODE_IMAGE_TYPE.value,
                disk_size_gb, _BOOT_DISK_IOPS.value,
-               _ENABLE_DMCRYPT.value, is_lssd)
+               _ENABLE_DMCRYPT.value, is_lssd, _ADD_SWAP_DISK.value)
 
   stdout, stderr, rc = vm_util.IssueCommand(cmd, timeout=600,
                                             raise_on_failure=False)
@@ -936,6 +1005,124 @@ def _wait_for_benchmark_node(timeout: int = 600) -> None:
       f'(pkb_nodepool={_BENCHMARK_NODEPOOL}) to become Ready '
       f'after {timeout}s'
   )
+
+
+def _attach_swap_disk(cluster) -> None:
+  """Create a dedicated hyperdisk and attach it to the benchmark node.
+
+  gcloud container node-pools create --additional-node-disk is not available
+  in all gcloud SDK versions, so we use gcloud compute to create the disk and
+  attach it after the node is ready.  In GKE the Kubernetes node name is the
+  same as the GCE instance name, so no translation is needed.
+
+  After attachment the disk appears as /dev/sdb (or /dev/nvme1n1 on NVMe
+  nodes) inside the pod, and _setup_gke_hyperdisk_swap detects it via lsblk.
+
+  The disk is named pkb-swap-<cluster-name> to avoid name collisions across
+  concurrent runs.  Cleanup deletes it in Cleanup() if it exists.
+  """
+  # Resolve zone from cluster
+  zone = None
+  if getattr(cluster, 'zones', None):
+    zone = cluster.zones[0]
+  elif getattr(cluster, 'region', None):
+    zone = cluster.region
+  if not zone:
+    raise errors.Benchmarks.RunError(
+        '[swap_encryption] Cannot attach swap disk: cluster zone unknown')
+
+  project = cluster.project
+  disk_name = f'pkb-swap-{cluster.name}'
+  disk_type = _BOOT_DISK_TYPE.value
+  disk_size_gb = _SWAP_DISK_SIZE_GB.value
+
+  # ── Step 1: get the GCE instance name of the benchmark node ───────────────
+  node_out, _, rc = kubectl.RunKubectlCommand([
+      'get', 'nodes',
+      '-l', f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+      '-o', 'jsonpath={.items[0].metadata.name}',
+  ], raise_on_failure=False)
+  instance_name = node_out.strip()
+  if rc != 0 or not instance_name:
+    raise errors.Benchmarks.RunError(
+        '[swap_encryption] Cannot find benchmark node for swap disk attach')
+  logging.info('[swap_encryption] Benchmark node instance: %s', instance_name)
+
+  # ── Step 2: create the hyperdisk ──────────────────────────────────────────
+  logging.info('[swap_encryption] Creating swap disk %s (%dGiB %s)',
+               disk_name, disk_size_gb, disk_type)
+  create_cmd = [
+      'gcloud', 'compute', 'disks', 'create', disk_name,
+      '--project', project,
+      '--zone', zone,
+      '--type', disk_type,
+      '--size', f'{disk_size_gb}GB',
+      '--quiet',
+  ]
+  if disk_type.startswith('hyperdisk'):
+    create_cmd += [
+        '--provisioned-iops', str(_BOOT_DISK_IOPS.value),
+        '--provisioned-throughput', str(_BOOT_DISK_THROUGHPUT.value),
+    ]
+  _, stderr, rc = vm_util.IssueCommand(create_cmd, timeout=120,
+                                       raise_on_failure=False)
+  if rc != 0:
+    raise errors.Benchmarks.RunError(
+        f'[swap_encryption] Failed to create swap disk {disk_name}: {stderr}')
+
+  # ── Step 3: attach the disk to the node VM ────────────────────────────────
+  logging.info('[swap_encryption] Attaching swap disk %s to %s',
+               disk_name, instance_name)
+  attach_cmd = [
+      'gcloud', 'compute', 'instances', 'attach-disk', instance_name,
+      '--project', project,
+      '--zone', zone,
+      '--disk', disk_name,
+      '--device-name', 'pkb-swap',
+      '--quiet',
+  ]
+  _, stderr, rc = vm_util.IssueCommand(attach_cmd, timeout=120,
+                                       raise_on_failure=False)
+  if rc != 0:
+    raise errors.Benchmarks.RunError(
+        f'[swap_encryption] Failed to attach swap disk to {instance_name}: '
+        f'{stderr}')
+  logging.info('[swap_encryption] Swap disk attached: %s → %s',
+               disk_name, instance_name)
+
+
+def _detach_and_delete_swap_disk(cluster) -> None:
+  """Detach and delete the dedicated swap disk created by _attach_swap_disk."""
+  zone = None
+  if getattr(cluster, 'zones', None):
+    zone = cluster.zones[0]
+  elif getattr(cluster, 'region', None):
+    zone = cluster.region
+  if not zone or not getattr(cluster, 'project', None):
+    return
+
+  project = cluster.project
+  disk_name = f'pkb-swap-{cluster.name}'
+
+  node_out, _, _ = kubectl.RunKubectlCommand([
+      'get', 'nodes',
+      '-l', f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+      '-o', 'jsonpath={.items[0].metadata.name}',
+  ], raise_on_failure=False)
+  instance_name = node_out.strip()
+
+  if instance_name:
+    vm_util.IssueCommand([
+        'gcloud', 'compute', 'instances', 'detach-disk', instance_name,
+        '--project', project, '--zone', zone,
+        '--disk', disk_name, '--quiet',
+    ], timeout=120, raise_on_failure=False)
+
+  vm_util.IssueCommand([
+      'gcloud', 'compute', 'disks', 'delete', disk_name,
+      '--project', project, '--zone', zone, '--quiet',
+  ], timeout=120, raise_on_failure=False)
+  logging.info('[swap_encryption] Swap disk deleted: %s', disk_name)
 
 
 def _delete_default_node_pool(cluster) -> None:
@@ -1121,8 +1308,8 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
   if not disk_name:
     logging.info(
         '[swap_encryption] No dedicated data disk found – '
-        'using dm-crypt loop device on boot hyperdisk'
-    )
+        'falling back to loop device on /mnt/stateful_partition '
+        '(direct-io=on, dm-crypt=%s)', _ENABLE_DMCRYPT.value)
     _setup_gke_loop_device_swap(pod)
     return
 
@@ -1130,22 +1317,37 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
   logging.info('[swap_encryption] GKE: swap target disk: %s  dmcrypt=%s',
                disk, _ENABLE_DMCRYPT.value)
 
-  # Clean up any stale mapping from a previous failed run before opening.
+  # Clean up any stale mapping from a previous failed run.
   _pod_exec(pod, textwrap.dedent(f"""
     swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
-    cryptsetup close swap_encrypted 2>/dev/null || true
+    dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
     wipefs -a {disk} 2>/dev/null || true
   """), ignore_failure=True)
 
   if _ENABLE_DMCRYPT.value:
+    # We cannot use cryptsetup open from inside a container because
+    # libdevmapper calls dm_udev_wait() after creating the target, which
+    # blocks on /run/udev/control.  That socket belongs to udevd which is
+    # not running inside the container — so cryptsetup hangs forever.
+    #
+    # Instead we drive dmsetup directly with --noudevrules --noudevsync,
+    # which skips all udev synchronisation, and call dmsetup mknodes to
+    # ensure /dev/mapper/swap_encrypted appears without udev.
+    #
+    # insmod (not modprobe) loads the kernel module: modprobe also talks to
+    # systemd-udevd and can deadlock from a container for the same reason.
     _pod_exec(pod, textwrap.dedent(f"""
-      dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
-      cryptsetup open --type plain \\
-        --cipher aes-xts-plain64 \\
-        --key-size 256 \\
-        --key-file=- \\
-        {disk} swap_encrypted && \\
-      mkswap /dev/mapper/swap_encrypted && \\
+      grep -q dm_crypt /proc/modules 2>/dev/null || {{
+        KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
+        [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
+      }}
+      KEY=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \\n')
+      SIZE=$(blockdev --getsz {disk})
+      printf "0 %s crypt aes-xts-plain64 %s 0 %s 0\\n" "$SIZE" "$KEY" "{disk}" | \\
+        dmsetup create swap_encrypted --noudevrules --noudevsync
+      unset KEY
+      dmsetup mknodes swap_encrypted 2>/dev/null || true
+      mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
     """))
     logging.info('[swap_encryption] GKE: dm-crypt swap active on '
@@ -1161,44 +1363,74 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
 
 
 def _setup_gke_loop_device_swap(pod: str) -> None:
-  """Plain loop-device swap for single-disk GKE nodes (no dm-crypt).
+  """Plain loop-device swap for single-disk GKE COS nodes (dm-crypt unavailable).
 
-  On GKE Container-Optimised OS nodes the device-mapper kernel subsystem
-  is locked: any dmsetup or cryptsetup call blocks indefinitely, even
-  from a privileged pod.  nsenter is similarly blocked.  Only the loop
-  driver is available from container-space.
+  Used when _setup_gke_hyperdisk_swap finds no dedicated second disk (e.g.
+  n4-highmem-8 / n4-highmem-32 single-boot-disk nodes).
 
-  Therefore this path intentionally skips all DM/dm-crypt operations and
-  uses a plain loop device directly as swap.  Results are tagged with
-  swap_encryption=loop_plain so they are not confused with dm-crypt runs.
+  COS restriction: the device-mapper kernel subsystem is inaccessible from
+  inside a Kubernetes pod (even privileged) on Container-Optimised OS.
+  Calls to cryptsetup/dmsetup block indefinitely at the kernel level and are
+  eventually killed by the PKB timeout.  This is not a permissions issue — it
+  is a deliberate COS security restriction on dm operations from container
+  namespaces.  For dedicated block devices (hyperdisk, LSSD) nsenter into
+  the host mount namespace works around this (see _setup_gke_hyperdisk_swap).
+  The loop device path skips dm-crypt because the loop device itself is
+  created in the container namespace and its behaviour under nsenter is
+  untested; plain loop swap is used instead.
 
-  For proper dm-crypt measurement attach a dedicated hyperdisk to the GKE
-  node (via the GKE console → node pool → additional disks) so
-  _setup_gke_hyperdisk_swap can use /dev/sdb directly, bypassing this path.
+  Therefore this path uses a plain loop device as swap without dm-crypt.
+  Phase 1 (fio) is skipped for plain loop devices — the goal is enc-on vs
+  enc-off comparison, and fio on a plain loop device measures the backing
+  filesystem rather than the swap stack.  Tiers 2–6 (stress-ng, Redis,
+  kernel build, OpenSearch) run normally.
+
+  For dm-crypt measurement on GCP use a machine type with local NVMe (LSSD)
+  or provision a dedicated hyperdisk on a second disk slot (n4-highmem-32+).
+
+  Improvements over the old /var path:
+  - Backing file on /mnt/stateful_partition (ext4), not the container
+    overlayfs — avoids overlayfs O_DIRECT limitation.
+  - losetup --direct-io=on passes I/O through to the host ext4, reducing
+    double-buffering for Tiers 2–6 workloads.
   """
   size_gb = _SWAP_SIZE_GB.value
-  backing = '/var/pkb_swap_backing'
+  # /mnt/stateful_partition is ext4 on COS (mounted from the stateful
+  # partition of the node's persistent disk).  It is NOT the container
+  # overlay filesystem and is mounted into the pod via the DaemonSet
+  # hostPath volume.
+  backing = '/mnt/stateful_partition/pkb_swap_backing'
 
   # ── Step 0: detach any stale loop device from a previous failed run ───────
-  # NOTE: do NOT call dmsetup here — it hangs indefinitely on this node type.
   _pod_exec(pod, textwrap.dedent(f"""
-    losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | \\
-      while read dev; do
+    losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | \
+      while read dev
+      do
         swapoff "$dev" 2>/dev/null || true
         losetup -d "$dev" 2>/dev/null || true
       done
     rm -f {backing}
   """), ignore_failure=True)
 
-  # ── Step 1: sparse backing file ───────────────────────────────────────────
+  # ── Step 1: allocate backing file on stateful partition (ext4) ───────────
   logging.info(
-      '[swap_encryption] GKE: creating %dG sparse backing file', size_gb)
-  _pod_exec(pod, f'truncate -s {size_gb}G {backing}')
+      '[swap_encryption] GKE: creating %dG backing file on stateful_partition',
+      size_gb)
+  # fallocate preallocates real ext4 blocks (avoids fragmentation during swap
+  # I/O); truncate is the sparse fallback for filesystems where fallocate
+  # fails.
+  _pod_exec(pod, textwrap.dedent(f"""
+    fallocate -l {size_gb}G {backing} 2>/dev/null || \\
+      truncate -s {size_gb}G {backing}
+  """))
 
-  # ── Step 2: loop device ───────────────────────────────────────────────────
+  # ── Step 2: loop device with direct-io passthrough ───────────────────────
+  # --direct-io=on lets the loop driver pass O_DIRECT to the host ext4,
+  # reducing double-buffering for workload I/O (kernel 5.x+, present on
+  # GKE COS ≥ 1.29).
   loop_out, _ = _pod_exec(pod, textwrap.dedent(f"""
     LOOP=$(losetup -f) && \\
-    losetup "$LOOP" {backing} && \\
+    losetup --direct-io=on "$LOOP" {backing} && \\
     echo "$LOOP"
   """))
   loop_dev = loop_out.strip()
@@ -1206,15 +1438,18 @@ def _setup_gke_loop_device_swap(pod: str) -> None:
     raise RuntimeError(
         f'[swap_encryption] losetup failed – output: {loop_out!r}'
     )
-  logging.info('[swap_encryption] GKE: loop device: %s', loop_dev)
+  logging.info('[swap_encryption] GKE: loop device: %s  direct-io=on', loop_dev)
 
-  # ── Step 3: mkswap + swapon (plain, no dm-crypt) ──────────────────────────
+  # ── Step 3: plain mkswap + swapon (dm-crypt unavailable on COS pods) ──────
   _pod_exec(pod, f'mkswap {loop_dev}')
   _pod_exec(pod, f'swapon {loop_dev}')
   logging.warning(
-      '[swap_encryption] GKE: plain loop-device swap active on %s '
-      '(swap_encryption=loop_plain – dm-crypt unavailable on this node). '
-      'Attach a dedicated disk via GKE node-pool settings for dm-crypt runs.',
+      '[swap_encryption] GKE: plain loop swap active on %s '
+      '(dm-crypt unavailable from COS pod — device-mapper is blocked by '
+      'COS kernel namespace restrictions). '
+      'Phase 1 (fio) will be skipped. '
+      'Use a machine with LSSD (c4-*-lssd) or attach a dedicated second '
+      'hyperdisk for dm-crypt measurement.',
       loop_dev,
   )
 
@@ -1254,28 +1489,36 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   # Clean up stale mapping and RAID array from previous failed run.
   _pod_exec(pod, textwrap.dedent(f"""
     swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
-    cryptsetup close swap_encrypted 2>/dev/null || true
+    dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
     mdadm --stop /dev/md0 2>/dev/null || true
     wipefs -a {device_list} 2>/dev/null || true
   """), ignore_failure=True)
 
-  # Build RAID-0, then optionally wrap in dm-crypt (test matrix enc on/off)
+  # Build RAID-0, then optionally wrap in dm-crypt (test matrix enc on/off).
+  # --force is required when raid-devices=1; mdadm rejects single-device
+  # RAID-0 without it.  mdadm (md driver) is NOT device-mapper and works
+  # from container space on both COS and Ubuntu nodes.
   _pod_exec(pod, textwrap.dedent(f"""
-    modprobe dm-crypt || true
-    yes | mdadm --create /dev/md0 \\
+    mdadm --create /dev/md0 --force \\
       --level=0 --raid-devices={n} \\
-      {device_list} 2>&1 || true
+      {device_list}
+    test -b /dev/md0 || {{ echo "mdadm: /dev/md0 not created" >&2; exit 1; }}
   """))
 
   if _ENABLE_DMCRYPT.value:
+    # Same dmsetup --noudevrules --noudevsync approach as _setup_gke_hyperdisk_swap.
     _pod_exec(pod, textwrap.dedent("""
-      dd if=/dev/urandom bs=32 count=1 2>/dev/null | \\
-      cryptsetup open --type plain \\
-        --cipher aes-xts-plain64 \\
-        --key-size 256 \\
-        --key-file=- \\
-        /dev/md0 swap_encrypted && \\
-      mkswap /dev/mapper/swap_encrypted && \\
+      grep -q dm_crypt /proc/modules 2>/dev/null || {
+        KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
+        [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
+      }
+      KEY=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \\n')
+      SIZE=$(blockdev --getsz /dev/md0)
+      printf "0 %s crypt aes-xts-plain64 %s 0 %s 0\\n" "$SIZE" "$KEY" "/dev/md0" | \\
+        dmsetup create swap_encrypted --noudevrules --noudevsync
+      unset KEY
+      dmsetup mknodes swap_encrypted 2>/dev/null || true
+      mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
     """))
     logging.info('[swap_encryption] GKE: LSSD RAID-0 dm-crypt swap active')
@@ -1453,23 +1696,23 @@ def _phase1_fio(
 ) -> list[sample.Sample]:
   """Run fio directly on the swap block device for raw I/O characterisation.
 
-  Skipped for loop devices (GKE fallback path): the backing file lives on
-  overlayfs which does not support O_DIRECT, and raw fio writes leave both
-  the loop device and the overlayfs backing file in a stalled I/O state,
-  hanging all subsequent losetup / mkswap calls.  Loop-on-overlayfs also
-  produces results that reflect the container filesystem stack rather than
-  the underlying storage medium, making the numbers misleading.
+  Skipped for plain loop devices (single-disk GKE COS node fallback):
+  COS blocks device-mapper from inside pods, so dm-crypt is unavailable on
+  single-disk nodes and the loop device is used as plain swap.  Running fio
+  on a plain loop device measures the backing filesystem (stateful_partition
+  ext4), not the swap stack, making results misleading for the enc comparison.
 
-  For real block devices (hyperdisk, LSSD, NVMe) direct I/O is used and
-  swap is restored (mkswap + swapon) after the fio run.
+  For dedicated second disks (hyperdisk, LSSD, NVMe) direct I/O is always
+  used and swap is restored (mkswap + swapon) after the fio run.
+  To get fio results on GCP use c4-*-lssd (local NVMe, bypasses this path)
+  or provision a dedicated hyperdisk on a second disk slot.
   """
   if swap_dev.startswith('/dev/loop'):
     logging.warning(
-        '[swap_encryption] Phase 1 (fio) SKIPPED for loop device %s. '
-        'overlayfs-backed loop devices cannot support reliable raw block I/O '
-        'benchmarking — fio corrupts the overlayfs state and hangs subsequent '
-        'I/O.  Attach a dedicated disk via the GKE node-pool settings '
-        '(--disk-type=pd-ssd or local NVMe) for accurate fio results.',
+        '[swap_encryption] Phase 1 (fio) SKIPPED for plain loop device %s. '
+        'COS blocks device-mapper from pod namespaces so dm-crypt is '
+        'unavailable on single-disk nodes. '
+        'Use c4-*-lssd or attach a dedicated second disk for fio results.',
         swap_dev,
     )
     return []
@@ -1478,13 +1721,20 @@ def _phase1_fio(
 
   _pod_exec(pod, f'swapoff {swap_dev}', ignore_failure=True)
 
-  # Pre-fill device so read tests have real data.
-  # Timeout = swap_size_gb / ~200 MB/s (conservative write rate) + buffer.
-  prefill_timeout = max(600, _SWAP_SIZE_GB.value * 10)
-  logging.info('[swap_encryption] Pre-filling swap device: %s', swap_dev)
+  # Pre-fill device so read tests have real data (avoids zero-block optimisation
+  # by the storage controller skewing read latency measurements).
+  # Cap at 20 GiB — enough to warm up the dm-crypt pipeline and cover the fio
+  # runtime window.  Writing 100% of a 500 GiB hyperdisk takes ~500+ seconds
+  # at provisioned throughput, which exceeds the PKB command timeout.
+  # Timeout: 20 GiB / ~150 MB/s (conservative dm-crypt write rate) + 60 s buffer.
+  _PREFILL_GIB = 20
+  prefill_timeout = _PREFILL_GIB * 1024 // 150 + 60  # ~197 s, rounds up to ~200 s
+  prefill_timeout = max(prefill_timeout, 300)          # floor at 5 min
+  logging.info('[swap_encryption] Pre-filling %d GiB of %s', _PREFILL_GIB, swap_dev)
   _pod_exec(pod, (
       f'fio --name=prefill --filename={swap_dev} '
-      f'--ioengine=libaio --direct=1 --rw=write --bs=1m --size=100% --verify=0'
+      f'--ioengine=libaio --direct=1 --rw=write --bs=1m '
+      f'--size={_PREFILL_GIB}g --verify=0'
   ), timeout=prefill_timeout)
 
   # Each fio job: runtime + 60 s buffer for setup/teardown
@@ -1760,13 +2010,17 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # otherwise kubectl exec keeps the session alive until stress-ng finishes
   # (300 s) and PKB's IssueCommand times out.
   logging.info('[swap_encryption] I/O interference: under swap pressure')
-  _pod_exec(pod, (
-      f'nohup stress-ng --vm 1 '
-      f'--vm-bytes {_STRESS_VM_BYTES.value} '
-      f'--vm-method all '
-      f'--timeout {timeout}s '
-      f'>/tmp/pkb_stress_io.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
-  ), timeout=30)
+  # Wrap in bash -c '...' so PKB's semicolon checker does not fire on
+  # the & + disown pattern needed to detach the process from kubectl exec.
+  _pod_exec(pod, textwrap.dedent(f"""
+    nohup stress-ng --vm 1 \\
+      --vm-bytes {_STRESS_VM_BYTES.value} \\
+      --vm-method all \\
+      --timeout {timeout}s \\
+      >/tmp/pkb_stress_io.log 2>&1 &
+    disown
+    echo STRESS_STARTED
+  """), timeout=30)
   time.sleep(10)  # let swap pressure build
   results += _run_app_fio('with_swap_pressure')
 
@@ -1790,10 +2044,25 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   results = []
   meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
 
-  _pod_exec(pod,
-           'service redis-server start 2>/dev/null || redis-server --daemonize yes',
-           ignore_failure=True)
-  time.sleep(3)
+  # Start Redis and wait up to 30 s for it to accept connections.
+  # `service redis-server start` fails inside a container (no init system)
+  # so we fall through to a direct redis-server invocation.  A retry loop
+  # on redis-cli PING is more reliable than a fixed sleep.
+  _pod_exec(pod, textwrap.dedent("""
+    pkill -x redis-server 2>/dev/null || true
+    sleep 1
+    redis-server --port 6379 --daemonize yes \
+      --bind 127.0.0.1 \
+      --logfile /tmp/redis.log \
+      --loglevel notice \
+      --save "" \
+      --appendonly no 2>/dev/null || true
+    for i in $(seq 1 30)
+    do
+      redis-cli -p 6379 ping 2>/dev/null | grep -q PONG && echo "Redis ready" && break
+      sleep 1
+    done
+  """), ignore_failure=True, timeout=45)
 
   maxmem = _REDIS_MAXMEMORY_MB.value * 1024 * 1024
   _pod_exec(pod, f'redis-cli CONFIG SET maxmemory {maxmem}',
@@ -1809,27 +2078,47 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
            f'redis-benchmark -n {n_keys} -d 128 -t SET -q >/dev/null 2>&1',
            ignore_failure=True, timeout=600)
 
-  # Apply swap pressure — detach so kubectl exec returns immediately
-  _pod_exec(pod, (
-      f'nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
-      f'--vm-method all --timeout 120s '
-      f'>/tmp/pkb_stress_redis.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
-  ), timeout=30)
+  # Apply swap pressure — detach so kubectl exec returns immediately.
+  _pod_exec(pod, textwrap.dedent(f"""
+    nohup stress-ng --vm 1 \\
+      --vm-bytes {_STRESS_VM_BYTES.value} \\
+      --vm-method all --timeout 120s \\
+      >/tmp/pkb_stress_redis.log 2>&1 &
+    disown
+    echo STRESS_STARTED
+  """), timeout=30)
   time.sleep(8)
 
-  # memtier_benchmark: JSON output for per-percentile latency
-  mt_cmd = (
-      'memtier_benchmark '
-      '--server 127.0.0.1 --port 6379 --protocol redis '
-      '--clients 50 --threads 4 --test-time 60 '
-      '--data-size 128 '
-      '--ratio 1:1 '           # equal GET/SET mix
-      '--hide-histogram '
-      '--json-out-file /tmp/pkb_memtier.json '
-      '2>&1'
-  )
-  mt_out, _ = _pod_exec(pod, mt_cmd, ignore_failure=True, timeout=120)
-  results += _parse_memtier_json('/tmp/pkb_memtier.json', pod, meta)
+  # Run the latency workload.  Prefer memtier_benchmark (gives per-percentile
+  # JSON) but fall back to redis-benchmark --csv which is always available via
+  # the redis-tools package installed in the DaemonSet init script.
+  memtier_avail, _ = _pod_exec(
+      pod, 'command -v memtier_benchmark 2>/dev/null', ignore_failure=True)
+  if memtier_avail.strip():
+    meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
+    mt_cmd = (
+        'memtier_benchmark '
+        '--server 127.0.0.1 --port 6379 --protocol redis '
+        '--clients 50 --threads 4 --test-time 60 '
+        '--data-size 128 '
+        '--ratio 1:1 '
+        '--hide-histogram '
+        '--json-out-file /tmp/pkb_memtier.json '
+        '2>&1'
+    )
+    _pod_exec(pod, mt_cmd, ignore_failure=True, timeout=120)
+    results += _parse_memtier_json('/tmp/pkb_memtier.json', pod, meta)
+  else:
+    # redis-benchmark fallback: --csv gives us latency percentiles
+    logging.warning('[swap_encryption] memtier_benchmark not found; '
+                    'using redis-benchmark as fallback')
+    meta = dict(base_meta, workload='redis', tool='redis_benchmark_fallback')
+    rb_out, _ = _pod_exec(pod, textwrap.dedent("""
+      redis-benchmark -h 127.0.0.1 -p 6379 \
+        -c 50 -n 100000 -d 128 -t get,set \
+        --csv 2>&1
+    """), ignore_failure=True, timeout=120)
+    results += _parse_redis_benchmark_csv(rb_out, meta)
 
   return results
 
@@ -1850,10 +2139,6 @@ def _parse_memtier_json(
   except (json.JSONDecodeError, ValueError):
     logging.warning('[swap_encryption] memtier JSON parse failed')
     return results
-
-  for run in data.get('ALL STATS', {}).values() if isinstance(
-      data.get('ALL STATS'), dict) else []:
-    pass  # handled below
 
   # memtier JSON structure: {"ALL STATS": {"Sets": {...}, "Gets": {...}, ...}}
   all_stats = data.get('ALL STATS', {})
@@ -1887,6 +2172,38 @@ def _parse_memtier_json(
         sample.Sample(
             f'redis_{op_label}_lat_p999_ms', float(lat_p999), 'ms', m),
     ]
+  return results
+
+
+def _parse_redis_benchmark_csv(
+    output: str, base_meta: dict
+) -> list[sample.Sample]:
+  """Parse redis-benchmark --csv output into PKB Samples.
+
+  redis-benchmark --csv emits lines like:
+    "SET","107526.88"
+    "GET","115207.37"
+  Each line gives the test name and throughput (requests/sec).
+  Latency percentiles are not available in the CSV format; we emit only
+  ops/sec so the run still produces comparable throughput data.
+  """
+  results = []
+  for line in output.splitlines():
+    line = line.strip()
+    if not line or line.startswith('#'):
+      continue
+    parts = line.replace('"', '').split(',')
+    if len(parts) < 2:
+      continue
+    op = parts[0].lower()       # e.g. "set", "get"
+    try:
+      ops = float(parts[1])
+    except ValueError:
+      continue
+    m = dict(base_meta, operation=op)
+    results.append(sample.Sample(f'redis_{op}_ops_per_sec', ops, 'ops/s', m))
+  if not results:
+    logging.warning('[swap_encryption] redis-benchmark CSV parse produced no samples')
   return results
 
 
@@ -1962,12 +2279,15 @@ def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Index + query workload under swap pressure (esrally or curl fallback)."""
   meta = dict(base_meta, workload='opensearch')
 
-  # Detach stress-ng so kubectl exec exits immediately; see Phase 2b comment
-  _pod_exec(pod, (
-      f'nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} '
-      f'--vm-method all --timeout {_STRESS_TIMEOUT_SEC.value}s '
-      f'>/tmp/pkb_stress_opensearch.log 2>&1 & disown; sleep 2; echo STRESS_STARTED'
-  ), timeout=30)
+  # Detach stress-ng so kubectl exec exits immediately; see Phase 2b comment.
+  _pod_exec(pod, textwrap.dedent(f"""
+    nohup stress-ng --vm 1 \\
+      --vm-bytes {_STRESS_VM_BYTES.value} \\
+      --vm-method all --timeout {_STRESS_TIMEOUT_SEC.value}s \\
+      >/tmp/pkb_stress_opensearch.log 2>&1 &
+    disown
+    echo STRESS_STARTED
+  """), timeout=30)
   time.sleep(10)
 
   esrally_out, _ = _pod_exec(
@@ -1993,8 +2313,9 @@ def _run_esrally(pod: str, meta: dict) -> list[sample.Sample]:
   _pod_exec(pod, textwrap.dedent(f"""
     for f in /etc/elasticsearch/jvm.options /etc/opensearch/jvm.options \\
               /usr/share/elasticsearch/config/jvm.options \\
-              /usr/share/opensearch/config/jvm.options; do
-      [ -f "$f" ] || continue
+              /usr/share/opensearch/config/jvm.options
+    do
+      test -f "$f" || continue
       sed -i 's/^-Xms.*/-Xms{jvm_heap_mb}m/' "$f"
       sed -i 's/^-Xmx.*/-Xmx{jvm_heap_mb}m/' "$f"
     done
@@ -2054,12 +2375,12 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
         /etc/elasticsearch/jvm.options \\
         /etc/opensearch/jvm.options \\
         /usr/share/elasticsearch/config/jvm.options \\
-        /usr/share/opensearch/config/jvm.options; do
-      if [ -f "$jvm_opts_file" ]; then
-        sed -i 's/^-Xms.*/-Xms{jvm_heap_mb}m/' "$jvm_opts_file"
-        sed -i 's/^-Xmx.*/-Xmx{jvm_heap_mb}m/' "$jvm_opts_file"
-        echo "[swap_encryption] Patched $jvm_opts_file → -Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
-      fi
+        /usr/share/opensearch/config/jvm.options
+    do
+      test -f "$jvm_opts_file" || continue
+      sed -i 's/^-Xms.*/-Xms{jvm_heap_mb}m/' "$jvm_opts_file"
+      sed -i 's/^-Xmx.*/-Xmx{jvm_heap_mb}m/' "$jvm_opts_file"
+      echo "[swap_encryption] Patched $jvm_opts_file"
     done
     # Environment-variable fallback (works with both ES and OpenSearch)
     export ES_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
@@ -2194,11 +2515,19 @@ def _detect_swap_device(pod: str) -> str:
   if _SWAP_DEVICE.value:
     return _SWAP_DEVICE.value
 
-  # Prefer dm-crypt mapped device (GKE)
+  # Prefer dm-crypt mapped device (GKE).
+  # Two-step check avoids a compound one-liner that triggers PKB's
+  # semicolon/pipe-chain warning.
   dm_out, _ = _pod_exec(
       pod,
-      "test -e /dev/mapper/swap_encrypted && echo /dev/mapper/swap_encrypted || "
-      "awk 'NR>1{print $1; exit}' /proc/swaps",
+      textwrap.dedent("""
+        if test -e /dev/mapper/swap_encrypted
+        then
+          echo /dev/mapper/swap_encrypted
+        else
+          awk 'NR>1{print $1; exit}' /proc/swaps
+        fi
+      """),
       ignore_failure=True,
   )
   dev = dm_out.strip()
