@@ -49,7 +49,8 @@ ONE_HOUR = 60 * 60
 
 def _CalculateCidrSize(nodes: int) -> int:
   # Defaults are used for pod and services CIDR ranges:
-  # https://cloud.google.com/kubernetes-engine/docs/concepts/alias-ips#cluster_sizing_secondary_range_svcs)
+  # https://cloud.google.com/kubernetes-engine/docs/concepts/
+  # alias-ips#cluster_sizing_secondary_range_svcs)
   # Each node requires a /24 CIDR range for pods
   # The cluster requires a /20 CIDR range for services
   # So 2^(32 - nodes) - 2^(32 - 20) >= 2^(32 - 24) * CIDR
@@ -65,6 +66,7 @@ class GoogleArtifactRegistry(container_registry.BaseContainerRegistry):
   CLOUD = provider_info.GCP
 
   def __init__(self, registry_spec):
+    """Initializes the GKE container registry."""
     super().__init__(registry_spec)
     self.project = self.project or util.GetDefaultProject()
     self.region = util.GetRegionFromZone(self.zone)
@@ -83,6 +85,7 @@ class GoogleArtifactRegistry(container_registry.BaseContainerRegistry):
     util.GcloudCommand(self, 'auth', 'configure-docker', self.endpoint).Issue()
 
   def _Create(self):
+    """Creates the GKE container registry."""
     self.Login()
     util.GcloudCommand(
         self,
@@ -95,6 +98,7 @@ class GoogleArtifactRegistry(container_registry.BaseContainerRegistry):
     ).Issue()
 
   def _Delete(self):
+    """Deletes the GKE container registry."""
     util.GcloudCommand(
         self,
         'artifacts',
@@ -120,6 +124,7 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
   """Base class for regular & Autopilot GKE clusters."""
 
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
+    """Initializes the GKE cluster with project and zone config."""
     super().__init__(spec)
     self.project: str = spec.vm_spec.GetProject()
     self.cluster_version: str = FLAGS.container_cluster_version
@@ -217,6 +222,7 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     cmd.IssueRetryable(env=env)
 
   def _IsDeleting(self):
+    """Returns True if the cluster is currently being deleted."""
     cmd = self._GcloudCommand('container', 'clusters', 'describe', self.name)
     stdout, _, _ = cmd.Issue(raise_on_failure=False)
     return True if stdout else False
@@ -241,7 +247,8 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
 
   def GetDefaultStorageClass(self) -> str:
     """Gets the default storage class for the provider."""
-    # https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver
+    # https://cloud.google.com/kubernetes-engine/docs/how-to/
+    # persistent-volumes/gce-pd-csi-driver
     # PD-SSD
     return 'premium-rwo'
 
@@ -300,6 +307,7 @@ class GkeCluster(BaseGkeCluster):
   CLOUD = provider_info.GCP
 
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
+    """Initializes the GKE cluster with node pool tracking."""
     super().__init__(spec)
     # Initialize event_poller to None to avoid AttributeError
     if not hasattr(self, 'event_poller'):
@@ -325,6 +333,7 @@ class GkeCluster(BaseGkeCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    """Sets GKE-specific defaults on the node pool config."""
     super().InitializeNodePoolForCloud(vm_config, nodepool_config)
     vm_config = typing.cast(gce_virtual_machine.GceVmSpec, vm_config)
     nodepool_config.disk_type = vm_config.boot_disk_type
@@ -612,6 +621,7 @@ class GkeCluster(BaseGkeCluster):
     )
 
   def _GetInstanceGroups(self):
+    """Returns the instance groups for all node pools in the cluster."""
     cmd = self._GcloudCommand('container', 'node-pools', 'list')
     cmd.flags['cluster'] = self.name
     stdout, _, _ = cmd.Issue()
@@ -627,7 +637,8 @@ class GkeCluster(BaseGkeCluster):
 
     GKE does this in the background every hour. Do it immediately in case the
     cluster is deleted within that hour.
-    https://cloud.google.com/kubernetes-engine/docs/how-to/creating-managing-labels#label_propagation
+    https://cloud.google.com/kubernetes-engine/docs/how-to/
+    creating-managing-labels#label_propagation
     """
     pvcs = kubernetes_commands.GetPvcs()
     for pvc in pvcs:
@@ -799,7 +810,8 @@ class GkeCluster(BaseGkeCluster):
     )
   
 #   def HasActiveUpgradeOperations(self) -> bool:
-#     """Checks if there are any active node pool upgrades running on the cluster."""
+#     """Checks if there are any active node pool upgrades
+#     running on the cluster."""
 #     cmd = self._GcloudCommand('container', 'operations', 'list')
 #     cmd.flags['project'] = self.project
 #     cmd.flags['zone'] = self.zone
@@ -817,6 +829,7 @@ class GkeCluster(BaseGkeCluster):
       nodepool_config: container.BaseNodePoolConfig,
       node_version: str | None = None,
   ) -> str:
+    """Initiates node pool create; returns op handle. Does NOT wait."""
     cmd = self._GcloudCommand(
         'container',
         'node-pools',
@@ -834,6 +847,7 @@ class GkeCluster(BaseGkeCluster):
     return self._IssueAsync(cmd)
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
+    """Initiates node pool upgrade; returns op handle. Does NOT wait."""
     cmd = self._GcloudCommand(
         'container',
         'clusters',
@@ -863,6 +877,7 @@ class GkeCluster(BaseGkeCluster):
         return op_name
 
   def DeleteNodePoolAsync(self, name: str) -> str:
+    """Initiates node pool deletion; returns op handle. Does NOT wait."""
     cmd = self._GcloudCommand(
         'container',
         'node-pools',
@@ -875,6 +890,7 @@ class GkeCluster(BaseGkeCluster):
     return self._IssueAsync(cmd)
 
   def UpdateClusterAsync(self) -> str:
+    """Initiates cluster-level update; returns op handle. Does NOT wait."""
     cmd = self._GcloudCommand('container', 'clusters', 'update', self.name)
     cmd.flags['update-labels'] = f'k8s-mgmt-ts={int(time.time())}'
     # 'gcloud container clusters update --async' suppresses stdout when
@@ -930,6 +946,7 @@ class GkeCluster(BaseGkeCluster):
       )
 
     def _version_tuple(v):
+      """Converts a version string to a comparable tuple."""
       return tuple(int(x) for x in v.split('-', 1)[0].split('.'))
 
     valid.sort(key=_version_tuple, reverse=True)
@@ -953,6 +970,7 @@ class GkeCluster(BaseGkeCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _poll():
+      """Polls operation status until complete or timeout."""
       describe = self._GcloudCommand(
           'container',
           'operations',
@@ -988,6 +1006,7 @@ class GkeAutopilotCluster(BaseGkeCluster):
   CLUSTER_TYPE = 'Auto'
 
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
+    """Initializes the Autopilot GKE cluster."""
     super().__init__(spec)
     # Nodepools are not supported for Autopilot clusters, but default vm_spec
     # still used for pod spec input.
@@ -998,6 +1017,7 @@ class GkeAutopilotCluster(BaseGkeCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    """Sets Autopilot-specific defaults on the node pool config."""
     kubernetes_cluster.KubernetesCluster.InitializeNodePoolForCloud(
         self, vm_config, nodepool_config
     )
@@ -1032,6 +1052,7 @@ class GkeAutopilotCluster(BaseGkeCluster):
     self._GetKubeconfig()
 
   def GetResourceMetadata(self) -> dict[str, Any]:
+    """Returns metadata dict for this Autopilot GKE cluster."""
     metadata = super().GetResourceMetadata()
     metadata['zone'] = self.zone
     metadata['region'] = self.region
@@ -1054,7 +1075,8 @@ class GkeAutopilotCluster(BaseGkeCluster):
       # Mandate one pod per node, which also handles packing small pods into
       # bigger nodes.
       compute_class = 'Performance'
-    # https://cloud.google.com/kubernetes-engine/docs/how-to/autopilot-gpus#request-gpus
+    # https://cloud.google.com/kubernetes-engine/docs/how-to/
+    # autopilot-gpus#request-gpus
     if self.gpu_type:
       gpu_count = self.gpu_count or 1
       gpu_type = self.gpu_type
@@ -1079,4 +1101,8 @@ class GkeAutopilotCluster(BaseGkeCluster):
   def ResizeNodePool(
       self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
   ):
+    """Raises NotImplementedError.
+
+    Autopilot clusters do not support resizing.
+    """
     raise NotImplementedError('Autopilot clusters do not support resizing.')
