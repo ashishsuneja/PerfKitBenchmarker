@@ -585,11 +585,13 @@ class _Results:
   """Thread-safe collector for (name, init_latency, e2e_latency, error)."""
 
   def __init__(self):
+    """Initializes the thread-safe results collector."""
     self._lock = threading.Lock()
     self.entries: list[_OpResult] = []
 
   def add(self, name: str, init_dur: float, e2e_dur: float,
         err: Exception | None) -> None:
+    """Appends an operation result thread-safely."""
     result = _OpResult(name, init_dur, e2e_dur, err)
     with self._lock:
       self.entries.append(result)
@@ -636,6 +638,7 @@ def _RunAsync(
   cap = min(len(items), _MAX_CONCURRENT.value)
 
   def DoWrap(item):
+    """Runs timed async operation for one item and records result."""
     init_dur, e2e_dur, err = _TimedAsync(lambda: kickoff(item), wait_fn)
     name = get_name(item)
     results.add(name, init_dur, e2e_dur, err)
