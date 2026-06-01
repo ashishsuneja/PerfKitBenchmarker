@@ -43,6 +43,7 @@ class AzureContainerRegistry(container_registry.BaseContainerRegistry):
   CLOUD = provider_info.AZURE
 
   def __init__(self, registry_spec):
+    """Initializes the AKS container registry."""
     super().__init__(registry_spec)
     self.region = util.GetRegionFromZone(self.zone)
     self.resource_group = azure_network.GetResourceGroup(self.region)
@@ -136,6 +137,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    """Sets AKS-specific defaults on the node pool config."""
     super().InitializeNodePoolForCloud(vm_config, nodepool_config)
     nodepool_config.disk_type = vm_config.boot_disk_type
     nodepool_config.disk_size = vm_config.boot_disk_size
@@ -626,6 +628,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       nodepool_config: container.BaseNodePoolConfig,
       node_version: str | None = None,
   ) -> str:
+    """Initiates node pool create; returns op handle. Does NOT wait."""
     node_flags = self._GetNodeFlags(nodepool_config)
     if node_version:
       # _GetNodeFlags may have added self.cluster_version; replace or append.
@@ -662,6 +665,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         log_errors=True,
     )
     def _IssueWithRetry():
+      """Issues create-nodepool command with retry on transient errors."""
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=600, raise_on_failure=False
       )
@@ -674,6 +678,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     return f'np_succeeded:{_AzureNodePoolName(nodepool_config.name)}'
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
+    """Initiates node pool upgrade; returns op handle. Does NOT wait."""
     cmd = [
         azure.AZURE_PATH,
         'aks',
@@ -697,6 +702,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     return f'np_succeeded:{_AzureNodePoolName(name)}'
 
   def DeleteNodePoolAsync(self, name: str) -> str:
+    """Initiates node pool deletion; returns op handle. Does NOT wait."""
     cmd = [
         azure.AZURE_PATH,
         'aks',
@@ -749,7 +755,10 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
           pool_name = pools[0]['name']
           current_count = int(pools[0]['count'])
           # Toggle: scale to current+1 or current-1 (minimum 1)
-          new_count = current_count + 1 if current_count <= 1 else current_count - 1
+          new_count = (
+              current_count + 1 if current_count <= 1
+              else current_count - 1
+          )
           scale_cmd = [
               azure.AZURE_PATH, 'aks', 'nodepool', 'scale',
               '--cluster-name', self.name,
@@ -812,6 +821,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _wait_np_succeeded():
+      """Polls until the node pool reaches succeeded state."""
       # fix: bound each individual poll call to 120s so a hung
       # az aks nodepool show doesn't block the retry loop indefinitely.
       out, err, rc = vm_util.IssueCommand(
@@ -857,6 +867,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         retryable_exceptions=(errors.Resource.RetryableDeletionError,),
     )
     def _wait_np_gone():
+      """Polls until the node pool is fully deleted."""
       # fix: per-poll timeout bound.
       _, err, rc = vm_util.IssueCommand(
           [
@@ -873,7 +884,10 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
           raise_on_failure=False,
           timeout=120,
       )
-      if rc and ('NotFound' in (err or '') or 'not found' in (err or '').lower()):
+      not_found = (
+          'NotFound' in (err or '') or 'not found' in (err or '').lower()
+      )
+      if rc and not_found:
         return
       if rc:
         raise errors.Resource.RetryableDeletionError(err)
@@ -888,6 +902,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _wait_cluster_succeeded():
+      """Polls until the cluster update reaches succeeded state."""
       # fix: per-poll timeout bound.
       out, err, rc = vm_util.IssueCommand(
           [
@@ -932,7 +947,8 @@ class AksAutomaticCluster(AksCluster):
   This feature is currently in preview. To provision an AKS Automatic cluster,
   you'll need to install the Azure CLI 'aks-preview' extension.
   For more details, see the official documentation:
-  https://learn.microsoft.com/en-us/azure/aks/automatic/quick-automatic-managed-network
+  https://learn.microsoft.com/en-us/azure/aks/automatic/
+  quick-automatic-managed-network
   """
 
   CLOUD = provider_info.AZURE
@@ -1019,7 +1035,8 @@ class AksAutomaticCluster(AksCluster):
     )
 
   def _GrantResourcePolicyContributorRole(self):
-    """Grants Resource Policy Contributor role to current user/service principal.
+    """Grants Resource Policy Contributor role to current user/
+    service principal.
 
     This role is required to manage Safeguards policies for the AKS cluster.
     """
@@ -1034,7 +1051,10 @@ class AksAutomaticCluster(AksCluster):
     ])
 
     assignee_id, subscription_id = account_info.strip().split('\n')
-    scope = f'/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}'
+    scope = (
+        f'/subscriptions/{subscription_id}'
+        f'/resourceGroups/{self.resource_group.name}'
+    )
 
     vm_util.IssueCommand([
         azure.AZURE_PATH,
@@ -1050,7 +1070,8 @@ class AksAutomaticCluster(AksCluster):
     ])
 
   def _RelaxAKSPolicy(self):
-    """Switches AKS Deployment Safeguards policy to audit-only mode for benchmark testing.
+    """Switches AKS Deployment Safeguards policy to audit-only mode
+    for benchmark testing.
 
     AKS Safeguards enforces policies that are unnecessary for benchmark testing:
     - Memory limits must be <= 5Gi (AI benchmark workloads requires more)
@@ -1070,7 +1091,12 @@ class AksAutomaticCluster(AksCluster):
         'tsv',
     ])
     subscription_id = subscription_id.strip()
-    policy_scope = f'/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}/providers/Microsoft.ContainerService/managedClusters/{self.name}'
+    policy_scope = (
+        f'/subscriptions/{subscription_id}'
+        f'/resourceGroups/{self.resource_group.name}'
+        f'/providers/Microsoft.ContainerService'
+        f'/managedClusters/{self.name}'
+    )
 
     vm_util.IssueCommand([
         azure.AZURE_PATH,
@@ -1095,6 +1121,7 @@ class AksAutomaticCluster(AksCluster):
         retryable_exceptions=(errors.Resource.RetryableCreationError,),
     )
     def _CheckConstraintEnforcementAction():
+      """Checks the current constraint enforcement action for the cluster."""
       stdout, stderr, retcode = vm_util.IssueCommand(
           [
               FLAGS.kubectl,
@@ -1103,7 +1130,8 @@ class AksAutomaticCluster(AksCluster):
               'get',
               'constraints',
               '-o',
-              'jsonpath={.items[?(@.kind=="K8sAzureV1ContainerRequests")].spec.enforcementAction}',
+              'jsonpath={.items[?(@.kind=="K8sAzureV1ContainerRequests")]'
+              '.spec.enforcementAction}',
           ],
           raise_on_failure=False,
       )
