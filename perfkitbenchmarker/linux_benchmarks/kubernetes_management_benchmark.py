@@ -559,9 +559,9 @@ def _RunScenarioC(
       scale - len(alive),
   )
   if not alive:
-    logging.warning(
-        'Scenario C scale=%d: 0 live pools — all timed-out creates were'
-        + ' rolled back. Recording 0%% delete success rate.', scale)
+    logging.info(
+        'Scenario C scale=%d: 0 live pools — all creates rolled back.'
+        ' Recording 0%% delete success rate.', scale)
     samples += _OpSamples('ScenarioC_Delete', [], attempted_ops=scale)
     return samples
 
