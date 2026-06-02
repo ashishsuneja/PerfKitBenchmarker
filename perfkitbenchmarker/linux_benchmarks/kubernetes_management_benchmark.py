@@ -235,7 +235,12 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
     flag_initial = flag_initial or resolved_initial
     flag_target = flag_target or resolved_target
   initial, target = flag_initial, flag_target
-  source = 'flags' if (_INITIAL_VERSION.value and _TARGET_VERSION.value) else 'auto-resolved'
+  if _INITIAL_VERSION.value and _TARGET_VERSION.value:
+    source = 'flags'
+  elif not (_INITIAL_VERSION.value or _TARGET_VERSION.value):
+    source = 'auto-resolved'
+  else:
+    source = 'mixed'
 
   logging.info(
       'NodePool versions (%s): initial=%s -> target=%s '
