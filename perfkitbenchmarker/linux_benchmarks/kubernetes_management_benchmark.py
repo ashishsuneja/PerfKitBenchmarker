@@ -296,13 +296,9 @@ def Cleanup(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
       ['delete', 'pod', _SLEEP_POD_NAME, '--ignore-not-found'],
       raise_on_failure=False,
   )
-  try:
-    leftover = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Cleanup: failed to list node pools')
-    return
+  leftover = [
+      n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
+  ]
   if not leftover:
     return
   logging.info('Cleanup: deleting %d leftover node pools', len(leftover))
