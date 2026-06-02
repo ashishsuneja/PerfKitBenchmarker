@@ -298,13 +298,9 @@ def Cleanup(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
       ['delete', 'pod', _SLEEP_POD_NAME, '--ignore-not-found'],
       raise_on_failure=False,
   )
-  try:
-    leftover = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Cleanup: failed to list node pools')
-    return
+  leftover = [
+      n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
+  ]
   if not leftover:
     return
   logging.info('Cleanup: deleting %d leftover node pools', len(leftover))
@@ -497,10 +493,7 @@ def _RunScenarioB(
     samples += _OpSamples(entry.name, [entry], attempted_ops=1)
 
   # Remove test pool (best-effort).
-  try:
-    cluster.DeleteNodePool(_SCENARIO_B_NAME)
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Scenario B: failed to delete test pool')
+  cluster.DeleteNodePool(_SCENARIO_B_NAME)
   return samples
 
 
