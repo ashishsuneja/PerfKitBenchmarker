@@ -302,10 +302,8 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
         raise_on_failure=False,
     )
     if code:
-      logging.warning(
-          'Got error when trying to get nodepool name for node %s: %s',
-          err,
-          node_name,
+      logging.info(
+          'Could not get nodepool name for node %s: %s', node_name, err,
       )
       nodepool = None
     else:
@@ -314,7 +312,7 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
         nodepool = self.default_nodepool
       else:
         if nodepool_name not in self.nodepools:
-          logging.warning(
+          logging.info(
               'Nodepool %s not found in nodepools %s',
               nodepool_name,
               self.nodepools,
@@ -652,14 +650,14 @@ class EksCluster(BaseEksCluster):
                   az, ami_id, res_id,
               )
             else:
-              logging.warning(
+              logging.info(
                   '[EKS] Failed to create launch template for %s', az)
           else:
-            logging.warning(
+            logging.info(
                 '[EKS] Missing AMI/CA/endpoint — no launch template for %s',
                 az)
         else:
-          logging.warning(
+          logging.info(
               '[EKS] Failed to create capacity reservation in %s — on-demand',
               az)
 
@@ -910,12 +908,10 @@ class EksCluster(BaseEksCluster):
         raise_on_failure=False,
     )
     if rc:
-      logging.warning(
-          '[EKS] Could not describe subnets for AZ mapping — '
-          + 'falling back to all subnets'
+      raise errors.Resource.GetError(
+          '[EKS] Could not describe subnets for AZ mapping. '
+          f'rc={rc}'
       )
-      self._cached_subnets_per_az = {}
-      return {}
 
     subnets = json.loads(out)
 
@@ -935,7 +931,7 @@ class EksCluster(BaseEksCluster):
         az_map_private[az] = s['SubnetId']
     for az, sid in az_map_private.items():
       if az not in az_map:
-        logging.warning(
+        logging.info(
             '[EKS] AZ %s has no public subnet — using private %s',
             az, sid)
         az_map[az] = sid
@@ -1122,7 +1118,7 @@ class EksCluster(BaseEksCluster):
             nodepool_config.name, _lt_name, res_id, _az,
         )
       else:
-        logging.warning(
+        logging.info(
             '[EKS] No reservation/template for AZ %s — using on-demand',
             _az)
 
@@ -2494,8 +2490,8 @@ class EksKarpenterCluster(BaseEksCluster):
     ]
     stdout, stderr, retcode = vm_util.IssueCommand(cmd)
     if retcode:
-      logging.warning(
-          'Failed to get Karpenter NodePools: %s, error: %s', stdout, stderr
+      raise errors.Resource.GetError(
+          f'Failed to get Karpenter NodePools: {stdout}, error: {stderr}'
       )
       return []
     nodepools = json.loads(stdout)
