@@ -12,82 +12,78 @@ from tests import pkb_common_test_case
 
 class ProvisionNodePoolsBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
 
-  def setUp(self):
-    super().setUp()
-    self.cluster = mock.create_autospec(
-        kubernetes_cluster.KubernetesCluster, instance=True
-    )
-    self.cluster.CLOUD = 'GCP'
-
-  def setUpWithXNodes(self, num_nodes: int):
-    many_nodes = [f'foo{i}' for i in range(num_nodes)]
-    self.enter_context(
-        mock.patch.object(
-            kubectl,
-            'RunKubectlCommand',
-            return_value=(' '.join(many_nodes), None, None),
+    def setUp(self):
+        super().setUp()
+        self.cluster = mock.create_autospec(
+            kubernetes_cluster.KubernetesCluster, instance=True
         )
-    )
-    self.enter_context(
-        mock.patch.object(
-            kubernetes_commands,
-            'ApplyManifest',
+        self.cluster.CLOUD = "GCP"
+
+    def setUpWithXNodes(self, num_nodes: int):
+        many_nodes = [f"foo{i}" for i in range(num_nodes)]
+        self.enter_context(
+            mock.patch.object(
+                kubectl,
+                "RunKubectlCommand",
+                return_value=(" ".join(many_nodes), None, None),
+            )
         )
-    )
-    self.enter_context(
-        mock.patch.object(
-            kubernetes_commands,
-            'GetNodeNames',
-            return_value=set(many_nodes),
+        self.enter_context(
+            mock.patch.object(
+                kubernetes_commands,
+                "ApplyManifest",
+            )
         )
-    )
-    self.cluster.GetNodePoolNames.return_value = many_nodes
+        self.enter_context(
+            mock.patch.object(
+                kubernetes_commands,
+                "GetNodeNames",
+                return_value=set(many_nodes),
+            )
+        )
+        self.cluster.GetNodePoolNames.return_value = many_nodes
 
-  def test_IndividualChecks(self):
-    self.setUpWithXNodes(20)
-    provision_node_pools_benchmark._AssertNodes(10, 10)
-    provision_node_pools_benchmark._AssertNodePools(self.cluster, 10, 10)
+    def test_IndividualChecks(self):
+        self.setUpWithXNodes(20)
+        provision_node_pools_benchmark._AssertNodes(10, 10)
+        provision_node_pools_benchmark._AssertNodePools(self.cluster, 10, 10)
 
-  @flagsaver.flagsaver(provision_node_pools_init_batch=0)
-  @flagsaver.flagsaver(provision_node_pools_test_batch=10)
-  def test_FullRun(self):
-    self.setUpWithXNodes(10)
-    b_spec = mock.create_autospec(benchmark_spec.BenchmarkSpec, instance=True)
-    b_spec.container_cluster = self.cluster
-    b_spec.container_specs = {
-        'provisioning': mock.Mock(image='pkb_busybox')
-    }
-    samples = provision_node_pools_benchmark.Run(b_spec)
-    metrics = [s.metric for s in samples]
-    self.assertContainsSubset(
-        [
-            'test_batch_apply_time',
-            'total_time',
-            'total_time_per_node_pool',
-            'test_batch_ready_time',
-            'test_batch_provisioning_time',
-        ],
-        metrics,
-    )
+    @flagsaver.flagsaver(provision_node_pools_init_batch=0)
+    @flagsaver.flagsaver(provision_node_pools_test_batch=10)
+    def test_FullRun(self):
+        self.setUpWithXNodes(10)
+        b_spec = mock.create_autospec(benchmark_spec.BenchmarkSpec, instance=True)
+        b_spec.container_cluster = self.cluster
+        b_spec.container_specs = {"provisioning": mock.Mock(image="pkb_busybox")}
+        samples = provision_node_pools_benchmark.Run(b_spec)
+        metrics = [s.metric for s in samples]
+        self.assertContainsSubset(
+            [
+                "test_batch_apply_time",
+                "total_time",
+                "total_time_per_node_pool",
+                "test_batch_ready_time",
+                "test_batch_provisioning_time",
+            ],
+            metrics,
+        )
+
+    def test_AddNodePoolCallsAddNodepool(self):
+        """_AddNodePool calls cluster.AddNodepool with correct args."""
+        self.setUpWithXNodes(1)
+        provision_node_pools_benchmark._AddNodePool(
+            self.cluster, "batch1", "0", "pkb_busybox"
+        )
+        self.cluster.AddNodepool.assert_called_once_with("batch1", pool_id="0")
+
+    def test_AddNodePoolUsesCorrectBatchAndPoolId(self):
+        """_AddNodePool passes batch_name and pool_id correctly."""
+        self.setUpWithXNodes(1)
+        provision_node_pools_benchmark._AddNodePool(
+            self.cluster, "mybatch", "42", "pkb_busybox"
+        )
+        self.cluster.AddNodepool.assert_called_once_with("mybatch", pool_id="42")
 
 
-
-
-  def test_AddNodePoolCallsAddNodepool(self):
-    """_AddNodePool calls cluster.AddNodepool with correct args."""
-    self.setUpWithXNodes(1)
-    provision_node_pools_benchmark._AddNodePool(
-        self.cluster, 'batch1', '0', 'pkb_busybox'
-    )
-    self.cluster.AddNodepool.assert_called_once_with('batch1', pool_id='0')
-
-  def test_AddNodePoolUsesCorrectBatchAndPoolId(self):
-    """_AddNodePool passes batch_name and pool_id correctly."""
-    self.setUpWithXNodes(1)
-    provision_node_pools_benchmark._AddNodePool(
-        self.cluster, 'mybatch', '42', 'pkb_busybox'
-    )
-    self.cluster.AddNodepool.assert_called_once_with('mybatch', pool_id='42')
-
-if __name__ == '__main__':
-  unittest.main()
+if __name__ == "__main__":
+    unittest.main()
