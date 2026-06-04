@@ -210,19 +210,11 @@ def Prepare(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
 
 def _CleanStartSweep(cluster: kubernetes_cluster.KubernetesCluster) -> None:
   """Deletes any stale pkbm* node pools so each run starts clean (spec C.2)."""
-  try:
-    stale = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('CleanStart: failed to list node pools')
-    return
+  stale = [n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)]
   if not stale:
-    logging.info(
-        'CleanStart: no stale pools found — clean start confirmed.')
+    logging.info('CleanStart: no stale pools found — clean start confirmed.')
     return
-  logging.warning('CleanStart: deleting %d stale pools: %s', len(stale),
-                  stale)
+  logging.info('CleanStart: deleting %d stale pools: %s', len(stale), stale)
   background_tasks.RunThreaded(cluster.DeleteNodePool, stale)
 
 
@@ -238,14 +230,17 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
   # Google spec: initial=N-1, target=N (adjacent minor upgrade).
   flag_initial = _INITIAL_VERSION.value
   flag_target = _TARGET_VERSION.value
-  if flag_initial and flag_target:
-    initial, target = flag_initial, flag_target
-    source = 'flags'
-  else:
+  if not (flag_initial and flag_target):
     resolved_initial, resolved_target = cluster.ResolveNodePoolVersions()
-    initial = flag_initial or resolved_initial
-    target = flag_target or resolved_target
-    source = 'auto-resolved' if not (flag_initial or flag_target) else 'mixed'
+    flag_initial = flag_initial or resolved_initial
+    flag_target = flag_target or resolved_target
+  initial, target = flag_initial, flag_target
+  if _INITIAL_VERSION.value and _TARGET_VERSION.value:
+    source = 'flags'
+  elif not (_INITIAL_VERSION.value or _TARGET_VERSION.value):
+    source = 'auto-resolved'
+  else:
+    source = 'mixed'
 
   logging.info(
       'NodePool versions (%s): initial=%s -> target=%s '
@@ -303,13 +298,9 @@ def Cleanup(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
       ['delete', 'pod', _SLEEP_POD_NAME, '--ignore-not-found'],
       raise_on_failure=False,
   )
-  try:
-    leftover = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Cleanup: failed to list node pools')
-    return
+  leftover = [
+      n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
+  ]
   if not leftover:
     return
   logging.info('Cleanup: deleting %d leftover node pools', len(leftover))
@@ -502,10 +493,7 @@ def _RunScenarioB(
     samples += _OpSamples(entry.name, [entry], attempted_ops=1)
 
   # Remove test pool (best-effort).
-  try:
-    cluster.DeleteNodePool(_SCENARIO_B_NAME)
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Scenario B: failed to delete test pool')
+  cluster.DeleteNodePool(_SCENARIO_B_NAME)
   return samples
 
 
@@ -564,9 +552,9 @@ def _RunScenarioC(
       scale - len(alive),
   )
   if not alive:
-    logging.warning(
-        'Scenario C scale=%d: 0 live pools — all timed-out creates were'
-        + ' rolled back. Recording 0%% delete success rate.', scale)
+    logging.info(
+        'Scenario C scale=%d: 0 live pools — all creates rolled back.'
+        ' Recording 0%% delete success rate.', scale)
     samples += _OpSamples('ScenarioC_Delete', [], attempted_ops=scale)
     return samples
 
