@@ -44,6 +44,7 @@ from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
+from perfkitbenchmarker.resources.container_service import container as container_lib
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
@@ -108,8 +109,11 @@ def _AddNodePool(
     pool_id: str,
     image: str,
 ) -> None:
-  """Adds a node pool to the cluster."""
-  cluster.AddNodepool(batch_name, pool_id=pool_id)
+  """Adds a node pool to the cluster using CreateNodePool."""
+  nodepool_config = container_lib.BaseNodePoolConfig(
+      name=f'{batch_name}-{pool_id}',
+  )
+  cluster.CreateNodePool(nodepool_config)
   kubernetes_commands.ApplyManifest(
       JOB_MANIFEST_TEMPLATE,
       batch=batch_name,
