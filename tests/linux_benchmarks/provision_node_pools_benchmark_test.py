@@ -71,5 +71,23 @@ class ProvisionNodePoolsBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
     )
 
 
+
+
+  def test_AddNodePoolCallsAddNodepool(self):
+    """_AddNodePool calls cluster.AddNodepool with correct args."""
+    self.setUpWithXNodes(1)
+    provision_node_pools_benchmark._AddNodePool(
+        self.cluster, 'batch1', '0', 'pkb_busybox'
+    )
+    self.cluster.AddNodepool.assert_called_once_with('batch1', pool_id='0')
+
+  def test_AddNodePoolUsesCorrectBatchAndPoolId(self):
+    """_AddNodePool passes batch_name and pool_id correctly."""
+    self.setUpWithXNodes(1)
+    provision_node_pools_benchmark._AddNodePool(
+        self.cluster, 'mybatch', '42', 'pkb_busybox'
+    )
+    self.cluster.AddNodepool.assert_called_once_with('mybatch', pool_id='42')
+
 if __name__ == '__main__':
   unittest.main()
