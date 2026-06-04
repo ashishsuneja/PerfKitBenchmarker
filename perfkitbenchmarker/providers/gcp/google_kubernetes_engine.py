@@ -55,7 +55,7 @@ def _CalculateCidrSize(nodes: int) -> int:
   # So 2^(32 - nodes) - 2^(32 - 20) >= 2^(32 - 24) * CIDR
   # OR CIDR <= 32 - log2(2^8 * nodes + 2^12)
   cidr_size = int(32 - math.log2((nodes << 8) + (1 << 12)))
-  # /16 is narrowest CIDR range GKE supports
+  # /16 is the narrowest CIDR range GKE supports (not /17)
   return min(cidr_size, 16)
 
 
@@ -786,14 +786,17 @@ class GkeCluster(BaseGkeCluster):
             attempt, max_attempts,
         )
         return op_name
-      logging.warning(
+      logging.info(
           '_GetLatestOperationName: no %s op found for target=%s '
-          '(attempt %d/%d), retrying in %ds. stderr=%s',
+          '(attempt %d/%d), retrying in %ds.',
           operation_type, link_target, attempt, max_attempts, retry_delay,
-          stderr,
       )
       time.sleep(retry_delay)
-    return ''
+    raise errors.Resource.GetError(
+        f'_GetLatestOperationName: no {operation_type} op found '
+        f'for target={link_target} after {max_attempts} attempts. '
+        f'stderr={stderr}'
+    )
   
 #   def HasActiveUpgradeOperations(self) -> bool:
 #     """Checks if there are any active node pool upgrades running on the cluster."""
@@ -848,7 +851,7 @@ class GkeCluster(BaseGkeCluster):
             raise
         # Fallback: gcloud succeeded but printed nothing. Query the operations
         # list scoped to this specific nodepool to find the operation name.
-        logging.warning(
+        logging.info(
             'UpgradeNodePoolAsync: falling back to operations list for '
             'nodepool %s. Original error: %s', name, e
         )
@@ -892,7 +895,7 @@ class GkeCluster(BaseGkeCluster):
       # Fallback: gcloud returned retcode=0 but empty stdout.  Query the
       # operations list including DONE status (fast label-update ops complete
       # before we query) guarded by op_start_time to avoid stale matches.
-      logging.warning(
+      logging.info(
           'UpdateClusterAsync: falling back to operations list for cluster %s.'
           ' Original error: %s', self.name, e
       )
