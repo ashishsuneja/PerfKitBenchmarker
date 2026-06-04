@@ -27,6 +27,7 @@ import logging
 import math
 import re
 import threading
+import time
 from typing import Any
 from urllib import parse
 
@@ -1111,28 +1112,23 @@ class EksCluster(BaseEksCluster):
         '--cli-input-json',
         f'file://{filename}',
     ]
-    @vm_util.Retry(
-        retryable_exceptions=(errors.Resource.RetryableCreationError,),
-        max_retries=5,
-        exponential_sleep_multiplier=2,
-        sleep_interval=10,
-        log_errors=True,
-    )
-    def _IssueWithRetry():
-      """Issues create-nodegroup command with retry on throttling."""
+    for _attempt in range(5):
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=300, raise_on_failure=False
       )
-      if retcode:
-        throttled = (
-            'Request limit exceeded' in stderr
-            or 'ThrottlingException' in stderr
+      if retcode == 0:
+        break
+      throttled = (
+          'Request limit exceeded' in stderr
+          or 'ThrottlingException' in stderr
+      )
+      if throttled and _attempt < 4:
+        logging.info(
+            '[EKS] CreateNodegroup throttled — retry %d/5', _attempt + 1
         )
-        if throttled:
-          raise errors.Resource.RetryableCreationError(stderr)
-        raise errors.Resource.CreationError(stderr)
-
-    _IssueWithRetry()
+        time.sleep(10 * (2 ** _attempt))
+        continue
+      raise errors.Resource.CreationError(stderr)
     return f'ng_active:{nodepool_config.name}'
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
@@ -1143,16 +1139,16 @@ class EksCluster(BaseEksCluster):
     # pkbmb (Scenario B) has no suffix — use idx=1 (us-east-1b) to avoid
     # competing with us-east-1a which already has the default nodegroup
     idx = int(suffix) if suffix else 1
-    az_subnets = self._DiscoverSubnetsPerAZ()
-    if az_subnets and len(az_subnets) > 1:
-      zones = sorted(az_subnets.keys())
-      _az = zones[idx % len(zones)]
-    else:
-      _az = f'{self.region}a'
     # Only look up launch template when capacity reservations are enabled.
     # For other benchmarks, always use standard kubernetes-version upgrade.
     lt_id = ''
     _lt_name = ''
+    _az = f'{self.region}a'
+    if FLAGS.eks_reserve_capacity_per_az:
+      az_subnets = self._DiscoverSubnetsPerAZ()
+      if az_subnets and len(az_subnets) > 1:
+        zones = sorted(az_subnets.keys())
+        _az = zones[idx % len(zones)]
     if FLAGS.eks_reserve_capacity_per_az:
       _lt_name = f'pkb-eks-lt-{_az}'
       lt_out, _, lt_rc = vm_util.IssueCommand(
@@ -1268,24 +1264,21 @@ class EksCluster(BaseEksCluster):
         break
       logging.info('[EKS] Cluster status=%s — waiting 5s...', status_out.strip())
       time.sleep(5)
-    @vm_util.Retry(
-        retryable_exceptions=(errors.Resource.RetryableCreationError,),
-        max_retries=10,
-        sleep_interval=30,
-        log_errors=True,
-    )
-    def _UpdateWithRetry():
-      """Issues update-cluster-config with retry on ResourceInUseException."""
+    stdout = ''
+    for _attempt in range(10):
       stdout, stderr, retcode = vm_util.IssueCommand(
           upd, timeout=300, raise_on_failure=False
       )
-      if retcode:
-        if 'ResourceInUseException' in stderr:
-          raise errors.Resource.RetryableCreationError(stderr)
-        raise errors.Resource.CreationError(stderr)
-      return stdout
-
-    stdout = _UpdateWithRetry()
+      if retcode == 0:
+        break
+      if 'ResourceInUseException' in stderr and _attempt < 9:
+        logging.info(
+            '[EKS] UpdateClusterConfig ResourceInUseException — retry %d/10',
+            _attempt + 1,
+        )
+        time.sleep(30)
+        continue
+      raise errors.Resource.CreationError(stderr)
     update_id = json.loads(stdout)['update']['id']
     return f'cluster_update:{update_id}'
 
