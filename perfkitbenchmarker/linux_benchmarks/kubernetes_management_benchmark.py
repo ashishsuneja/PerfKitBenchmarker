@@ -157,6 +157,12 @@ class _OpResult:
   e2e_dur: float
   error: Exception | None = None
 
+  def __iter__(self):
+    yield self.name
+    yield self.init_dur
+    yield self.e2e_dur
+    yield self.error
+
 
 def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
@@ -675,6 +681,8 @@ def _OpSamples(
   success = 0
 
   for r in results:
+    if isinstance(r, tuple):
+      r = _OpResult(*r)
     meta = {'operation_name': r.name, 'success': str(r.error is None)}
     if r.error is not None:
         meta['error'] = str(r.error)[:200]
