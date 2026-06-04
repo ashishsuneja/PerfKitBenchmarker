@@ -398,8 +398,9 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     ]
     stdout, stderr, retcode = vm_util.IssueCommand(cmd)
     if retcode:
-      logging.warning('Failed to get nodegroups: %s, error: %s', stdout, stderr)
-      return []
+      raise errors.Resource.GetError(
+          f'Failed to get nodegroups: {stdout}, error: {stderr}'
+      )
     nodegroups = json.loads(stdout)
     return [ng['Name'] for ng in nodegroups]
 
@@ -1110,29 +1111,28 @@ class EksCluster(BaseEksCluster):
         '--cli-input-json',
         f'file://{filename}',
     ]
-    # Retry on EC2 RunInstances throttling at high concurrency (99 pools).
-    max_retries = 5
-    base_delay = 10
-    for attempt in range(max_retries):
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.RetryableCreationError,),
+        max_retries=5,
+        exponential_sleep_multiplier=2,
+        sleep_interval=10,
+        log_errors=True,
+    )
+    def _IssueWithRetry():
+      """Issues create-nodegroup command with retry on throttling."""
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=300, raise_on_failure=False
       )
-      if retcode == 0:
-        break
-      if 'Request limit exceeded' in stderr or 'ThrottlingException' in stderr:
-        if attempt < max_retries - 1:
-          delay = base_delay * (2 ** attempt)
-          logging.warning(
-              '[EKS] CreateNodegroup %s throttled — retry %d/%d in %ds',
-              nodepool_config.name, attempt + 1, max_retries, delay,
-          )
-          time.sleep(delay)
-          continue
-      raise errors.Resource.CreationError(stderr)
-    else:
-      raise errors.Resource.CreationError(
-          f'CreateNodegroup {nodepool_config.name} failed after retries: {stderr}'
-      )
+      if retcode:
+        throttled = (
+            'Request limit exceeded' in stderr
+            or 'ThrottlingException' in stderr
+        )
+        if throttled:
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+
+    _IssueWithRetry()
     return f'ng_active:{nodepool_config.name}'
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
@@ -1268,24 +1268,24 @@ class EksCluster(BaseEksCluster):
         break
       logging.info('[EKS] Cluster status=%s — waiting 5s...', status_out.strip())
       time.sleep(5)
-    # Retry on ResourceInUseException race condition
-    upd_max_retries = 10
-    upd_base_delay = 30
-    for upd_attempt in range(upd_max_retries):
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.RetryableCreationError,),
+        max_retries=10,
+        sleep_interval=30,
+        log_errors=True,
+    )
+    def _UpdateWithRetry():
+      """Issues update-cluster-config with retry on ResourceInUseException."""
       stdout, stderr, retcode = vm_util.IssueCommand(
           upd, timeout=300, raise_on_failure=False
       )
-      if retcode == 0:
-        break
-      if 'ResourceInUseException' in stderr and upd_attempt < upd_max_retries - 1:
-        delay = upd_base_delay * (upd_attempt + 1)
-        logging.warning(
-            '[EKS] UpdateClusterConfig ResourceInUseException — retry %d/%d in %ds',
-            upd_attempt + 1, upd_max_retries, delay,
-        )
-        time.sleep(delay)
-        continue
-      raise errors.Resource.CreationError(stderr)
+      if retcode:
+        if 'ResourceInUseException' in stderr:
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+      return stdout
+
+    stdout = _UpdateWithRetry()
     update_id = json.loads(stdout)['update']['id']
     return f'cluster_update:{update_id}'
 
