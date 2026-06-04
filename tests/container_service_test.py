@@ -15,6 +15,7 @@ from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
 from perfkitbenchmarker.resources.container_service import kubernetes_events
 from perfkitbenchmarker.sample import Sample
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from tests import container_service_mock
 from tests import pkb_common_test_case
 
@@ -777,6 +778,70 @@ pod-1      my-app    123m         456Mi
 def _ClearTimestamps(samples: Iterable[Sample]) -> Iterable[Sample]:
   for s in samples:
     yield Sample(s.metric, s.value, s.unit, s.metadata, timestamp=0)
+
+
+
+class KubernetesClusterSyncWrappersTest(pkb_common_test_case.PkbCommonTestCase):
+  """Tests that sync methods delegate to async + WaitForOperation."""
+
+  def setUp(self):
+    super().setUp()
+    container_service_mock.MockContainerInit(self)
+    # Use autospec mock so abstract methods don't need implementation
+    self.cluster = mock.create_autospec(
+        kubernetes_cluster.KubernetesCluster, instance=True
+    )
+    # Wire sync methods to real implementations
+    self.cluster.CreateNodePool = (
+        lambda cfg, node_version=None:
+        kubernetes_cluster.KubernetesCluster.CreateNodePool(
+            self.cluster, cfg, node_version
+        )
+    )
+    self.cluster.DeleteNodePool = (
+        lambda name:
+        kubernetes_cluster.KubernetesCluster.DeleteNodePool(self.cluster, name)
+    )
+    self.cluster.UpgradeNodePool = (
+        lambda name, version:
+        kubernetes_cluster.KubernetesCluster.UpgradeNodePool(
+            self.cluster, name, version
+        )
+    )
+    self.cluster.UpdateCluster = (
+        lambda:
+        kubernetes_cluster.KubernetesCluster.UpdateCluster(self.cluster)
+    )
+    self.cluster.CreateNodePoolAsync.return_value = 'op-create'
+    self.cluster.DeleteNodePoolAsync.return_value = 'op-delete'
+    self.cluster.UpgradeNodePoolAsync.return_value = 'op-upgrade'
+    self.cluster.UpdateClusterAsync.return_value = 'op-update'
+    self.cluster.WaitForOperation.return_value = None
+
+  def testCreateNodePoolCallsAsyncAndWaits(self):
+    """CreateNodePool calls CreateNodePoolAsync then WaitForOperation."""
+    cfg = mock.Mock()
+    self.cluster.CreateNodePool(cfg, node_version='1.33')
+    self.cluster.CreateNodePoolAsync.assert_called_once_with(cfg, '1.33')
+    self.cluster.WaitForOperation.assert_called_once_with('op-create')
+
+  def testDeleteNodePoolCallsAsyncAndWaits(self):
+    """DeleteNodePool calls DeleteNodePoolAsync then WaitForOperation."""
+    self.cluster.DeleteNodePool('my-pool')
+    self.cluster.DeleteNodePoolAsync.assert_called_once_with('my-pool')
+    self.cluster.WaitForOperation.assert_called_once_with('op-delete')
+
+  def testUpgradeNodePoolCallsAsyncAndWaits(self):
+    """UpgradeNodePool calls UpgradeNodePoolAsync then WaitForOperation."""
+    self.cluster.UpgradeNodePool('my-pool', '1.34')
+    self.cluster.UpgradeNodePoolAsync.assert_called_once_with('my-pool', '1.34')
+    self.cluster.WaitForOperation.assert_called_once_with('op-upgrade')
+
+  def testUpdateClusterCallsAsyncAndWaits(self):
+    """UpdateCluster calls UpdateClusterAsync then WaitForOperation."""
+    self.cluster.UpdateCluster()
+    self.cluster.UpdateClusterAsync.assert_called_once_with()
+    self.cluster.WaitForOperation.assert_called_once_with('op-update')
 
 
 if __name__ == '__main__':
