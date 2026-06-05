@@ -3490,20 +3490,31 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
 # ---------------------------------------------------------------------------
 
 def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
-  """Index + query workload under swap pressure (esrally or curl fallback)."""
+  """Index + query workload under swap pressure (esrally or curl fallback).
+
+  IMPORTANT: the swap-pressure stressor is NOT started here.  Starting a 370 GB
+  memory hog before the search server is up starves the JVM during startup so
+  it never binds :9200 (the process lingers but never serves — observed pid
+  running yet :9200 down).  The server is launched and confirmed serving first,
+  then the stressor is applied for the actual index/query measurement (done
+  inside _run_opensearch_curl / _run_esrally).
+  """
   meta = dict(base_meta, workload='opensearch')
 
-  # Detach stress-ng so kubectl exec exits immediately; see Phase 2b comment.
-  # Use runtime-detected vm-method (mmap preferred; write64 fallback).
-  _pod_exec(pod, textwrap.dedent(f"""
-    nohup stress-ng --vm 1 \\
-      --vm-bytes {_STRESS_VM_BYTES.value} \\
-      {_stress_vm_method_flag(pod)} --timeout {_STRESS_TIMEOUT_SEC.value}s \\
-      >/tmp/pkb_stress_opensearch.log 2>&1 &
-    disown
-    echo STRESS_STARTED
-  """), timeout=30)
-  time.sleep(10)
+  # Free the node first.  On a reused pod, a leftover stress-ng (370 GB) or a
+  # stuck non-serving OpenSearch from a prior attempt can pin the node at its
+  # memory limit — enough that the launch session itself is OOM-killed (rc 137)
+  # before it can do anything.  Kill those hogs up front (tiny exec, survives
+  # memory pressure), then reclaim, so OpenSearch has room to start.
+  _pod_exec(pod, textwrap.dedent("""
+    pkill -9 -f stress-ng 2>/dev/null || true
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:9200/ 2>/dev/null)" != "200" ]; then
+      pkill -9 -f org.opensearch.bootstrap.OpenSearch 2>/dev/null || true
+    fi
+    sleep 3
+    sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    echo "[pkb] 3c pre-clean free:"; free -h | head -2
+  """), ignore_failure=True, timeout=60)
 
   esrally_out, _ = _pod_exec(
       pod, 'which esrally 2>/dev/null', ignore_failure=True)
@@ -3612,10 +3623,18 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     exec >/tmp/pkb_opensearch_run.log 2>&1
     echo "[pkb] opensearch launch attempt at $(date -u)"
     sysctl -w vm.max_map_count=262144 2>/dev/null || true
-    systemctl start elasticsearch 2>/dev/null && { echo "[pkb] started via systemd (elasticsearch)"; exit 0; }
-    systemctl start opensearch 2>/dev/null && { echo "[pkb] started via systemd (opensearch)"; exit 0; }
+    # NOTE: do NOT trust `systemctl start` (returns 0 without starting anything
+    # in this pod) and do NOT trust a mere process match — a prior attempt can
+    # leave a stuck OpenSearch JVM that is running but never bound :9200
+    # (observed: "already running pid 300885" yet :9200 down).  Only a real HTTP
+    # 200 on :9200 counts as up; otherwise kill the stale process and relaunch.
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:9200/ 2>/dev/null)" = "200" ]; then
+      echo "[pkb] opensearch already serving on :9200"; exit 0
+    fi
     if pgrep -f org.opensearch.bootstrap.OpenSearch >/dev/null 2>&1; then
-      echo "[pkb] opensearch already running (pid $(pgrep -f org.opensearch.bootstrap.OpenSearch | head -1))"; exit 0
+      echo "[pkb] stale opensearch process not serving :9200 — killing and relaunching"
+      pkill -9 -f org.opensearch.bootstrap.OpenSearch 2>/dev/null || true
+      sleep 5
     fi
     if [ ! -x /opt/opensearch/bin/opensearch ]; then
       echo "[pkb] FATAL: /opt/opensearch/bin/opensearch missing — install failed; see /tmp/pkb_opensearch_build.log"; exit 0
@@ -3628,11 +3647,24 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     echo "[pkb] launching opensearch as pkbos ..."
     su pkbos -s /bin/bash -c 'export HOME=/opt/opensearch OPENSEARCH_HOME=/opt/opensearch; /opt/opensearch/bin/opensearch -d -p /tmp/opensearch.pid'
     echo "[pkb] launch command returned rc=$?"
-    sleep 5
-    pgrep -f org.opensearch.bootstrap.OpenSearch >/dev/null 2>&1 \
-      && echo "[pkb] opensearch process is up after launch" \
-      || { echo "[pkb] opensearch NOT running 5s after launch — tail of its log:"; tail -30 /opt/opensearch/logs/*.log 2>/dev/null; }
-  """), ignore_failure=True, timeout=90)
+    sleep 20
+    if pgrep -f org.opensearch.bootstrap.OpenSearch >/dev/null 2>&1; then
+      echo "[pkb] opensearch process is up 20s after launch; recent log:"
+    else
+      echo "[pkb] opensearch NOT running 20s after launch — it crashed; log:"
+    fi
+    tail -60 /opt/opensearch/logs/*.log 2>/dev/null
+    echo "[pkb] ---------- diagnostics ----------"
+    echo "[pkb] memory:"; free -h
+    echo "[pkb] swap:"; (swapon --show 2>/dev/null; cat /proc/swaps 2>/dev/null) | head
+    echo "[pkb] java:"; /opt/opensearch/jdk/bin/java -version 2>&1 | head -3
+    echo "[pkb] opensearch.yml:"; cat /opt/opensearch/config/opensearch.yml 2>/dev/null
+    echo "[pkb] heap opts:"; cat /opt/opensearch/config/jvm.options.d/pkb-heap.options 2>/dev/null
+    echo "[pkb] pkbos can write data/logs?:"; su pkbos -s /bin/bash -c 'touch /opt/opensearch/data/.pkbtest /opt/opensearch/logs/.pkbtest 2>&1 && echo OK && rm -f /opt/opensearch/data/.pkbtest /opt/opensearch/logs/.pkbtest' 2>&1 | head
+    echo "[pkb] :9200 probe:"; curl -s -m 3 http://localhost:9200/ 2>&1 | head -8
+    echo "[pkb] kernel OOM kills (dmesg):"; dmesg 2>/dev/null | grep -iE 'killed process|out of memory|oom-kill' | tail -5
+    echo "[pkb] -------- end diagnostics --------"
+  """), ignore_failure=True, timeout=120)
 
   # Wait for the HTTP endpoint to actually accept connections before timing
   # anything.  Without this probe a server that never starts (curl exit 7,
@@ -3654,6 +3686,18 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
         'up on localhost:9200 (curl could not connect); skipping opensearch '
         'samples for this run rather than recording failed-connection timings')
     return []
+
+  # Server is up.  NOW apply swap pressure (detached) so the index/query below
+  # run under memory pressure — which is the point of the phase — without
+  # starving the JVM during its startup.
+  _pod_exec(pod, textwrap.dedent(f"""
+    nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} \\
+      {_stress_vm_method_flag(pod)} --timeout {_STRESS_TIMEOUT_SEC.value}s \\
+      >/tmp/pkb_stress_opensearch.log 2>&1 &
+    disown
+    echo STRESS_STARTED
+  """), timeout=30)
+  time.sleep(10)
 
   doc = '{"index":{}}\n{"field":"benchmark","ts":"2026-01-01"}\n'
   bulk = doc * 500
