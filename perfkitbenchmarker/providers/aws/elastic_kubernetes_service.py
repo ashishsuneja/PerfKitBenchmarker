@@ -93,7 +93,7 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     # EKS requires a region and optionally a list of one or zones.
     # Interpret the zone as a comma separated list of zones or a region.
     self.control_plane_zones: list[str] = (
-        spec.vm_spec.zone and spec.vm_spec.zone.split(',')
+        spec.vm_spec.zone and spec.vm_spec.zone.split(",")
     )
     # Do this before super, because commas in zones confuse EC2 virtual machines
     if len(self.control_plane_zones) > 1:
@@ -102,7 +102,7 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     super().__init__(spec)
     if not self.control_plane_zones:
       raise errors.Config.MissingOption(
-          'container_cluster.vm_spec.AWS.zone is required.'
+          "container_cluster.vm_spec.AWS.zone is required."
       )
     self.region: str | None = None
     if len(self.control_plane_zones) == 1 and util.IsRegion(self.zone):
@@ -126,12 +126,8 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
       # and --zones must have at least 2 zones
       # https://github.com/weaveworks/eksctl/issues/4735
       self.control_plane_zones.append(
-          self.region + ('b' if self.zone.endswith('a') else 'a')
+          self.region + ("b" if self.zone.endswith("a") else "a")
       )
-
-
-
-
 
   def _EksCtlCreate(self, create_json: dict[str, Any]):
     """Creates the EKS cluster."""
@@ -143,27 +139,27 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     # availabilityZones is already set in create_json by _CreateDependencies
     # via the EC2 AZ query (bypassing PKB zone flag truncation).
     # Log it here for visibility.
-    if 'availabilityZones' in create_json:
+    if "availabilityZones" in create_json:
       logging.info(
-          '[EKS] Creating cluster with AZs: %s — '
-          + 'eksctl will auto-assign CIDRs for all %d zones.',
-          create_json['availabilityZones'],
-          len(create_json['availabilityZones']),
+          "[EKS] Creating cluster with AZs: %s — "
+          + "eksctl will auto-assign CIDRs for all %d zones.",
+          create_json["availabilityZones"],
+          len(create_json["availabilityZones"]),
       )
     # Schema for the cluster create command is here:
     # https://schema.eksctl.io/
     create_json = _recursively_update_dictionary(
         {
-            'apiVersion': 'eksctl.io/v1alpha5',
-            'kind': 'ClusterConfig',
-            'metadata': {
-                'name': self.name,
-                'region': self.region,
-                'version': self.cluster_version,
-                'tags': util.MakeDefaultTags(),
+            "apiVersion": "eksctl.io/v1alpha5",
+            "kind": "ClusterConfig",
+            "metadata": {
+                "name": self.name,
+                "region": self.region,
+                "version": self.cluster_version,
+                "tags": util.MakeDefaultTags(),
             },
-            'iam': {
-                'withOidc': True,
+            "iam": {
+                "withOidc": True,
             },
         },
         create_json,
@@ -171,17 +167,17 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
     filename = self._WriteJsonToFile(create_json)
     cmd = [
         FLAGS.eksctl,
-        'create',
-        'cluster',
-        '-f',
+        "create",
+        "cluster",
+        "-f",
         filename,
-        f'--kubeconfig={FLAGS.kubeconfig}',
+        f"--kubeconfig={FLAGS.kubeconfig}",
     ]
     stdout, _, retcode = vm_util.IssueCommand(
         cmd, timeout=1800, raise_on_failure=False
     )
     if retcode:
-      if 'The maximum number of VPCs has been reached' in stdout:
+      if "The maximum number of VPCs has been reached" in stdout:
         raise errors.Benchmarks.QuotaFailure(stdout)
       else:
         raise errors.Resource.CreationError(stdout)
@@ -191,23 +187,23 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
   ) -> dict[str, Any]:
     """Constructs the node group json dictionary."""
     group_json = {
-        'name': nodepool.name,
-        'instanceType': nodepool.machine_type,
-        'desiredCapacity': nodepool.num_nodes,
-        'amiFamily': 'AmazonLinux2023',
-        'tags': util.MakeDefaultTags(),
-        'labels': {
-            'pkb_nodepool': nodepool.name,
+        "name": nodepool.name,
+        "instanceType": nodepool.machine_type,
+        "desiredCapacity": nodepool.num_nodes,
+        "amiFamily": "AmazonLinux2023",
+        "tags": util.MakeDefaultTags(),
+        "labels": {
+            "pkb_nodepool": nodepool.name,
         },
     }
     if nodepool.min_nodes != nodepool.max_nodes:
-      group_json['minSize'] = nodepool.min_nodes
-      group_json['maxSize'] = nodepool.max_nodes
+      group_json["minSize"] = nodepool.min_nodes
+      group_json["maxSize"] = nodepool.max_nodes
     # Pin the default nodegroup to control_plane_zones[0] so it stays in a
     # single known AZ. The benchmark nodegroups (pkbma*, pkbmc*) are placed
     # via CreateNodePoolAsync using the round-robin _DiscoverSubnetsPerAZ logic.
     if self.control_plane_zones:
-      group_json['availabilityZones'] = [self.control_plane_zones[0]]
+      group_json["availabilityZones"] = [self.control_plane_zones[0]]
     return group_json
 
   def _WriteJsonToFile(self, json_dict: dict[str, Any]) -> str:
@@ -220,11 +216,11 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
       The file path of the rendered json.
     """
     with vm_util.NamedTemporaryFile(
-        dir=vm_util.GetTempDir(), delete=False, mode='w'
+        dir=vm_util.GetTempDir(), delete=False, mode="w"
     ) as tf:
       rendered_json = json.dumps(json_dict, indent=2)
       logging.info(
-          'Writing to %s rendered eksctl create json: %s',
+          "Writing to %s rendered eksctl create json: %s",
           tf.name,
           rendered_json,
       )
@@ -241,35 +237,45 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
       pass
     # Clean up dynamically created launch templates and capacity reservations
     # Only runs if capacity reservations were actually created this run.
-    if getattr(FLAGS, 'eks_reserve_capacity_per_az', False):
-      for az in getattr(self, '_capacity_reservation_ids', {}).keys():
+    if getattr(FLAGS, "eks_reserve_capacity_per_az", False):
+      for az in getattr(self, "_capacity_reservation_ids", {}).keys():
         vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'ec2', 'delete-launch-template',
-                '--launch-template-name', f'pkb-eks-lt-{az}',
-                '--region', self.region,
+            util.AWS_PREFIX
+            + [
+                "ec2",
+                "delete-launch-template",
+                "--launch-template-name",
+                f"pkb-eks-lt-{az}",
+                "--region",
+                self.region,
             ],
             raise_on_failure=False,
         )
-        logging.info('[EKS] Deleted launch template pkb-eks-lt-%s', az)
-      for az, res_id in getattr(self, '_capacity_reservation_ids', {}).items():
+        logging.info("[EKS] Deleted launch template pkb-eks-lt-%s", az)
+      for az, res_id in getattr(self, "_capacity_reservation_ids", {}).items():
         vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'ec2', 'cancel-capacity-reservation',
-                '--capacity-reservation-id', res_id,
-                '--region', self.region,
+            util.AWS_PREFIX
+            + [
+                "ec2",
+                "cancel-capacity-reservation",
+                "--capacity-reservation-id",
+                res_id,
+                "--region",
+                self.region,
             ],
             raise_on_failure=False,
         )
-        logging.info('[EKS] Cancelled capacity reservation %s in %s', res_id, az)
+        logging.info(
+            "[EKS] Cancelled capacity reservation %s in %s", res_id, az
+        )
     super()._Delete()
     cmd = [
         FLAGS.eksctl,
-        'delete',
-        'cluster',
-        '--name',
+        "delete",
+        "cluster",
+        "--name",
         self.name,
-        '--region',
+        "--region",
         self.region,
     ]
     vm_util.IssueCommand(cmd, timeout=1800)
@@ -292,29 +298,29 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
       return self.node_to_nodepool[node_name]
     nodepool_name, err, code = kubectl.RunKubectlCommand(
         [
-            'get',
-            'node',
+            "get",
+            "node",
             node_name,
-            '-o',
+            "-o",
             'jsonpath="{.metadata.labels.pkb_nodepool}"',
         ],
         raise_on_failure=False,
     )
     if code:
       logging.warning(
-          'Got error when trying to get nodepool name for node %s: %s',
+          "Got error when trying to get nodepool name for node %s: %s",
           err,
           node_name,
       )
       nodepool = None
     else:
       nodepool_name = nodepool_name.strip().strip('"')
-      if nodepool_name == 'default':
+      if nodepool_name == "default":
         nodepool = self.default_nodepool
       else:
         if nodepool_name not in self.nodepools:
           logging.warning(
-              'Nodepool %s not found in nodepools %s',
+              "Nodepool %s not found in nodepools %s",
               nodepool_name,
               self.nodepools,
           )
@@ -330,18 +336,18 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
       return self.node_to_machine_type[node_name]
     out, _, _ = kubectl.RunKubectlCommand(
         [
-            'get',
-            'nodes',
-            '-o',
+            "get",
+            "nodes",
+            "-o",
             (
                 "jsonpath='{range"
-                r' .items[*]}{.metadata.name},{.metadata.labels.beta\.'
+                r" .items[*]}{.metadata.name},{.metadata.labels.beta\."
                 r'kubernetes\.io/instance-type}{"\n"}{end}\''
             ),
         ],
     )
     for line in out.splitlines():
-      pieces = line.split(',')
+      pieces = line.split(",")
       if not pieces or len(pieces) != 2:
         continue
       node, machine_type = pieces
@@ -359,26 +365,26 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
   @property
   def _ingress_manifest_path(self) -> str:
     """The path to the ingress manifest template file."""
-    return 'container/ingress.yaml.j2'
+    return "container/ingress.yaml.j2"
 
   def _WaitForIngress(self, name: str, namespace: str, port: int) -> str:
     """Waits for an Ingress resource to be deployed to the cluster."""
     del port
     kubernetes_commands.WaitForResource(
-        'ingress',
+        "ingress",
         kubernetes_cluster.INGRESS_JSONPATH,
         namespace=namespace,
-        condition_type='jsonpath=',
+        condition_type="jsonpath=",
         extra_args=[name],
     )
     stdout, _, _ = kubectl.RunKubectlCommand([
-        'get',
-        'ingress',
+        "get",
+        "ingress",
         name,
-        '-n',
+        "-n",
         namespace,
-        '-o',
-        f'jsonpath={kubernetes_cluster.INGRESS_JSONPATH}',
+        "-o",
+        f"jsonpath={kubernetes_cluster.INGRESS_JSONPATH}",
     ])
     return self._GetAddressFromIngress(stdout)
 
@@ -387,24 +393,21 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
 
     cmd = [
         FLAGS.eksctl,
-        'get',
-        'nodegroup',
-        '--cluster',
+        "get",
+        "nodegroup",
+        "--cluster",
         self.name,
-        '--region',
+        "--region",
         self.region,
-        '-o',
-        'json',
+        "-o",
+        "json",
     ]
     stdout, stderr, retcode = vm_util.IssueCommand(cmd)
     if retcode:
-      logging.warning('Failed to get nodegroups: %s, error: %s', stdout, stderr)
+      logging.warning("Failed to get nodegroups: %s, error: %s", stdout, stderr)
       return []
     nodegroups = json.loads(stdout)
-    return [ng['Name'] for ng in nodegroups]
-
-  def AddNodepool(self, batch_name, pool_id):
-    pass
+    return [ng["Name"] for ng in nodegroups]
 
 
 class EksCluster(BaseEksCluster):
@@ -437,8 +440,8 @@ class EksCluster(BaseEksCluster):
       dict mapping string property key to value.
     """
     result = super().GetResourceMetadata()
-    result['boot_disk_type'] = self.default_nodepool.disk_type
-    result['boot_disk_size'] = self.default_nodepool.disk_size
+    result["boot_disk_type"] = self.default_nodepool.disk_type
+    result["boot_disk_size"] = self.default_nodepool.disk_size
     return result
 
   def _Create(self):
@@ -449,8 +452,8 @@ class EksCluster(BaseEksCluster):
     for _, node_group in self.nodepools.items():
       nodepool_jsons += [self._RenderNodeGroupJson(node_group)]
     create_json: dict[str, Any] = {
-        'managedNodeGroups': nodepool_jsons,
-        'vpc': {'nat': {'gateway': 'Disable'}},
+        "managedNodeGroups": nodepool_jsons,
+        "vpc": {"nat": {"gateway": "Disable"}},
     }
     # Explicitly set cluster-level availabilityZones so eksctl creates VPC
     # public+private subnets in ALL AZs in the region.
@@ -461,12 +464,18 @@ class EksCluster(BaseEksCluster):
     # all AZs, enabling proper round-robin nodegroup placement.
     try:
       az_out, _, az_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'ec2', 'describe-availability-zones',
-              '--region', self.region,
-              '--filters', 'Name=state,Values=available',
-              '--query', 'AvailabilityZones[*].ZoneName',
-              '--output', 'json',
+          util.AWS_PREFIX
+          + [
+              "ec2",
+              "describe-availability-zones",
+              "--region",
+              self.region,
+              "--filters",
+              "Name=state,Values=available",
+              "--query",
+              "AvailabilityZones[*].ZoneName",
+              "--output",
+              "json",
           ],
           raise_on_failure=False,
       )
@@ -479,20 +488,21 @@ class EksCluster(BaseEksCluster):
         cluster_azs = (
             self.control_plane_zones
             if self.control_plane_zones
-            else [f'{self.region}a', f'{self.region}b', f'{self.region}c']
+            else [f"{self.region}a", f"{self.region}b", f"{self.region}c"]
         )
     except Exception:  # pylint: disable=broad-except
       cluster_azs = (
           self.control_plane_zones
           if self.control_plane_zones
-          else [f'{self.region}a', f'{self.region}b', f'{self.region}c']
+          else [f"{self.region}a", f"{self.region}b", f"{self.region}c"]
       )
 
-    create_json['availabilityZones'] = cluster_azs
+    create_json["availabilityZones"] = cluster_azs
     logging.info(
-        '[EKS] Cluster will have subnets in %d AZs: %s '
-        + '(queried from EC2, bypassing PKB zone flag truncation)',
-        len(cluster_azs), cluster_azs,
+        "[EKS] Cluster will have subnets in %d AZs: %s "
+        + "(queried from EC2, bypassing PKB zone flag truncation)",
+        len(cluster_azs),
+        cluster_azs,
     )
     self._EksCtlCreate(create_json)
 
@@ -504,158 +514,226 @@ class EksCluster(BaseEksCluster):
     if not FLAGS.eks_reserve_capacity_per_az:
       self._capacity_reservation_ids = {}
       logging.info(
-          '[EKS] Skipping capacity reservations '
-          '(--eks_reserve_capacity_per_az=False)'
+          "[EKS] Skipping capacity reservations "
+          "(--eks_reserve_capacity_per_az=False)"
       )
     else:
       self._capacity_reservation_ids = {}
       # Reserve enough capacity per AZ for 100 pools:
       # ~67 pools per AZ × 2 nodes = 134 instances max per AZ (Scenario A)
       # Plus default nodegroup (2) + buffer = 80 minimum for 10 pools, 150 for 100 pools
-      concurrent = getattr(FLAGS, 'k8s_mgmt_concurrent_nodepools', 10)
+      concurrent = getattr(FLAGS, "k8s_mgmt_concurrent_nodepools", 10)
       nodes_per_az = max(80, concurrent * 2 + 20)
       # Fetch cluster CA and endpoint for bootstrap user data
       import json as _json
+
       cluster_out, _, cluster_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'eks', 'describe-cluster',
-              '--name', self.name,
-              '--region', self.region,
-              '--query', 'cluster.{endpoint:endpoint,ca:certificateAuthority.data,cidr:kubernetesNetworkConfig.serviceIpv4Cidr}',
-              '--output', 'json',
+          util.AWS_PREFIX
+          + [
+              "eks",
+              "describe-cluster",
+              "--name",
+              self.name,
+              "--region",
+              self.region,
+              "--query",
+              "cluster.{endpoint:endpoint,ca:certificateAuthority.data,cidr:kubernetesNetworkConfig.serviceIpv4Cidr}",
+              "--output",
+              "json",
           ],
           raise_on_failure=False,
       )
-      cluster_ca = ''
-      cluster_endpoint = ''
-      cluster_service_cidr = '10.100.0.0/16'  # default fallback
+      cluster_ca = ""
+      cluster_endpoint = ""
+      cluster_service_cidr = "10.100.0.0/16"  # default fallback
       if cluster_rc == 0 and cluster_out.strip():
         cluster_info = _json.loads(cluster_out.strip())
-        cluster_ca = cluster_info.get('ca', '')
-        cluster_endpoint = cluster_info.get('endpoint', '')
-        cluster_service_cidr = cluster_info.get('cidr', '10.100.0.0/16')
-        logging.info('[EKS] Fetched cluster endpoint=%s cidr=%s for bootstrap',
-                     cluster_endpoint, cluster_service_cidr)
+        cluster_ca = cluster_info.get("ca", "")
+        cluster_endpoint = cluster_info.get("endpoint", "")
+        cluster_service_cidr = cluster_info.get("cidr", "10.100.0.0/16")
+        logging.info(
+            "[EKS] Fetched cluster endpoint=%s cidr=%s for bootstrap",
+            cluster_endpoint,
+            cluster_service_cidr,
+        )
 
       # Query EKS-optimized AMI once for all AZs
       # cluster_version may be None if not explicitly set — fetch from cluster
       if not self.cluster_version:
         ver_out, _, ver_rc = vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'eks', 'describe-cluster',
-                '--name', self.name,
-                '--region', self.region,
-                '--query', 'cluster.version',
-                '--output', 'text',
+            util.AWS_PREFIX
+            + [
+                "eks",
+                "describe-cluster",
+                "--name",
+                self.name,
+                "--region",
+                self.region,
+                "--query",
+                "cluster.version",
+                "--output",
+                "text",
             ],
             raise_on_failure=False,
         )
         if ver_rc != 0 or not ver_out.strip():
           raise errors.Resource.CreationError(
-              '[EKS] Failed to determine cluster version from describe-cluster. '
-              'Cannot proceed without a valid Kubernetes version. '
-              f'rc={ver_rc} out={ver_out.strip()!r}'
+              "[EKS] Failed to determine cluster version from"
+              " describe-cluster. Cannot proceed without a valid Kubernetes"
+              f" version. rc={ver_rc} out={ver_out.strip()!r}"
           )
         self.cluster_version = ver_out.strip()
-        logging.info('[EKS] Resolved cluster version: %s', self.cluster_version)
-      k8s_minor_str = '.'.join(self.cluster_version.split('.')[:2])
+        logging.info("[EKS] Resolved cluster version: %s", self.cluster_version)
+      k8s_minor_str = ".".join(self.cluster_version.split(".")[:2])
       ami_out, _, ami_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'ssm', 'get-parameter',
-              '--name', (
-                  f'/aws/service/eks/optimized-ami/{k8s_minor_str}/'
-                  'amazon-linux-2023/x86_64/standard/recommended/image_id'
+          util.AWS_PREFIX
+          + [
+              "ssm",
+              "get-parameter",
+              "--name",
+              (
+                  f"/aws/service/eks/optimized-ami/{k8s_minor_str}/"
+                  "amazon-linux-2023/x86_64/standard/recommended/image_id"
               ),
-              '--region', self.region,
-              '--query', 'Parameter.Value',
-              '--output', 'text',
+              "--region",
+              self.region,
+              "--query",
+              "Parameter.Value",
+              "--output",
+              "text",
           ],
           raise_on_failure=False,
       )
-      ami_id = ami_out.strip() if ami_rc == 0 and ami_out.strip() else ''
-      logging.info('[EKS] EKS AMI for K8s %s: %s', k8s_minor_str, ami_id)
+      ami_id = ami_out.strip() if ami_rc == 0 and ami_out.strip() else ""
+      logging.info("[EKS] EKS AMI for K8s %s: %s", k8s_minor_str, ami_id)
 
       for az in cluster_azs:
-        logging.info('[EKS] Creating capacity reservation in %s (%d instances)...', az, nodes_per_az)
+        logging.info(
+            "[EKS] Creating capacity reservation in %s (%d instances)...",
+            az,
+            nodes_per_az,
+        )
         cap_out, _, cap_rc = vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'ec2', 'create-capacity-reservation',
-                '--instance-type', 't3.medium',
-                '--instance-platform', 'Linux/UNIX',
-                '--availability-zone', az,
-                '--instance-count', str(nodes_per_az),
-                '--region', self.region,
-                '--query', 'CapacityReservation.CapacityReservationId',
-                '--output', 'text',
+            util.AWS_PREFIX
+            + [
+                "ec2",
+                "create-capacity-reservation",
+                "--instance-type",
+                "t3.medium",
+                "--instance-platform",
+                "Linux/UNIX",
+                "--availability-zone",
+                az,
+                "--instance-count",
+                str(nodes_per_az),
+                "--region",
+                self.region,
+                "--query",
+                "CapacityReservation.CapacityReservationId",
+                "--output",
+                "text",
             ],
             raise_on_failure=False,
         )
-        if cap_rc == 0 and cap_out.strip() and cap_out.strip() != 'None':
+        if cap_rc == 0 and cap_out.strip() and cap_out.strip() != "None":
           res_id = cap_out.strip()
           self._capacity_reservation_ids[az] = res_id
-          logging.info('[EKS] Created capacity reservation %s in %s', res_id, az)
+          logging.info(
+              "[EKS] Created capacity reservation %s in %s", res_id, az
+          )
           if ami_id and cluster_ca and cluster_endpoint:
             import base64 as _b64
             # AL2023 uses nodeadm YAML config — NOT the old bootstrap.sh
             nodeadm_config = (
-                'apiVersion: node.eks.aws/v1alpha1' + chr(10) +
-                'kind: NodeConfig' + chr(10) +
-                'spec:' + chr(10) +
-                '  cluster:' + chr(10) +
-                f'    name: {self.name}' + chr(10) +
-                f'    apiServerEndpoint: {cluster_endpoint}' + chr(10) +
-                f'    certificateAuthority: {cluster_ca}' + chr(10) +
-                f'    cidr: {cluster_service_cidr}'
+                "apiVersion: node.eks.aws/v1alpha1"
+                + chr(10)
+                + "kind: NodeConfig"
+                + chr(10)
+                + "spec:"
+                + chr(10)
+                + "  cluster:"
+                + chr(10)
+                + f"    name: {self.name}"
+                + chr(10)
+                + f"    apiServerEndpoint: {cluster_endpoint}"
+                + chr(10)
+                + f"    certificateAuthority: {cluster_ca}"
+                + chr(10)
+                + f"    cidr: {cluster_service_cidr}"
             )
-            user_data = _b64.b64encode(('MIME-Version: 1.0' + chr(10) +
-                'Content-Type: multipart/mixed; boundary="==BOUNDARY=="' + chr(10) +
-                chr(10) +
-                '--==BOUNDARY==' + chr(10) +
-                'Content-Type: application/node.eks.aws' + chr(10) +
-                chr(10) +
-                nodeadm_config + chr(10) +
-                '--==BOUNDARY==--').encode()).decode()
-            logging.info('[EKS] Using AL2023 nodeadm bootstrap for %s', az)
+            user_data = _b64.b64encode(
+                (
+                    "MIME-Version: 1.0"
+                    + chr(10)
+                    + 'Content-Type: multipart/mixed; boundary="==BOUNDARY=="'
+                    + chr(10)
+                    + chr(10)
+                    + "--==BOUNDARY=="
+                    + chr(10)
+                    + "Content-Type: application/node.eks.aws"
+                    + chr(10)
+                    + chr(10)
+                    + nodeadm_config
+                    + chr(10)
+                    + "--==BOUNDARY==--"
+                ).encode()
+            ).decode()
+            logging.info("[EKS] Using AL2023 nodeadm bootstrap for %s", az)
             lt_data = (
-                '{'
+                "{"
                 f'"ImageId":"{ami_id}",'
                 '"CapacityReservationSpecification":{'
                 '"CapacityReservationPreference":"capacity-reservations-only",'
                 f'"CapacityReservationTarget":{{"CapacityReservationId":"{res_id}"}}}},'
                 f'"UserData":"{user_data}"'
-                '}'
+                "}"
             )
             _, _, lt_rc = vm_util.IssueCommand(
-                util.AWS_PREFIX + [
-                    'ec2', 'create-launch-template',
-                    '--region', self.region,
-                    '--launch-template-name', f'pkb-eks-lt-{az}',
-                    '--launch-template-data', lt_data,
+                util.AWS_PREFIX
+                + [
+                    "ec2",
+                    "create-launch-template",
+                    "--region",
+                    self.region,
+                    "--launch-template-name",
+                    f"pkb-eks-lt-{az}",
+                    "--launch-template-data",
+                    lt_data,
                 ],
                 raise_on_failure=False,
             )
             if lt_rc == 0:
               logging.info(
-                  '[EKS] Created launch template pkb-eks-lt-%s (AMI=%s) -> %s',
-                  az, ami_id, res_id,
+                  "[EKS] Created launch template pkb-eks-lt-%s (AMI=%s) -> %s",
+                  az,
+                  ami_id,
+                  res_id,
               )
             else:
-              logging.warning('[EKS] Failed to create launch template for %s', az)
+              logging.warning(
+                  "[EKS] Failed to create launch template for %s", az
+              )
           else:
-            logging.warning('[EKS] Missing AMI/CA/endpoint — no launch template for %s', az)
+            logging.warning(
+                "[EKS] Missing AMI/CA/endpoint — no launch template for %s",
+                az,
+            )
         else:
-          logging.warning('[EKS] Failed to create capacity reservation in %s — on-demand', az)
+          logging.warning(
+              "[EKS] Failed to create capacity reservation in %s — on-demand",
+              az,
+          )
 
     # Above create command passes "withOidc=true", but it doesn't seem to work &
     # therefore this command is needed.
     if not FLAGS.eks_skip_ebs_csi:
       cmd = [
           FLAGS.eksctl,
-          'utils',
-          'associate-iam-oidc-provider',
-          f'--cluster={self.name}',
-          f'--region={self.region}',
-          '--approve',
+          "utils",
+          "associate-iam-oidc-provider",
+          f"--cluster={self.name}",
+          f"--region={self.region}",
+          "--approve",
       ]
       vm_util.IssueCommand(cmd)
 
@@ -665,65 +743,64 @@ class EksCluster(BaseEksCluster):
     # do not use persistent volumes, such as kubernetes_management).
     if FLAGS.eks_skip_ebs_csi:
       logging.info(
-          '[EKS] Skipping EBS CSI driver setup (--eks_skip_ebs_csi=True). '
-          + 'Saves ~3 min. Set to False if benchmark needs persistent volumes.'
+          "[EKS] Skipping EBS CSI driver setup (--eks_skip_ebs_csi=True). "
+          + "Saves ~3 min. Set to False if benchmark needs persistent volumes."
       )
     else:
       # Name must be unique.
-      ebs_csi_driver_role = f'AmazonEKS_EBS_CSI_DriverRole_{self.name}'
+      ebs_csi_driver_role = f"AmazonEKS_EBS_CSI_DriverRole_{self.name}"
 
       ebs_policy_arn = (
-          'arn:aws:iam::aws:policy/service-role/'
-          + 'AmazonEBSCSIDriverPolicy')
+          "arn:aws:iam::aws:policy/service-role/" + "AmazonEBSCSIDriverPolicy"
+      )
       cmd = [
           FLAGS.eksctl,
-          'create',
-          'iamserviceaccount',
-          '--name=ebs-csi-controller-sa',
-          '--namespace=kube-system',
-          f'--region={self.region}',
-          f'--cluster={self.name}',
-          f'--attach-policy-arn={ebs_policy_arn}',
-          '--approve',
-          '--role-only',
-          f'--role-name={ebs_csi_driver_role}',
+          "create",
+          "iamserviceaccount",
+          "--name=ebs-csi-controller-sa",
+          "--namespace=kube-system",
+          f"--region={self.region}",
+          f"--cluster={self.name}",
+          f"--attach-policy-arn={ebs_policy_arn}",
+          "--approve",
+          "--role-only",
+          f"--role-name={ebs_csi_driver_role}",
       ]
       vm_util.IssueCommand(cmd)
 
-      svc_acct_arn = (
-          f'arn:aws:iam::{self.account}:role/{ebs_csi_driver_role}')
+      svc_acct_arn = f"arn:aws:iam::{self.account}:role/{ebs_csi_driver_role}"
       cmd = [
           FLAGS.eksctl,
-          'create',
-          'addon',
-          '--name=aws-ebs-csi-driver',
-          f'--region={self.region}',
-          f'--cluster={self.name}',
-          f'--service-account-role-arn={svc_acct_arn}',
+          "create",
+          "addon",
+          "--name=aws-ebs-csi-driver",
+          f"--region={self.region}",
+          f"--cluster={self.name}",
+          f"--service-account-role-arn={svc_acct_arn}",
       ]
       vm_util.IssueCommand(cmd)
 
     if aws_flags.AWS_EKS_POD_IDENTITY_ROLE.value:
       cmd = util.AWS_PREFIX + [
-          'eks',
-          'create-addon',
-          '--addon-name=eks-pod-identity-agent',
-          f'--region={self.region}',
-          f'--cluster-name={self.name}',
+          "eks",
+          "create-addon",
+          "--addon-name=eks-pod-identity-agent",
+          f"--region={self.region}",
+          f"--cluster-name={self.name}",
       ]
       vm_util.IssueCommand(cmd)
       cmd = util.AWS_PREFIX + [
-          'eks',
-          'create-pod-identity-association',
-          '--role-arn',
+          "eks",
+          "create-pod-identity-association",
+          "--role-arn",
           (
-              f'arn:aws:iam::{self.account}:role/'
+              f"arn:aws:iam::{self.account}:role/"
               + aws_flags.AWS_EKS_POD_IDENTITY_ROLE.value
           ),
-          '--namespace=default',
-          '--service-account=default',
-          f'--region={self.region}',
-          f'--cluster-name={self.name}',
+          "--namespace=default",
+          "--service-account=default",
+          f"--region={self.region}",
+          f"--cluster-name={self.name}",
       ]
       vm_util.IssueCommand(cmd)
 
@@ -733,11 +810,11 @@ class EksCluster(BaseEksCluster):
     """Constructs the node group json dictionary."""
     base_json = super()._RenderNodeGroupJson(nodepool)
     if nodepool.disk_size:
-      base_json['volumeSize'] = nodepool.disk_size
+      base_json["volumeSize"] = nodepool.disk_size
     base_json.update({
-        'ssh': {
-            'allow': True,
-            'publicKeyPath': (
+        "ssh": {
+            "allow": True,
+            "publicKeyPath": (
                 aws_virtual_machine.AwsKeyFileManager.GetKeyNameForRun()
             ),
         },
@@ -748,20 +825,20 @@ class EksCluster(BaseEksCluster):
         zones = [nodepool.zone]
       else:
         zones = nodepool.zone
-      base_json['availabilityZones'] = zones
+      base_json["availabilityZones"] = zones
     return base_json
 
   def _IsReady(self):
     """Returns True if the workers are ready, else False."""
     get_cmd = [
         FLAGS.kubectl,
-        '--kubeconfig',
+        "--kubeconfig",
         FLAGS.kubeconfig,
-        'get',
-        'nodes',
+        "get",
+        "nodes",
     ]
     stdout, _, _ = vm_util.IssueCommand(get_cmd)
-    ready_nodes = len(re.findall('Ready', stdout))
+    ready_nodes = len(re.findall("Ready", stdout))
     return ready_nodes >= self.min_nodes
 
   def ResizeNodePool(
@@ -770,15 +847,15 @@ class EksCluster(BaseEksCluster):
     """Change the number of nodes in the node group."""
     cmd = [
         FLAGS.eksctl,
-        'scale',
-        'nodegroup',
+        "scale",
+        "nodegroup",
         node_pool,
-        f'--nodes={new_size}',
-        f'--nodes-min={new_size}',
-        f'--nodes-max={new_size}',
-        f'--cluster={self.name}',
-        f'--region={self.region}',
-        '--wait',
+        f"--nodes={new_size}",
+        f"--nodes-min={new_size}",
+        f"--nodes-max={new_size}",
+        f"--cluster={self.name}",
+        f"--region={self.region}",
+        "--wait",
     ]
     vm_util.IssueCommand(cmd)
 
@@ -790,22 +867,22 @@ class EksCluster(BaseEksCluster):
     """Creates a single managed node group on the cluster."""
     ng_json = self._RenderNodeGroupJson(nodepool_config)
     if node_version:
-      ng_json['version'] = node_version
+      ng_json["version"] = node_version
     config_json = {
-        'apiVersion': 'eksctl.io/v1alpha5',
-        'kind': 'ClusterConfig',
-        'metadata': {
-            'name': self.name,
-            'region': self.region,
+        "apiVersion": "eksctl.io/v1alpha5",
+        "kind": "ClusterConfig",
+        "metadata": {
+            "name": self.name,
+            "region": self.region,
         },
-        'managedNodeGroups': [ng_json],
+        "managedNodeGroups": [ng_json],
     }
     filename = self._WriteJsonToFile(config_json)
     cmd = [
         FLAGS.eksctl,
-        'create',
-        'nodegroup',
-        f'--config-file={filename}',
+        "create",
+        "nodegroup",
+        f"--config-file={filename}",
     ]
     _, stderr, retcode = vm_util.IssueCommand(
         cmd, timeout=1800, raise_on_failure=False
@@ -817,12 +894,12 @@ class EksCluster(BaseEksCluster):
     """Deletes the named node group."""
     cmd = [
         FLAGS.eksctl,
-        'delete',
-        'nodegroup',
-        f'--name={name}',
-        f'--cluster={self.name}',
-        f'--region={self.region}',
-        '--wait',
+        "delete",
+        "nodegroup",
+        f"--name={name}",
+        f"--cluster={self.name}",
+        f"--region={self.region}",
+        "--wait",
     ]
     vm_util.IssueCommand(cmd, timeout=1800)
 
@@ -830,13 +907,13 @@ class EksCluster(BaseEksCluster):
     """Upgrades the named node group to target_version."""
     cmd = [
         FLAGS.eksctl,
-        'upgrade',
-        'nodegroup',
-        f'--name={name}',
-        f'--cluster={self.name}',
-        f'--region={self.region}',
-        f'--kubernetes-version={target_version}',
-        '--wait',
+        "upgrade",
+        "nodegroup",
+        f"--name={name}",
+        f"--cluster={self.name}",
+        f"--region={self.region}",
+        f"--kubernetes-version={target_version}",
+        "--wait",
     ]
     vm_util.IssueCommand(cmd, timeout=1800)
 
@@ -844,21 +921,21 @@ class EksCluster(BaseEksCluster):
 
   def _DiscoverSubnets(self) -> list[str]:
     """Returns the EKS cluster's subnet IDs (cached after first call)."""
-    if getattr(self, '_cached_subnets', None):
+    if getattr(self, "_cached_subnets", None):
       return self._cached_subnets
     out, _, _ = vm_util.IssueCommand(
         util.AWS_PREFIX
         + [
-            'eks',
-            'describe-cluster',
-            '--name',
+            "eks",
+            "describe-cluster",
+            "--name",
             self.name,
-            '--region',
+            "--region",
             self.region,
         ]
     )
     info = json.loads(out)
-    self._cached_subnets = info['cluster']['resourcesVpcConfig']['subnetIds']
+    self._cached_subnets = info["cluster"]["resourcesVpcConfig"]["subnetIds"]
     return self._cached_subnets
 
   def _DiscoverSubnetsPerAZ(self) -> dict[str, str]:
@@ -869,7 +946,7 @@ class EksCluster(BaseEksCluster):
     Only returns AZs that are in control_plane_zones (if specified).
     Cached after first call.
     """
-    if getattr(self, '_cached_subnets_per_az', None) is not None:
+    if getattr(self, "_cached_subnets_per_az", None) is not None:
       return self._cached_subnets_per_az
 
     subnet_ids = self._DiscoverSubnets()
@@ -879,19 +956,25 @@ class EksCluster(BaseEksCluster):
 
     # Describe subnets to get their AZ mapping
     out, _, rc = vm_util.IssueCommand(
-        util.AWS_PREFIX + [
-            'ec2', 'describe-subnets',
-            '--region', self.region,
-            '--subnet-ids', *subnet_ids,
-            '--query', 'Subnets[*].{SubnetId:SubnetId,AZ:AvailabilityZone,Public:MapPublicIpOnLaunch}',
-            '--output', 'json',
+        util.AWS_PREFIX
+        + [
+            "ec2",
+            "describe-subnets",
+            "--region",
+            self.region,
+            "--subnet-ids",
+            *subnet_ids,
+            "--query",
+            "Subnets[*].{SubnetId:SubnetId,AZ:AvailabilityZone,Public:MapPublicIpOnLaunch}",
+            "--output",
+            "json",
         ],
         raise_on_failure=False,
     )
     if rc:
       logging.warning(
-          '[EKS] Could not describe subnets for AZ mapping — '
-          + 'falling back to all subnets'
+          "[EKS] Could not describe subnets for AZ mapping — "
+          + "falling back to all subnets"
       )
       self._cached_subnets_per_az = {}
       return {}
@@ -906,20 +989,23 @@ class EksCluster(BaseEksCluster):
     az_map: dict[str, str] = {}
     az_map_private: dict[str, str] = {}
     for s in subnets:
-      az = s['AZ']
-      if s.get('Public'):
-        az_map[az] = s['SubnetId']
-        logging.info('[EKS] AZ %s → public subnet %s', az, s['SubnetId'])
+      az = s["AZ"]
+      if s.get("Public"):
+        az_map[az] = s["SubnetId"]
+        logging.info("[EKS] AZ %s → public subnet %s", az, s["SubnetId"])
       elif az not in az_map:
-        az_map_private[az] = s['SubnetId']
+        az_map_private[az] = s["SubnetId"]
     for az, sid in az_map_private.items():
       if az not in az_map:
-        logging.warning('[EKS] AZ %s has no public subnet — using private %s', az, sid)
+        logging.warning(
+            "[EKS] AZ %s has no public subnet — using private %s", az, sid
+        )
         az_map[az] = sid
 
     logging.info(
-        '[EKS] Subnet-per-AZ mapping: %s (from %d total subnets)',
-        az_map, len(subnet_ids),
+        "[EKS] Subnet-per-AZ mapping: %s (from %d total subnets)",
+        az_map,
+        len(subnet_ids),
     )
     self._cached_subnets_per_az = az_map
     return az_map
@@ -932,31 +1018,31 @@ class EksCluster(BaseEksCluster):
     workers all asking for the same minor; only the first does the SSM
     lookup, the rest read from the cache.
     """
-    if getattr(self, '_release_version_lock', None) is None:
+    if getattr(self, "_release_version_lock", None) is None:
       self._release_version_lock = threading.Lock()
     with self._release_version_lock:
-      cache = getattr(self, '_cached_release_versions', None) or {}
+      cache = getattr(self, "_cached_release_versions", None) or {}
       if minor in cache:
         return cache[minor]
       cmd = util.AWS_PREFIX + [
-          'ssm',
-          'get-parameter',
-          '--name',
+          "ssm",
+          "get-parameter",
+          "--name",
           (
-              f'/aws/service/eks/optimized-ami/{minor}/amazon-linux-2023/'
-              'x86_64/standard/recommended/release_version'
+              f"/aws/service/eks/optimized-ami/{minor}/amazon-linux-2023/"
+              "x86_64/standard/recommended/release_version"
           ),
-          '--region',
+          "--region",
           self.region,
-          '--query',
-          'Parameter.Value',
-          '--output',
-          'text',
+          "--query",
+          "Parameter.Value",
+          "--output",
+          "text",
       ]
       out, err, rc = vm_util.IssueCommand(cmd, raise_on_failure=False)
       if rc:
         raise errors.Resource.CreationError(
-            f'Failed to resolve EKS release version for minor {minor!r}: {err}'
+            f"Failed to resolve EKS release version for minor {minor!r}: {err}"
         )
       cache[minor] = out.strip()
       self._cached_release_versions = cache
@@ -964,40 +1050,40 @@ class EksCluster(BaseEksCluster):
 
   def _DiscoverNodeRoleArn(self) -> str:
     """Returns a node IAM role ARN by inspecting an existing nodegroup."""
-    if getattr(self, '_cached_node_role_arn', None):
+    if getattr(self, "_cached_node_role_arn", None):
       return self._cached_node_role_arn
     out, _, _ = vm_util.IssueCommand(
         util.AWS_PREFIX
         + [
-            'eks',
-            'list-nodegroups',
-            '--cluster-name',
+            "eks",
+            "list-nodegroups",
+            "--cluster-name",
             self.name,
-            '--region',
+            "--region",
             self.region,
         ]
     )
-    for ng_name in json.loads(out).get('nodegroups', []):
+    for ng_name in json.loads(out).get("nodegroups", []):
       ng_out, _, _ = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
-              'eks',
-              'describe-nodegroup',
-              '--cluster-name',
+              "eks",
+              "describe-nodegroup",
+              "--cluster-name",
               self.name,
-              '--nodegroup-name',
+              "--nodegroup-name",
               ng_name,
-              '--region',
+              "--region",
               self.region,
           ]
       )
-      role = json.loads(ng_out)['nodegroup'].get('nodeRole')
+      role = json.loads(ng_out)["nodegroup"].get("nodeRole")
       if role:
         self._cached_node_role_arn = role
         return role
     raise errors.Resource.CreationError(
-        f'No existing nodegroup found to discover node role for '
-        f'cluster {self.name}.'
+        "No existing nodegroup found to discover node role for "
+        f"cluster {self.name}."
     )
 
   def CreateNodePoolAsync(
@@ -1026,7 +1112,7 @@ class EksCluster(BaseEksCluster):
     if az_subnets and len(az_subnets) > 1:
       # Extract numeric suffix from pool name to determine AZ assignment
       name = nodepool_config.name
-      suffix = ''.join(c for c in name if c.isdigit())
+      suffix = "".join(c for c in name if c.isdigit())
       # pkbmb (Scenario B) has no suffix — assign to us-east-1b (idx=1)
       # to avoid competing with us-east-1a which has the default nodegroup.
       idx = int(suffix) if suffix else 1
@@ -1034,81 +1120,108 @@ class EksCluster(BaseEksCluster):
       assigned_az = zones[idx % len(zones)]
       subnets = [az_subnets[assigned_az]]
       logging.info(
-          '[EKS] CreateNodePool %s -> AZ=%s subnet=%s (round-robin idx=%d)',
-          name, assigned_az, subnets[0], idx,
+          "[EKS] CreateNodePool %s -> AZ=%s subnet=%s (round-robin idx=%d)",
+          name,
+          assigned_az,
+          subnets[0],
+          idx,
       )
     else:
       subnets = self._DiscoverSubnets()
-      logging.info('[EKS] CreateNodePool %s -> using all subnets (single AZ)',
-                   nodepool_config.name)
+      logging.info(
+          "[EKS] CreateNodePool %s -> using all subnets (single AZ)",
+          nodepool_config.name,
+      )
 
     payload: dict[str, Any] = {
-        'clusterName': self.name,
-        'nodegroupName': nodepool_config.name,
-        'scalingConfig': {
-            'minSize': nodepool_config.num_nodes,
-            'maxSize': nodepool_config.num_nodes,
-            'desiredSize': nodepool_config.num_nodes,
+        "clusterName": self.name,
+        "nodegroupName": nodepool_config.name,
+        "scalingConfig": {
+            "minSize": nodepool_config.num_nodes,
+            "maxSize": nodepool_config.num_nodes,
+            "desiredSize": nodepool_config.num_nodes,
         },
-        'subnets': subnets,
-        'instanceTypes': [nodepool_config.machine_type],
-        'amiType': 'AL2023_x86_64_STANDARD',
-        'nodeRole': self._DiscoverNodeRoleArn(),
-        'labels': {'pkb_nodepool': nodepool_config.name},
-        'tags': util.MakeDefaultTags(),
+        "subnets": subnets,
+        "instanceTypes": [nodepool_config.machine_type],
+        "amiType": "AL2023_x86_64_STANDARD",
+        "nodeRole": self._DiscoverNodeRoleArn(),
+        "labels": {"pkb_nodepool": nodepool_config.name},
+        "tags": util.MakeDefaultTags(),
         # Target open capacity reservations first before falling back to
         # regular on-demand. Ensures EC2 capacity reservations created
         # before the benchmark are actually used by EKS nodegroups.
-        'capacityReservationSpecification': {
-            'capacityReservationPreference': 'open',
+        "capacityReservationSpecification": {
+            "capacityReservationPreference": "open",
         },
     }
-    _az = assigned_az if az_subnets and len(az_subnets) > 1 else f'{self.region}a'
+    _az = (
+        assigned_az if az_subnets and len(az_subnets) > 1 else f"{self.region}a"
+    )
     # Only look up launch templates and capacity reservations when
     # --eks_reserve_capacity_per_az=true. Other benchmarks skip this entirely.
     if FLAGS.eks_reserve_capacity_per_az:
-      _lt_name = f'pkb-eks-lt-{_az}'
+      _lt_name = f"pkb-eks-lt-{_az}"
       _lt_out, _, _lt_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'ec2', 'describe-launch-templates',
-              '--region', self.region,
-              '--filters', f'Name=launch-template-name,Values={_lt_name}',
-              '--query', 'LaunchTemplates[0].LaunchTemplateId',
-              '--output', 'text',
+          util.AWS_PREFIX
+          + [
+              "ec2",
+              "describe-launch-templates",
+              "--region",
+              self.region,
+              "--filters",
+              f"Name=launch-template-name,Values={_lt_name}",
+              "--query",
+              "LaunchTemplates[0].LaunchTemplateId",
+              "--output",
+              "text",
           ],
           raise_on_failure=False,
       )
-      res_id = self._capacity_reservation_ids.get(_az, '')
-      if res_id and _lt_rc == 0 and _lt_out.strip() and _lt_out.strip() not in ('None', 'null', ''):
-        payload['launchTemplate'] = {'id': _lt_out.strip(), 'version': '$Latest'}
+      res_id = self._capacity_reservation_ids.get(_az, "")
+      if (
+          res_id
+          and _lt_rc == 0
+          and _lt_out.strip()
+          and _lt_out.strip() not in ("None", "null", "")
+      ):
+        payload["launchTemplate"] = {
+            "id": _lt_out.strip(),
+            "version": "$Latest",
+        }
         # When launch template specifies an ImageId, EKS rejects these fields:
         # - releaseVersion: conflicts with AMI
         # - instanceTypes:  must come from launch template only
         # - amiType:        conflicts with AMI
-        payload.pop('releaseVersion', None)
-        payload.pop('instanceTypes', None)
-        payload.pop('amiType', None)
+        payload.pop("releaseVersion", None)
+        payload.pop("instanceTypes", None)
+        payload.pop("amiType", None)
         logging.info(
-            '[EKS] Nodegroup %s using launch template %s targeting reservation %s in AZ %s',
-            nodepool_config.name, _lt_name, res_id, _az,
+            "[EKS] Nodegroup %s using launch template %s targeting reservation"
+            " %s in AZ %s",
+            nodepool_config.name,
+            _lt_name,
+            res_id,
+            _az,
         )
       else:
-        logging.warning('[EKS] No reservation/template for AZ %s — using on-demand', _az)
+        logging.warning(
+            "[EKS] No reservation/template for AZ %s — using on-demand", _az
+        )
 
     if node_version:
       # EKS rejects both 'version' and 'releaseVersion' when a launch template
       # with ImageId is specified — skip both when launchTemplate is in use.
-      if 'launchTemplate' not in payload:
-        payload['version'] = node_version
-        payload['releaseVersion'] = self._ResolveReleaseVersion(node_version)
+      if "launchTemplate" not in payload:
+        payload["version"] = node_version
+        payload["releaseVersion"] = self._ResolveReleaseVersion(node_version)
     filename = self._WriteJsonToFile(payload)
     cmd = util.AWS_PREFIX + [
-        'eks',
-        'create-nodegroup',
-        '--region',
+        "eks",
+        "create-nodegroup",
+        "--region",
         self.region,
-        '--cli-input-json',
-        f'file://{filename}',
+        "--cli-input-json",
+        f"file://{filename}",
     ]
     # Retry on EC2 RunInstances throttling at high concurrency (99 pools).
     max_retries = 5
@@ -1119,27 +1232,31 @@ class EksCluster(BaseEksCluster):
       )
       if retcode == 0:
         break
-      if 'Request limit exceeded' in stderr or 'ThrottlingException' in stderr:
+      if "Request limit exceeded" in stderr or "ThrottlingException" in stderr:
         if attempt < max_retries - 1:
-          delay = base_delay * (2 ** attempt)
+          delay = base_delay * (2**attempt)
           logging.warning(
-              '[EKS] CreateNodegroup %s throttled — retry %d/%d in %ds',
-              nodepool_config.name, attempt + 1, max_retries, delay,
+              "[EKS] CreateNodegroup %s throttled — retry %d/%d in %ds",
+              nodepool_config.name,
+              attempt + 1,
+              max_retries,
+              delay,
           )
           time.sleep(delay)
           continue
       raise errors.Resource.CreationError(stderr)
     else:
       raise errors.Resource.CreationError(
-          f'CreateNodegroup {nodepool_config.name} failed after retries: {stderr}'
+          f"CreateNodegroup {nodepool_config.name} failed after retries:"
+          f" {stderr}"
       )
-    return f'ng_active:{nodepool_config.name}'
+    return f"ng_active:{nodepool_config.name}"
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
     # For Custom AMI nodegroups (using launch template with ImageId),
     # EKS requires the launch template to be passed on upgrade.
     # Determine the AZ for this nodegroup to find the correct launch template.
-    suffix = ''.join(c for c in name if c.isdigit())
+    suffix = "".join(c for c in name if c.isdigit())
     # pkbmb (Scenario B) has no suffix — use idx=1 (us-east-1b) to avoid
     # competing with us-east-1a which already has the default nodegroup
     idx = int(suffix) if suffix else 1
@@ -1148,60 +1265,84 @@ class EksCluster(BaseEksCluster):
       zones = sorted(az_subnets.keys())
       _az = zones[idx % len(zones)]
     else:
-      _az = f'{self.region}a'
+      _az = f"{self.region}a"
     # Only look up launch template when capacity reservations are enabled.
     # For other benchmarks, always use standard kubernetes-version upgrade.
-    lt_id = ''
-    _lt_name = ''
+    lt_id = ""
+    _lt_name = ""
     if FLAGS.eks_reserve_capacity_per_az:
-      _lt_name = f'pkb-eks-lt-{_az}'
+      _lt_name = f"pkb-eks-lt-{_az}"
       lt_out, _, lt_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'ec2', 'describe-launch-templates',
-              '--region', self.region,
-              '--filters', f'Name=launch-template-name,Values={_lt_name}',
-              '--query', 'LaunchTemplates[0].LaunchTemplateId',
-              '--output', 'text',
+          util.AWS_PREFIX
+          + [
+              "ec2",
+              "describe-launch-templates",
+              "--region",
+              self.region,
+              "--filters",
+              f"Name=launch-template-name,Values={_lt_name}",
+              "--query",
+              "LaunchTemplates[0].LaunchTemplateId",
+              "--output",
+              "text",
           ],
           raise_on_failure=False,
       )
-      lt_id = lt_out.strip() if lt_rc == 0 and lt_out.strip() not in ('', 'None', 'null') else ''
+      lt_id = (
+          lt_out.strip()
+          if lt_rc == 0 and lt_out.strip() not in ("", "None", "null")
+          else ""
+      )
 
     # Custom AMI nodegroups cannot use --kubernetes-version — use launch template only
     if lt_id:
       cmd = util.AWS_PREFIX + [
-          'eks', 'update-nodegroup-version',
-          '--cluster-name', self.name,
-          '--nodegroup-name', name,
-          '--region', self.region,
-          '--launch-template', f'id={lt_id},version=$Latest',
+          "eks",
+          "update-nodegroup-version",
+          "--cluster-name",
+          self.name,
+          "--nodegroup-name",
+          name,
+          "--region",
+          self.region,
+          "--launch-template",
+          f"id={lt_id},version=$Latest",
       ]
-      logging.info('[EKS] Upgrading %s with launch template %s in AZ %s',
-                   name, _lt_name, _az)
+      logging.info(
+          "[EKS] Upgrading %s with launch template %s in AZ %s",
+          name,
+          _lt_name,
+          _az,
+      )
     else:
       cmd = util.AWS_PREFIX + [
-          'eks', 'update-nodegroup-version',
-          '--cluster-name', self.name,
-          '--nodegroup-name', name,
-          '--region', self.region,
-          '--kubernetes-version', target_version,
+          "eks",
+          "update-nodegroup-version",
+          "--cluster-name",
+          self.name,
+          "--nodegroup-name",
+          name,
+          "--region",
+          self.region,
+          "--kubernetes-version",
+          target_version,
       ]
     _, stderr, retcode = vm_util.IssueCommand(
         cmd, timeout=300, raise_on_failure=False
     )
     if retcode:
       raise errors.Resource.CreationError(stderr)
-    return f'ng_active:{name}'
+    return f"ng_active:{name}"
 
   def DeleteNodePoolAsync(self, name: str) -> str:
     cmd = util.AWS_PREFIX + [
-        'eks',
-        'delete-nodegroup',
-        '--cluster-name',
+        "eks",
+        "delete-nodegroup",
+        "--cluster-name",
         self.name,
-        '--nodegroup-name',
+        "--nodegroup-name",
         name,
-        '--region',
+        "--region",
         self.region,
     ]
     _, stderr, retcode = vm_util.IssueCommand(
@@ -1209,7 +1350,7 @@ class EksCluster(BaseEksCluster):
     )
     if retcode:
       raise errors.Resource.CreationError(stderr)
-    return f'ng_gone:{name}'
+    return f"ng_gone:{name}"
 
   def UpdateClusterAsync(self) -> str:
     """Fires a CloudWatch logging toggle; returns handle 'cluster_update:<id>'.
@@ -1219,54 +1360,65 @@ class EksCluster(BaseEksCluster):
     cluster's top-level status (which stays ACTIVE during config updates,
     making the wait return instantly and silently mis-reporting latency).
     """
-    log_types = ['api', 'audit', 'authenticator', 'controllerManager',
-                 'scheduler']
+    log_types = [
+        "api",
+        "audit",
+        "authenticator",
+        "controllerManager",
+        "scheduler",
+    ]
     describe = util.AWS_PREFIX + [
-        'eks',
-        'describe-cluster',
-        '--name',
+        "eks",
+        "describe-cluster",
+        "--name",
         self.name,
-        '--region',
+        "--region",
         self.region,
     ]
     out, _, _ = vm_util.IssueCommand(describe)
     current = (
-        json.loads(out)['cluster'].get('logging', {}).get('clusterLogging', [])
+        json.loads(out)["cluster"].get("logging", {}).get("clusterLogging", [])
     )
-    any_enabled = any(e.get('enabled', False) for e in current)
-    payload = json.dumps({
-        'clusterLogging': [
-            {'types': log_types, 'enabled': not any_enabled}
-        ]
-    })
+    any_enabled = any(e.get("enabled", False) for e in current)
+    payload = json.dumps(
+        {"clusterLogging": [{"types": log_types, "enabled": not any_enabled}]}
+    )
     upd = util.AWS_PREFIX + [
-        'eks',
-        'update-cluster-config',
-        '--name',
+        "eks",
+        "update-cluster-config",
+        "--name",
         self.name,
-        '--region',
+        "--region",
         self.region,
-        '--logging',
+        "--logging",
         payload,
     ]
     # Wait for cluster ACTIVE before firing update — at 99-pool scale
     # Scenario A leaves the cluster UPDATING causing ResourceInUseException.
-    logging.info('[EKS] Waiting for cluster ACTIVE before ClusterUpdate...')
+    logging.info("[EKS] Waiting for cluster ACTIVE before ClusterUpdate...")
     for _ in range(60):
       status_out, _, status_rc = vm_util.IssueCommand(
-          util.AWS_PREFIX + [
-              'eks', 'describe-cluster',
-              '--name', self.name,
-              '--region', self.region,
-              '--query', 'cluster.status',
-              '--output', 'text',
+          util.AWS_PREFIX
+          + [
+              "eks",
+              "describe-cluster",
+              "--name",
+              self.name,
+              "--region",
+              self.region,
+              "--query",
+              "cluster.status",
+              "--output",
+              "text",
           ],
           raise_on_failure=False,
       )
-      if status_rc == 0 and status_out.strip() == 'ACTIVE':
-        logging.info('[EKS] Cluster is ACTIVE — proceeding with ClusterUpdate')
+      if status_rc == 0 and status_out.strip() == "ACTIVE":
+        logging.info("[EKS] Cluster is ACTIVE — proceeding with ClusterUpdate")
         break
-      logging.info('[EKS] Cluster status=%s — waiting 5s...', status_out.strip())
+      logging.info(
+          "[EKS] Cluster status=%s — waiting 5s...", status_out.strip()
+      )
       time.sleep(5)
     # Retry on ResourceInUseException race condition
     upd_max_retries = 10
@@ -1277,17 +1429,23 @@ class EksCluster(BaseEksCluster):
       )
       if retcode == 0:
         break
-      if 'ResourceInUseException' in stderr and upd_attempt < upd_max_retries - 1:
+      if (
+          "ResourceInUseException" in stderr
+          and upd_attempt < upd_max_retries - 1
+      ):
         delay = upd_base_delay * (upd_attempt + 1)
         logging.warning(
-            '[EKS] UpdateClusterConfig ResourceInUseException — retry %d/%d in %ds',
-            upd_attempt + 1, upd_max_retries, delay,
+            "[EKS] UpdateClusterConfig ResourceInUseException — retry %d/%d"
+            " in %ds",
+            upd_attempt + 1,
+            upd_max_retries,
+            delay,
         )
         time.sleep(delay)
         continue
       raise errors.Resource.CreationError(stderr)
-    update_id = json.loads(stdout)['update']['id']
-    return f'cluster_update:{update_id}'
+    update_id = json.loads(stdout)["update"]["id"]
+    return f"cluster_update:{update_id}"
 
   def ResolveNodePoolVersions(self) -> tuple[str, str]:
     """Returns (initial, target) EKS nodegroup versions.
@@ -1299,19 +1457,21 @@ class EksCluster(BaseEksCluster):
     """
     cluster_ver = self.cluster_version or self.k8s_version
     # Strip any patch suffix e.g. '1.34.7' -> '1.34'
-    parts = cluster_ver.lstrip('v').split('.')
+    parts = cluster_ver.lstrip("v").split(".")
     major, minor = int(parts[0]), int(parts[1])
-    target  = f'{major}.{minor}'
-    initial = f'{major}.{minor - 1}'
+    target = f"{major}.{minor}"
+    initial = f"{major}.{minor - 1}"
     logging.info(
-        '[EKS] ResolveNodePoolVersions: cluster=%s initial=%s target=%s',
-        cluster_ver, initial, target,
+        "[EKS] ResolveNodePoolVersions: cluster=%s initial=%s target=%s",
+        cluster_ver,
+        initial,
+        target,
     )
     return initial, target
 
   def WaitForOperation(self, op_handle: str) -> None:
     """Polls EKS resources until the expected terminal state is observed."""
-    kind, _, name = op_handle.partition(':')
+    kind, _, name = op_handle.partition(":")
 
     @vm_util.Retry(
         poll_interval=5,
@@ -1323,28 +1483,28 @@ class EksCluster(BaseEksCluster):
       out, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
-              'eks',
-              'describe-nodegroup',
-              '--cluster-name',
+              "eks",
+              "describe-nodegroup",
+              "--cluster-name",
               self.name,
-              '--nodegroup-name',
+              "--nodegroup-name",
               name,
-              '--region',
+              "--region",
               self.region,
           ],
           raise_on_failure=False,
       )
       if rc:
         raise errors.Resource.RetryableCreationError(err)
-      status = json.loads(out)['nodegroup']['status']
-      if status in ('ACTIVE',):
+      status = json.loads(out)["nodegroup"]["status"]
+      if status in ("ACTIVE",):
         return
-      if status in ('CREATE_FAILED', 'DELETE_FAILED', 'DEGRADED'):
+      if status in ("CREATE_FAILED", "DELETE_FAILED", "DEGRADED"):
         raise errors.Resource.CreationError(
-            f'nodegroup {name} ended in {status}'
+            f"nodegroup {name} ended in {status}"
         )
       raise errors.Resource.RetryableCreationError(
-          f'nodegroup {name} status={status}'
+          f"nodegroup {name} status={status}"
       )
 
     @vm_util.Retry(
@@ -1357,23 +1517,23 @@ class EksCluster(BaseEksCluster):
       _, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
-              'eks',
-              'describe-nodegroup',
-              '--cluster-name',
+              "eks",
+              "describe-nodegroup",
+              "--cluster-name",
               self.name,
-              '--nodegroup-name',
+              "--nodegroup-name",
               name,
-              '--region',
+              "--region",
               self.region,
           ],
           raise_on_failure=False,
       )
-      if rc and 'ResourceNotFoundException' in (err or ''):
+      if rc and "ResourceNotFoundException" in (err or ""):
         return
       if rc:
         raise errors.Resource.RetryableDeletionError(err)
       raise errors.Resource.RetryableDeletionError(
-          f'nodegroup {name} still present'
+          f"nodegroup {name} still present"
       )
 
     @vm_util.Retry(
@@ -1386,42 +1546,42 @@ class EksCluster(BaseEksCluster):
       out, err, rc = vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
-              'eks',
-              'describe-update',
-              '--name',
+              "eks",
+              "describe-update",
+              "--name",
               self.name,
-              '--update-id',
+              "--update-id",
               name,
-              '--region',
+              "--region",
               self.region,
-              '--query',
-              'update.status',
-              '--output',
-              'text',
+              "--query",
+              "update.status",
+              "--output",
+              "text",
           ],
           raise_on_failure=False,
       )
       if rc:
         raise errors.Resource.RetryableCreationError(err)
       status = out.strip()
-      if status == 'Successful':
+      if status == "Successful":
         return
-      if status in ('Failed', 'Cancelled'):
+      if status in ("Failed", "Cancelled"):
         raise errors.Resource.CreationError(
-            f'cluster update {name} ended in {status}'
+            f"cluster update {name} ended in {status}"
         )
       raise errors.Resource.RetryableCreationError(
-          f'cluster update {name} status={status}'
+          f"cluster update {name} status={status}"
       )
 
-    if kind == 'ng_active':
+    if kind == "ng_active":
       _wait_ng_active()
-    elif kind == 'ng_gone':
+    elif kind == "ng_gone":
       _wait_ng_gone()
-    elif kind == 'cluster_update':
+    elif kind == "cluster_update":
       _wait_cluster_update()
     else:
-      raise ValueError(f'Unknown EKS op handle: {op_handle!r}')
+      raise ValueError(f"Unknown EKS op handle: {op_handle!r}")
 
   def UpdateCluster(self) -> None:
     """Real cluster-level update via a CloudWatch logging toggle.
@@ -1431,28 +1591,38 @@ class EksCluster(BaseEksCluster):
     five log types is a 5-10 minute control-plane op, giving a meaningful
     overlap window for Scenario B.
     """
-    log_types = ['api', 'audit', 'authenticator', 'controllerManager',
-                 'scheduler']
+    log_types = [
+        "api",
+        "audit",
+        "authenticator",
+        "controllerManager",
+        "scheduler",
+    ]
     describe = util.AWS_PREFIX + [
-        'eks', 'describe-cluster',
-        '--name', self.name,
-        '--region', self.region,
+        "eks",
+        "describe-cluster",
+        "--name",
+        self.name,
+        "--region",
+        self.region,
     ]
     stdout, _, _ = vm_util.IssueCommand(describe)
     info = json.loads(stdout)
-    current = info['cluster'].get('logging', {}).get('clusterLogging', [])
-    any_enabled = any(entry.get('enabled', False) for entry in current)
+    current = info["cluster"].get("logging", {}).get("clusterLogging", [])
+    any_enabled = any(entry.get("enabled", False) for entry in current)
     new_enabled = not any_enabled
-    logging_payload = json.dumps({
-        'clusterLogging': [
-            {'types': log_types, 'enabled': new_enabled}
-        ]
-    })
+    logging_payload = json.dumps(
+        {"clusterLogging": [{"types": log_types, "enabled": new_enabled}]}
+    )
     update = util.AWS_PREFIX + [
-        'eks', 'update-cluster-config',
-        '--name', self.name,
-        '--region', self.region,
-        '--logging', logging_payload,
+        "eks",
+        "update-cluster-config",
+        "--name",
+        self.name,
+        "--region",
+        self.region,
+        "--logging",
+        logging_payload,
     ]
     vm_util.IssueCommand(update, timeout=900)
 
@@ -1464,18 +1634,21 @@ class EksCluster(BaseEksCluster):
     )
     def _wait_active():
       query = util.AWS_PREFIX + [
-          'eks', 'describe-cluster',
-          '--name', self.name,
-          '--region', self.region,
-          '--query', 'cluster.status',
-          '--output', 'text',
+          "eks",
+          "describe-cluster",
+          "--name",
+          self.name,
+          "--region",
+          self.region,
+          "--query",
+          "cluster.status",
+          "--output",
+          "text",
       ]
       out, _, _ = vm_util.IssueCommand(query)
       status = out.strip()
-      if status != 'ACTIVE':
-        raise errors.Resource.RetryableCreationError(
-            f'cluster status={status}'
-        )
+      if status != "ACTIVE":
+        raise errors.Resource.RetryableCreationError(f"cluster status={status}")
 
     _wait_active()
 
@@ -1490,7 +1663,7 @@ class EksAutoCluster(BaseEksCluster):
   """
 
   CLOUD = provider_info.AWS
-  CLUSTER_TYPE = 'Auto'
+  CLUSTER_TYPE = "Auto"
 
   def __init__(self, spec):
     super().__init__(spec)
@@ -1500,18 +1673,18 @@ class EksAutoCluster(BaseEksCluster):
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
-    self._EksCtlCreate({'autoModeConfig': {'enabled': True}})
+    self._EksCtlCreate({"autoModeConfig": {"enabled": True}})
 
     # Enable public and private access to the cluster.
     vpc_cmd = [
         FLAGS.eksctl,
-        'utils',
-        'update-cluster-vpc-config',
-        f'--cluster={self.name}',
-        f'--region={self.region}',
-        '--private-access=true',
-        '--public-access=true',
-        '--approve',
+        "utils",
+        "update-cluster-vpc-config",
+        f"--cluster={self.name}",
+        f"--region={self.region}",
+        "--private-access=true",
+        "--public-access=true",
+        "--approve",
     ]
     # Retry esp. "cluster currently has an update in progress" errors.
     vm_util.IssueRetryableCommand(vpc_cmd, timeout=900)
@@ -1521,7 +1694,7 @@ class EksAutoCluster(BaseEksCluster):
     super()._PostCreate()
     if self.use_spot:
       kubernetes_commands.ApplyManifest(
-          'container/auto/nodepool.yaml.j2',
+          "container/auto/nodepool.yaml.j2",
           CLUSTER_NAME=self.name,
       )
 
@@ -1534,45 +1707,55 @@ class EksAutoCluster(BaseEksCluster):
       pass
     # Clean up dynamically created launch templates and capacity reservations
     # Only runs if capacity reservations were actually created this run.
-    if getattr(FLAGS, 'eks_reserve_capacity_per_az', False):
-      for az in getattr(self, '_capacity_reservation_ids', {}).keys():
+    if getattr(FLAGS, "eks_reserve_capacity_per_az", False):
+      for az in getattr(self, "_capacity_reservation_ids", {}).keys():
         vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'ec2', 'delete-launch-template',
-                '--launch-template-name', f'pkb-eks-lt-{az}',
-                '--region', self.region,
+            util.AWS_PREFIX
+            + [
+                "ec2",
+                "delete-launch-template",
+                "--launch-template-name",
+                f"pkb-eks-lt-{az}",
+                "--region",
+                self.region,
             ],
             raise_on_failure=False,
         )
-        logging.info('[EKS] Deleted launch template pkb-eks-lt-%s', az)
-      for az, res_id in getattr(self, '_capacity_reservation_ids', {}).items():
+        logging.info("[EKS] Deleted launch template pkb-eks-lt-%s", az)
+      for az, res_id in getattr(self, "_capacity_reservation_ids", {}).items():
         vm_util.IssueCommand(
-            util.AWS_PREFIX + [
-                'ec2', 'cancel-capacity-reservation',
-                '--capacity-reservation-id', res_id,
-                '--region', self.region,
+            util.AWS_PREFIX
+            + [
+                "ec2",
+                "cancel-capacity-reservation",
+                "--capacity-reservation-id",
+                res_id,
+                "--region",
+                self.region,
             ],
             raise_on_failure=False,
         )
-        logging.info('[EKS] Cancelled capacity reservation %s in %s', res_id, az)
+        logging.info(
+            "[EKS] Cancelled capacity reservation %s in %s", res_id, az
+        )
     super()._Delete()
     cmd = [
         FLAGS.eksctl,
-        'delete',
-        'cluster',
-        '--name',
+        "delete",
+        "cluster",
+        "--name",
         self.name,
-        '--region',
+        "--region",
         self.region,
     ]
     vm_util.IssueCommand(cmd, timeout=1800)
 
   def _IsReady(self):
     """Returns True if cluster is running. Autopilot defaults to 0 nodes."""
-    stdout, _, _ = kubectl.RunKubectlCommand(['cluster-info'])
+    stdout, _, _ = kubectl.RunKubectlCommand(["cluster-info"])
     # These two strings are printed in sequence, but with ansi color code
     # escape characters in between.
-    return 'Kubernetes control plane' in stdout and 'is running at' in stdout
+    return "Kubernetes control plane" in stdout and "is running at" in stdout
 
   def GetDefaultStorageClass(self) -> str:
     """Get the default storage class for the provider."""
@@ -1591,19 +1774,19 @@ class EksAutoCluster(BaseEksCluster):
     # Theoretically needed in mixed mode, but deployments fail without it.
     # See: docs.aws.amazon.com/eks/latest/userguide/associate-workload.html
     # #_require_a_workload_is_deployed_to_eks_auto_mode_nodes
-    selectors = {'eks.amazonaws.com/compute-type': 'auto'}
+    selectors = {"eks.amazonaws.com/compute-type": "auto"}
     if self.use_spot:
-      selectors['karpenter.sh/capacity-type'] = 'spot'
+      selectors["karpenter.sh/capacity-type"] = "spot"
     if virtual_machine.GPU_TYPE.value:
-      selectors['eks.amazonaws.com/instance-gpu-name'] = (
+      selectors["eks.amazonaws.com/instance-gpu-name"] = (
           virtual_machine.GPU_TYPE.value
       )
     return selectors
 
 
-_KARPENTER_NAMESPACE = 'kube-system'
-_KARPENTER_VERSION = '1.8.1'
-_DEFAULT_K8S_VERSION = '1.34'
+_KARPENTER_NAMESPACE = "kube-system"
+_KARPENTER_VERSION = "1.8.1"
+_DEFAULT_K8S_VERSION = "1.34"
 
 
 class EksKarpenterCluster(BaseEksCluster):
@@ -1613,12 +1796,12 @@ class EksKarpenterCluster(BaseEksCluster):
   """
 
   CLOUD = provider_info.AWS
-  CLUSTER_TYPE = 'Karpenter'
+  CLUSTER_TYPE = "Karpenter"
 
   def __init__(self, spec):
     super().__init__(spec)
     self._ChooseSecondZone()
-    self.stack_name = f'Karpenter-{self.name}'
+    self.stack_name = f"Karpenter-{self.name}"
     self.cluster_version: str = self.cluster_version or _DEFAULT_K8S_VERSION
     # The AMI version for current kubernetes version.
     # See e.g. https://karpenter.sh/docs/tasks/managing-amis/ for not using
@@ -1627,37 +1810,38 @@ class EksKarpenterCluster(BaseEksCluster):
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
-    template_filename = vm_util.PrependTempDir('cloud-formation-template.yaml')
+    template_filename = vm_util.PrependTempDir("cloud-formation-template.yaml")
     cfn_url = (
-        'https://raw.githubusercontent.com/aws/karpenter-provider-aws/'
-        + f'v{_KARPENTER_VERSION}/website/content/en/preview/'
-        + 'getting-started/getting-started-with-karpenter/'
-        + 'cloudformation.yaml')
+        "https://raw.githubusercontent.com/aws/karpenter-provider-aws/"
+        + f"v{_KARPENTER_VERSION}/website/content/en/preview/"
+        + "getting-started/getting-started-with-karpenter/"
+        + "cloudformation.yaml"
+    )
     vm_util.IssueCommand([
-        'curl',
-        '-fsSL',
+        "curl",
+        "-fsSL",
         cfn_url,
-        '-o',
+        "-o",
         template_filename,
     ])
     # key=value format differs from other service's Key=key,Value=value format
-    formation_tags = [f'{k}={v}' for k, v in util.MakeDefaultTags().items()]
+    formation_tags = [f"{k}={v}" for k, v in util.MakeDefaultTags().items()]
     vm_util.IssueCommand(
         [
-            'aws',
-            'cloudformation',
-            'deploy',
-            '--stack-name',
+            "aws",
+            "cloudformation",
+            "deploy",
+            "--stack-name",
             self.stack_name,
-            '--template-file',
+            "--template-file",
             template_filename,
-            '--capabilities',
-            'CAPABILITY_NAMED_IAM',
-            '--parameter-overrides',
-            f'ClusterName={self.name}',
-            '--region',
-            f'{self.region}',
-            '--tags',
+            "--capabilities",
+            "CAPABILITY_NAMED_IAM",
+            "--parameter-overrides",
+            f"ClusterName={self.name}",
+            "--region",
+            f"{self.region}",
+            "--tags",
         ]
         + formation_tags,
     )
@@ -1667,34 +1851,33 @@ class EksKarpenterCluster(BaseEksCluster):
     bootstrapping_nodepool.num_nodes = 1
     bootstrapping_nodepool.min_nodes = 1
     bootstrapping_nodepool.max_nodes = 1
-    bootstrapping_nodepool.machine_type = 'm7i.2xlarge'
+    bootstrapping_nodepool.machine_type = "m7i.2xlarge"
     karpenter_policy_arn = (
-        f'arn:aws:iam::{self.account}:policy/'
-        + f'KarpenterControllerPolicy-{self.name}')
+        f"arn:aws:iam::{self.account}:policy/"
+        + f"KarpenterControllerPolicy-{self.name}"
+    )
     karpenter_node_role_arn = (
-        f'arn:aws:iam::{self.account}:role/'
-        + f'KarpenterNodeRole-{self.name}')
+        f"arn:aws:iam::{self.account}:role/" + f"KarpenterNodeRole-{self.name}"
+    )
     create_json: dict[str, Any] = {
-        'metadata': {
-            'tags': {'karpenter.sh/discovery': self.name},
+        "metadata": {
+            "tags": {"karpenter.sh/discovery": self.name},
         },
-        'iam': {
-            'podIdentityAssociations': [{
-                'namespace': _KARPENTER_NAMESPACE,
-                'serviceAccountName': 'karpenter',
-                'roleName': f'{self.name}-karpenter',
-                'permissionPolicyARNs': [
-                    karpenter_policy_arn
-                ],
+        "iam": {
+            "podIdentityAssociations": [{
+                "namespace": _KARPENTER_NAMESPACE,
+                "serviceAccountName": "karpenter",
+                "roleName": f"{self.name}-karpenter",
+                "permissionPolicyARNs": [karpenter_policy_arn],
             }],
         },
-        'iamIdentityMappings': [{
-            'arn': karpenter_node_role_arn,
-            'username': 'system:node:{{EC2PrivateDNSName}}',
-            'groups': ['system:bootstrappers', 'system:nodes'],
+        "iamIdentityMappings": [{
+            "arn": karpenter_node_role_arn,
+            "username": "system:node:{{EC2PrivateDNSName}}",
+            "groups": ["system:bootstrappers", "system:nodes"],
         }],
-        'addons': [{'name': 'eks-pod-identity-agent'}],
-        'managedNodeGroups': [
+        "addons": [{"name": "eks-pod-identity-agent"}],
+        "managedNodeGroups": [
             self._RenderNodeGroupJson(bootstrapping_nodepool)
         ],
     }
@@ -1706,132 +1889,134 @@ class EksKarpenterCluster(BaseEksCluster):
     vm_util.IssueCommand(
         [
             FLAGS.eksctl,
-            'utils',
-            'associate-iam-oidc-provider',
-            f'--region={self.region}',
-            f'--cluster={self.name}',
-            '--approve',
+            "utils",
+            "associate-iam-oidc-provider",
+            f"--region={self.region}",
+            f"--cluster={self.name}",
+            "--approve",
         ],
-        suppress_failure=lambda stdout, stderr, retcode: 'already associated'
+        suppress_failure=lambda stdout, stderr, retcode: "already associated"
         in stderr,
     )
     # 2) Ensure the IAM policy exists (reuse by name or create)
     list_cmd = util.AWS_PREFIX + [
-        'iam',
-        'list-policies',
-        '--scope',
-        'Local',
-        '--query',
+        "iam",
+        "list-policies",
+        "--scope",
+        "Local",
+        "--query",
         "Policies[?PolicyName=='AWSLoadBalancerControllerIAMPolicy'].Arn | [0]",
-        '--output',
-        'text',
+        "--output",
+        "text",
     ]
     stdout, _, _ = vm_util.IssueCommand(list_cmd)
-    policy_arn = (stdout or '').strip()
-    if not policy_arn or policy_arn == 'None':
-      with vm_util.NamedTemporaryFile(dir=vm_util.GetTempDir(), mode='w') as tf:
+    policy_arn = (stdout or "").strip()
+    if not policy_arn or policy_arn == "None":
+      with vm_util.NamedTemporaryFile(dir=vm_util.GetTempDir(), mode="w") as tf:
         alb_policy_url = (
-            'https://raw.githubusercontent.com/kubernetes-sigs/'
-            + 'aws-load-balancer-controller/'
-            + 'v2.13.4/docs/install/iam_policy.json')
+            "https://raw.githubusercontent.com/kubernetes-sigs/"
+            + "aws-load-balancer-controller/"
+            + "v2.13.4/docs/install/iam_policy.json"
+        )
         vm_util.IssueCommand([
-            'curl',
-            '-sSL',
-            '-o',
+            "curl",
+            "-sSL",
+            "-o",
             tf.name,
             alb_policy_url,
         ])
         stdout, _, _ = vm_util.IssueCommand(
             util.AWS_PREFIX
             + [
-                'iam',
-                'create-policy',
-                '--policy-name',
-                'AWSLoadBalancerControllerIAMPolicy',
-                '--policy-document',
-                f'file://{tf.name}',
-                '--query',
-                'Policy.Arn',
-                '--output',
-                'text',
+                "iam",
+                "create-policy",
+                "--policy-name",
+                "AWSLoadBalancerControllerIAMPolicy",
+                "--policy-document",
+                f"file://{tf.name}",
+                "--query",
+                "Policy.Arn",
+                "--output",
+                "text",
             ]
         )
-        policy_arn = (stdout or '').strip()
+        policy_arn = (stdout or "").strip()
     # 3) Ensure ServiceAccount
     vm_util.IssueCommand(
         [
             FLAGS.eksctl,
-            'create',
-            'iamserviceaccount',
-            '--cluster',
+            "create",
+            "iamserviceaccount",
+            "--cluster",
             self.name,
-            '--region',
+            "--region",
             self.region,
-            '--namespace',
-            'kube-system',
-            '--name',
-            'aws-load-balancer-controller',
-            '--attach-policy-arn',
+            "--namespace",
+            "kube-system",
+            "--name",
+            "aws-load-balancer-controller",
+            "--attach-policy-arn",
             policy_arn,
-            '--approve',
-            '--override-existing-serviceaccounts',
+            "--approve",
+            "--override-existing-serviceaccounts",
         ],
-        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        suppress_failure=lambda stdout, stderr, retcode: "already exists"
         in stderr,
     )
     # 4) Apply CRDs
     crds_url = (
-        'https://raw.githubusercontent.com/aws/eks-charts/master/'
-        + 'stable/aws-load-balancer-controller/crds/crds.yaml')
+        "https://raw.githubusercontent.com/aws/eks-charts/master/"
+        + "stable/aws-load-balancer-controller/crds/crds.yaml"
+    )
     kubectl.RunKubectlCommand(
         [
-            'apply',
-            '-f',
+            "apply",
+            "-f",
             crds_url,
         ],
-        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        suppress_failure=lambda stdout, stderr, retcode: "already exists"
         in stderr,
     )
     # 5) Install via helm.
     vm_util.IssueCommand(
-        ['helm', 'repo', 'add', 'eks', 'https://aws.github.io/eks-charts'],
-        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        ["helm", "repo", "add", "eks", "https://aws.github.io/eks-charts"],
+        suppress_failure=lambda stdout, stderr, retcode: "already exists"
         in stderr,
     )
-    vm_util.IssueCommand(['helm', 'repo', 'update', 'eks'])
+    vm_util.IssueCommand(["helm", "repo", "update", "eks"])
     vm_util.IssueCommand([
-        'helm',
-        'upgrade',
-        '--install',
-        'aws-load-balancer-controller',
-        'eks/aws-load-balancer-controller',
-        '-n',
-        'kube-system',
-        '--kubeconfig',
+        "helm",
+        "upgrade",
+        "--install",
+        "aws-load-balancer-controller",
+        "eks/aws-load-balancer-controller",
+        "-n",
+        "kube-system",
+        "--kubeconfig",
         FLAGS.kubeconfig,
-        '--set',
-        f'clusterName={self.name}',
-        '--set',
-        'serviceAccount.create=false',
-        '--set',
-        'serviceAccount.name=aws-load-balancer-controller',
-        '--set',
-        f'region={self.region}',
-        '--set',
-        'createIngressClassResource=true',
-        '--set',
-        'ingressClass=alb',
-        '--set',
-        'replicaCount=1',
+        "--set",
+        f"clusterName={self.name}",
+        "--set",
+        "serviceAccount.create=false",
+        "--set",
+        "serviceAccount.name=aws-load-balancer-controller",
+        "--set",
+        f"region={self.region}",
+        "--set",
+        "createIngressClassResource=true",
+        "--set",
+        "ingressClass=alb",
+        "--set",
+        "replicaCount=1",
     ])
     # 6) Wait for rollout
     kubectl.RunKubectlCommand([
-        'rollout',
-        'status',
-        'deployment/aws-load-balancer-controller',
-        '-n',
-        'kube-system',
-        '--timeout=180s',
+        "rollout",
+        "status",
+        "deployment/aws-load-balancer-controller",
+        "-n",
+        "kube-system",
+        "--timeout=180s",
     ])
 
   @property
@@ -1844,27 +2029,27 @@ class EksKarpenterCluster(BaseEksCluster):
     Returns:
       The path to the ingress manifest template file.
     """
-    return 'container/karpenter/ingress_alb.yaml.j2'
+    return "container/karpenter/ingress_alb.yaml.j2"
 
   def _WaitForIngress(self, name: str, namespace: str, port: int) -> str:
     """Wait for the ingress & apply some additional networking fixes."""
     # Wait until the ingress resource gets an address (hostname or IP).
     kubernetes_commands.WaitForResource(
-        'ingress',
+        "ingress",
         kubernetes_cluster.INGRESS_JSONPATH,
         namespace=namespace,
-        condition_type='jsonpath=',
+        condition_type="jsonpath=",
         extra_args=[name],
     )
     # Retrieve the ingress address to return it back.
     stdout, _, _ = kubectl.RunKubectlCommand([
-        'get',
-        'ingress',
+        "get",
+        "ingress",
         name,
-        '-n',
+        "-n",
         namespace,
-        '-o',
-        f'jsonpath={kubernetes_cluster.INGRESS_JSONPATH}',
+        "-o",
+        f"jsonpath={kubernetes_cluster.INGRESS_JSONPATH}",
     ])
     address = self._GetAddressFromIngress(stdout)
 
@@ -1884,77 +2069,77 @@ class EksKarpenterCluster(BaseEksCluster):
     # 1) Get ALB security group from address
     host = (
         parse.urlparse(address).hostname
-        if address.startswith('http')
+        if address.startswith("http")
         else address
     )
-    normalized = (host or '').replace('dualstack.', '')
+    normalized = (host or "").replace("dualstack.", "")
     if not normalized:
       raise errors.Config.InvalidValue(
-          f'No valid hostname in address: {address}'
+          f"No valid hostname in address: {address}"
       )
     out, _ = vm_util.IssueRetryableCommand(
         util.AWS_PREFIX
         + [
-            'elbv2',
-            'describe-load-balancers',
-            '--region',
+            "elbv2",
+            "describe-load-balancers",
+            "--region",
             self.region,
-            '--query',
+            "--query",
             (
-                'LoadBalancers[?contains(DNSName,'
+                "LoadBalancers[?contains(DNSName,"
                 f" '{normalized}')].SecurityGroups[0]"
             ),
-            '--output',
-            'text',
+            "--output",
+            "text",
         ],
         timeout=120,
     )
-    alb_sg = (out or '').strip()
-    if not alb_sg or alb_sg == 'None':
+    alb_sg = (out or "").strip()
+    if not alb_sg or alb_sg == "None":
       raise errors.Resource.GetError(
-          f'ALB security group not found for {normalized}'
+          f"ALB security group not found for {normalized}"
       )
     # 2) Get node security groups from actual running instances
     ids_out, _ = vm_util.IssueRetryableCommand(
         [
             FLAGS.kubectl,
-            '--kubeconfig',
+            "--kubeconfig",
             FLAGS.kubeconfig,
-            'get',
-            'nodes',
-            '-o',
-            'jsonpath={.items[*].spec.providerID}',
+            "get",
+            "nodes",
+            "-o",
+            "jsonpath={.items[*].spec.providerID}",
         ],
         timeout=120,
     )
     if not ids_out.strip():
-      raise errors.Resource.GetError('No nodes found in cluster')
+      raise errors.Resource.GetError("No nodes found in cluster")
     # 3) Extract instance IDs
     instance_ids = [
-        pid.split('/')[-1]
+        pid.split("/")[-1]
         for pid in ids_out.split()
-        if '/' in pid and pid.split('/')[-1].startswith('i-')
+        if "/" in pid and pid.split("/")[-1].startswith("i-")
     ]
     if not instance_ids:
-      raise errors.Resource.GetError('No valid instance IDs found from nodes')
+      raise errors.Resource.GetError("No valid instance IDs found from nodes")
     out, _, _ = vm_util.IssueCommand(
         util.AWS_PREFIX
         + [
-            'ec2',
-            'describe-instances',
-            '--region',
+            "ec2",
+            "describe-instances",
+            "--region",
             self.region,
-            '--instance-ids',
+            "--instance-ids",
             *instance_ids,
-            '--query',
-            'Reservations[].Instances[].SecurityGroups[].GroupId',
-            '--output',
-            'text',
+            "--query",
+            "Reservations[].Instances[].SecurityGroups[].GroupId",
+            "--output",
+            "text",
         ]
     )
     if not out.strip():
       raise errors.Resource.GetError(
-          f'No security groups found for instances: {instance_ids}'
+          f"No security groups found for instances: {instance_ids}"
       )
     node_sgs = set(out.split())
     # 4) CRITICAL: Allow ALB to reach nodes on app port (fixes 504 errors)
@@ -1962,88 +2147,88 @@ class EksKarpenterCluster(BaseEksCluster):
       vm_util.IssueCommand(
           util.AWS_PREFIX
           + [
-              'ec2',
-              'authorize-security-group-ingress',
-              '--region',
+              "ec2",
+              "authorize-security-group-ingress",
+              "--region",
               self.region,
-              '--group-id',
+              "--group-id",
               sg,
-              '--protocol',
-              'tcp',
-              '--port',
+              "--protocol",
+              "tcp",
+              "--port",
               str(port),
-              '--source-group',
+              "--source-group",
               alb_sg,
           ],
-          suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+          suppress_failure=lambda stdout, stderr, retcode: "already exists"
           in stderr,
       )
     logging.info(
-        '[PKB][EKS] Allowed ALB SG %s -> node SGs on port %s', alb_sg, port
+        "[PKB][EKS] Allowed ALB SG %s -> node SGs on port %s", alb_sg, port
     )
 
   def _PostCreate(self):
     """Performs post-creation steps for the cluster."""
     super()._PostCreate()
     if FLAGS.eks_tune_vpc_cni_for_scale:
-      logging.info('Tuning aws-node (VPC CNI) for kubernetes_node_scale')
+      logging.info("Tuning aws-node (VPC CNI) for kubernetes_node_scale")
       kubectl.RunKubectlCommand([
-          'set',
-          'env',
-          'daemonset/aws-node',
-          '-n',
-          'kube-system',
-          'WARM_ENI_TARGET=0',
-          'WARM_IP_TARGET=1',
-          'MINIMUM_IP_TARGET=1',
+          "set",
+          "env",
+          "daemonset/aws-node",
+          "-n",
+          "kube-system",
+          "WARM_ENI_TARGET=0",
+          "WARM_IP_TARGET=1",
+          "MINIMUM_IP_TARGET=1",
       ])
       kubectl.RunRetryableKubectlCommand(
           [
-              'rollout',
-              'status',
-              'daemonset/aws-node',
-              '-n',
-              'kube-system',
-              f'--timeout={vm_util.DEFAULT_TIMEOUT}s',
+              "rollout",
+              "status",
+              "daemonset/aws-node",
+              "-n",
+              "kube-system",
+              f"--timeout={vm_util.DEFAULT_TIMEOUT}s",
           ],
           timeout=vm_util.DEFAULT_TIMEOUT,
       )
     # Karpenter controller resources: default 1/1Gi; scale up controller when
     # more nodes are expected.
     if self.max_total_nodes > 1000:
-      controller_cpu, controller_memory = 4, '16Gi'
+      controller_cpu, controller_memory = 4, "16Gi"
     elif self.max_total_nodes >= 500:
-      controller_cpu, controller_memory = 2, '8Gi'
+      controller_cpu, controller_memory = 2, "8Gi"
     else:
-      controller_cpu, controller_memory = 1, '1Gi'
+      controller_cpu, controller_memory = 1, "1Gi"
     vm_util.IssueCommand([
-        'helm',
-        'upgrade',
-        '--install',
-        'karpenter',
-        'oci://public.ecr.aws/karpenter/karpenter',
-        '--version',
+        "helm",
+        "upgrade",
+        "--install",
+        "karpenter",
+        "oci://public.ecr.aws/karpenter/karpenter",
+        "--version",
         str(_KARPENTER_VERSION),
-        '--namespace',
+        "--namespace",
         _KARPENTER_NAMESPACE,
-        '--kubeconfig',
+        "--kubeconfig",
         FLAGS.kubeconfig,
-        '--create-namespace',
-        '--set',
-        f'settings.clusterName={self.name}',
-        '--set',
-        f'settings.interruptionQueue={self.name}',
-        '--set',
-        f'controller.resources.requests.cpu={controller_cpu}',
-        '--set',
-        f'controller.resources.requests.memory={controller_memory}',
-        '--set',
-        f'controller.resources.limits.cpu={controller_cpu}',
-        '--set',
-        f'controller.resources.limits.memory={controller_memory}',
-        '--set',
-        'logLevel=debug',
-        '--wait',
+        "--create-namespace",
+        "--set",
+        f"settings.clusterName={self.name}",
+        "--set",
+        f"settings.interruptionQueue={self.name}",
+        "--set",
+        f"controller.resources.requests.cpu={controller_cpu}",
+        "--set",
+        f"controller.resources.requests.memory={controller_memory}",
+        "--set",
+        f"controller.resources.limits.cpu={controller_cpu}",
+        "--set",
+        f"controller.resources.limits.memory={controller_memory}",
+        "--set",
+        "logLevel=debug",
+        "--wait",
     ])
     # Ensure ALB ingress support: installs AWS Load Balancer Controller.
     if FLAGS.eks_install_alb_controller:
@@ -2052,72 +2237,73 @@ class EksKarpenterCluster(BaseEksCluster):
       # Install NVIDIA drivers.
       vm_util.IssueCommand(
           [
-              'helm',
-              'repo',
-              'add',
-              'nvdp',
-              'https://nvidia.github.io/k8s-device-plugin',
+              "helm",
+              "repo",
+              "add",
+              "nvdp",
+              "https://nvidia.github.io/k8s-device-plugin",
           ],
-          suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+          suppress_failure=lambda stdout, stderr, retcode: "already exists"
           in stderr,
       )
-      vm_util.IssueCommand(['helm', 'repo', 'update', 'nvdp'])
+      vm_util.IssueCommand(["helm", "repo", "update", "nvdp"])
       # Allow node discovery pod to schedule even over NoSchedule taint.
       tolerations_string = (
           'tolerations=[{"key":"nvidia.com/gpu","operator":'
           + '"Exists","effect":"NoSchedule"}]'
       )
       vm_util.IssueCommand([
-          'helm',
-          'upgrade',
-          '--install',
-          'nvdp',
-          'nvdp/nvidia-device-plugin',
-          '--namespace',
-          'kube-system',
-          '--kubeconfig',
+          "helm",
+          "upgrade",
+          "--install",
+          "nvdp",
+          "nvdp/nvidia-device-plugin",
+          "--namespace",
+          "kube-system",
+          "--kubeconfig",
           FLAGS.kubeconfig,
-          '--set',
-          'gfd.enabled=true',
-          '--set',
-          'node-feature-discovery.enabled=true',
-          '--set-json',
-          f'nfd.worker.{tolerations_string}',
-          '--set-json',
+          "--set",
+          "gfd.enabled=true",
+          "--set",
+          "node-feature-discovery.enabled=true",
+          "--set-json",
+          f"nfd.worker.{tolerations_string}",
+          "--set-json",
           tolerations_string,
       ])
     # Get the AMI version for current kubernetes version.
     # See e.g. https://karpenter.sh/docs/tasks/managing-amis/ for not using
     # @latest.
     ssm_ami_path = (
-        f'/aws/service/eks/optimized-ami/{self.cluster_version}/'
-        + 'amazon-linux-2023/x86_64/standard/recommended/image_id')
+        f"/aws/service/eks/optimized-ami/{self.cluster_version}/"
+        + "amazon-linux-2023/x86_64/standard/recommended/image_id"
+    )
     image_id, _, _ = vm_util.IssueCommand([
-        'aws',
-        'ssm',
-        'get-parameter',
-        '--name',
+        "aws",
+        "ssm",
+        "get-parameter",
+        "--name",
         ssm_ami_path,
-        '--region',
+        "--region",
         self.region,
-        '--query',
-        'Parameter.Value',
+        "--query",
+        "Parameter.Value",
     ])
     image_id = image_id.strip().strip('"')
     full_version, _, _ = vm_util.IssueCommand([
-        'aws',
-        'ec2',
-        'describe-images',
-        '--query',
-        'Images[0].Name',
-        '--image-ids',
+        "aws",
+        "ec2",
+        "describe-images",
+        "--query",
+        "Images[0].Name",
+        "--image-ids",
         image_id,
-        '--region',
+        "--region",
         self.region,
     ])
     self.alias_version = (
-        'v'
-        + full_version.strip().strip('"').split(f'{self.cluster_version}-v')[1]
+        "v"
+        + full_version.strip().strip('"').split(f"{self.cluster_version}-v")[1]
     )
     self._CreateKarpenterNodePool(self.default_nodepool)
     for nodepool in self.nodepools.values():
@@ -2126,7 +2312,7 @@ class EksKarpenterCluster(BaseEksCluster):
   def _CreateKarpenterNodePool(self, nodepool: container.BaseNodePoolConfig):
     """Creates the Karpenter NodePool and EC2NodeClass."""
     yaml_nodepool = kubernetes_commands.ConvertManifestToYamlDicts(
-        'container/karpenter/nodepool.yaml.j2',
+        "container/karpenter/nodepool.yaml.j2",
         NODEPOOL_NAME=nodepool.name,
         CLUSTER_NAME=self.name,
         ALIAS_VERSION=self.alias_version,
@@ -2134,35 +2320,35 @@ class EksKarpenterCluster(BaseEksCluster):
     if nodepool.machine_families:
       machine_requirements = [
           {
-              'key': 'karpenter.k8s.aws/instance-family',
-              'operator': 'In',
-              'values': nodepool.machine_families,
+              "key": "karpenter.k8s.aws/instance-family",
+              "operator": "In",
+              "values": nodepool.machine_families,
           },
           {
-              'key': 'karpenter.k8s.aws/instance-generation',
-              'operator': 'Gt',
-              'values': ['2'],
+              "key": "karpenter.k8s.aws/instance-generation",
+              "operator": "Gt",
+              "values": ["2"],
           },
       ]
     else:
       machine_requirements = [{
-          'key': 'node.kubernetes.io/instance-type',
-          'operator': 'In',
-          'values': [nodepool.machine_type],
+          "key": "node.kubernetes.io/instance-type",
+          "operator": "In",
+          "values": [nodepool.machine_type],
       }]
-    yaml_nodepool[0]['spec']['template']['spec']['requirements'].extend(
+    yaml_nodepool[0]["spec"]["template"]["spec"]["requirements"].extend(
         machine_requirements
     )
     if nodepool.min_nodes == nodepool.max_nodes:
       # Not using autoscaling; set static replica count.
-      yaml_nodepool[0]['spec']['replicas'] = nodepool.num_nodes
+      yaml_nodepool[0]["spec"]["replicas"] = nodepool.num_nodes
     else:
       # NodePool CPU limit: max nodes * vCPU + 5%, max 1000.
       vcpu_per_node = FLAGS.eks_karpenter_limits_vcpu_per_node
       cpu_limit = max(
           1000, math.ceil(nodepool.max_nodes * vcpu_per_node * 1.05)
       )
-      yaml_nodepool[0]['spec']['limits'] = {'cpu': cpu_limit}
+      yaml_nodepool[0]["spec"]["limits"] = {"cpu": cpu_limit}
     kubernetes_commands.ApplyYaml(yaml_nodepool)
 
   def _Delete(self):
@@ -2171,45 +2357,45 @@ class EksKarpenterCluster(BaseEksCluster):
     self._CleanupKarpenter()
     super()._Delete()
     vm_util.IssueCommand([
-        'aws',
-        'cloudformation',
-        'delete-stack',
-        '--stack-name',
+        "aws",
+        "cloudformation",
+        "delete-stack",
+        "--stack-name",
         self.stack_name,
-        '--region',
-        f'{self.region}',
+        "--region",
+        f"{self.region}",
     ])
 
   def _DeleteDependencies(self):
     """Deletes the CloudFormation stack."""
     super()._DeleteDependencies()
     delete_stack_cmd = [
-        'aws',
-        'cloudformation',
-        'delete-stack',
-        '--stack-name',
+        "aws",
+        "cloudformation",
+        "delete-stack",
+        "--stack-name",
         self.stack_name,
-        '--region',
-        f'{self.region}',
+        "--region",
+        f"{self.region}",
     ]
     # Start deleting the stack but likely to fail to delete this role.
     vm_util.IssueCommand(delete_stack_cmd)
-    node_role = f'KarpenterNodeRole-{self.name}'
+    node_role = f"KarpenterNodeRole-{self.name}"
     out, _, retcode = vm_util.IssueCommand(
         [
-            'aws',
-            'iam',
-            'list-instance-profiles-for-role',
-            '--role-name',
+            "aws",
+            "iam",
+            "list-instance-profiles-for-role",
+            "--role-name",
             node_role,
-            '--region',
-            f'{self.region}',
+            "--region",
+            f"{self.region}",
         ],
         suppress_failure=lambda stdout, stderr, rc: (
             rc != 0
             and (
-                'nosuchentity' in (stderr or '').lower()
-                or 'cannot be found' in (stderr or '').lower()
+                "nosuchentity" in (stderr or "").lower()
+                or "cannot be found" in (stderr or "").lower()
             )
         ),
     )
@@ -2217,32 +2403,32 @@ class EksKarpenterCluster(BaseEksCluster):
       profiles_json = json.loads(out)
     else:
       logging.info(
-          'Karpenter node role %s not found or empty response; skipping'
-          + ' instance profile cleanup',
+          "Karpenter node role %s not found or empty response; skipping"
+          + " instance profile cleanup",
           node_role,
       )
-      profiles_json = {'InstanceProfiles': []}
-    for profile in profiles_json.get('InstanceProfiles', []):
-      profile_name = profile['InstanceProfileName']
+      profiles_json = {"InstanceProfiles": []}
+    for profile in profiles_json.get("InstanceProfiles", []):
+      profile_name = profile["InstanceProfileName"]
       vm_util.IssueCommand([
-          'aws',
-          'iam',
-          'remove-role-from-instance-profile',
-          '--instance-profile-name',
+          "aws",
+          "iam",
+          "remove-role-from-instance-profile",
+          "--instance-profile-name",
           profile_name,
-          '--role-name',
+          "--role-name",
           node_role,
-          '--region',
-          f'{self.region}',
+          "--region",
+          f"{self.region}",
       ])
       vm_util.IssueCommand([
-          'aws',
-          'iam',
-          'delete-instance-profile',
-          '--instance-profile-name',
+          "aws",
+          "iam",
+          "delete-instance-profile",
+          "--instance-profile-name",
           profile_name,
-          '--region',
-          f'{self.region}',
+          "--region",
+          f"{self.region}",
       ])
     # Finish deleting the stack after deleting the role.
     vm_util.IssueCommand(delete_stack_cmd)
@@ -2251,95 +2437,95 @@ class EksKarpenterCluster(BaseEksCluster):
     """Deletes all ingresses in all namespaces (to trigger ALB deletion)."""
     kubectl.RunKubectlCommand(
         [
-            'delete',
-            'ingress',
-            '--all',
-            '--all-namespaces',
-            '--timeout=600s',
+            "delete",
+            "ingress",
+            "--all",
+            "--all-namespaces",
+            "--timeout=600s",
         ],
         timeout=660,
         raise_on_timeout=False,
         suppress_failure=lambda stdout, stderr, retcode: (
-            'deleted' in stdout
-            and 'timed out waiting for the condition' in stderr
+            "deleted" in stdout
+            and "timed out waiting for the condition" in stderr
         ),
     )
 
   def _CleanupKarpenter(self):
     """Cleanup Karpenter managed nodes before cluster deletion."""
-    logging.info('Cleaning up Karpenter nodes...')
+    logging.info("Cleaning up Karpenter nodes...")
     # Delete NodePool resources - this will trigger node termination
     kubectl.RunRetryableKubectlCommand(
         [
-            'delete',
-            'nodepool,ec2nodeclass',
-            '--all',
-            '--timeout=120s',
+            "delete",
+            "nodepool,ec2nodeclass",
+            "--all",
+            "--timeout=120s",
         ],
         timeout=300,
         suppress_failure=lambda stdout, stderr, retcode: (
-            'no resources found' in stderr.lower()
-            or 'not found' in stderr.lower()
+            "no resources found" in stderr.lower()
+            or "not found" in stderr.lower()
         ),
     )
     # Wait for all Karpenter nodes to be deleted
     kubectl.RunRetryableKubectlCommand(
         [
-            'wait',
-            '--for=delete',
-            'node',
-            '-l',
-            'karpenter.sh/nodepool',
-            '--timeout=120s',
+            "wait",
+            "--for=delete",
+            "node",
+            "-l",
+            "karpenter.sh/nodepool",
+            "--timeout=120s",
         ],
         timeout=300,
         suppress_failure=lambda stdout, stderr, retcode: (
-            'no matching resources found' in stderr.lower()
-            or 'no resources found' in stderr.lower()
+            "no matching resources found" in stderr.lower()
+            or "no resources found" in stderr.lower()
         ),
     )
 
     # Force terminate remaining EC2 instances
     stdout, _, _ = vm_util.IssueCommand(
         [
-            'aws',
-            'ec2',
-            'describe-instances',
-            '--region',
+            "aws",
+            "ec2",
+            "describe-instances",
+            "--region",
             self.region,
-            '--filters',
-            'Name=tag:karpenter.sh/nodepool,Values=*',
-            f'Name=tag:kubernetes.io/cluster/{self.name},Values=owned',
-            'Name=instance-state-name,Values=running,pending',
-            '--query',
-            'Reservations[].Instances[].InstanceId',
-            '--output',
-            'text',
+            "--filters",
+            "Name=tag:karpenter.sh/nodepool,Values=*",
+            f"Name=tag:kubernetes.io/cluster/{self.name},Values=owned",
+            "Name=instance-state-name,Values=running,pending",
+            "--query",
+            "Reservations[].Instances[].InstanceId",
+            "--output",
+            "text",
         ],
     )
     instance_ids = stdout.strip().split() if stdout and stdout.strip() else []
     if instance_ids:
-      logging.info('Terminating %d remaining instances', len(instance_ids))
+      logging.info("Terminating %d remaining instances", len(instance_ids))
       vm_util.IssueCommand(
           [
-              'aws',
-              'ec2',
-              'terminate-instances',
-              '--region',
+              "aws",
+              "ec2",
+              "terminate-instances",
+              "--region",
               self.region,
-              '--instance-ids',
+              "--instance-ids",
               *instance_ids,
           ],
       )
       vm_util.IssueCommand(
           [
-              'aws',
-              'ec2',
-              'wait',
-              'instance-terminated',
-              '--region',
+              "aws",
+              "ec2",
+              "wait",
+              "instance-terminated",
+              "--region",
               self.region,
-              '--instance-ids',
+              "--instance-ids",
               *instance_ids,
           ],
           timeout=180,
@@ -2347,53 +2533,53 @@ class EksKarpenterCluster(BaseEksCluster):
     # Cleanup orphaned network interfaces
     stdout, _, _ = vm_util.IssueCommand(
         [
-            'aws',
-            'ec2',
-            'describe-network-interfaces',
-            '--region',
+            "aws",
+            "ec2",
+            "describe-network-interfaces",
+            "--region",
             self.region,
-            '--filters',
-            f'Name=tag:cluster.k8s.amazonaws.com/name,Values={self.name}',
-            'Name=status,Values=available',
-            '--query',
-            'NetworkInterfaces[].NetworkInterfaceId',
-            '--output',
-            'text',
+            "--filters",
+            f"Name=tag:cluster.k8s.amazonaws.com/name,Values={self.name}",
+            "Name=status,Values=available",
+            "--query",
+            "NetworkInterfaces[].NetworkInterfaceId",
+            "--output",
+            "text",
         ],
         suppress_failure=lambda stdout, stderr, retcode: (
-            'not found' in stderr.lower()
+            "not found" in stderr.lower()
         ),
     )
     eni_ids = stdout.strip().split() if stdout and stdout.strip() else []
     if eni_ids:
-      logging.info('Deleting %d orphaned network interfaces', len(eni_ids))
+      logging.info("Deleting %d orphaned network interfaces", len(eni_ids))
       for eni_id in eni_ids:
         # Bind eni_id by default to avoid loop closure issues if
         # this is refactored.
         def _delete_one_eni(eni_id=eni_id) -> None:
           _, stderr, retcode = vm_util.IssueCommand(
               [
-                  'aws',
-                  'ec2',
-                  'delete-network-interface',
-                  '--region',
+                  "aws",
+                  "ec2",
+                  "delete-network-interface",
+                  "--region",
                   self.region,
-                  '--network-interface-id',
+                  "--network-interface-id",
                   eni_id,
               ],
               raise_on_failure=False,
           )
           if retcode == 0:
             return
-          stderr_lower = (stderr or '').lower()
+          stderr_lower = (stderr or "").lower()
           # ENI already deleted (e.g. by another process or previous attempt).
-          if 'invalidnetworkinterfaceid.notfound' in stderr_lower:
+          if "invalidnetworkinterfaceid.notfound" in stderr_lower:
             return
           # RequestLimitExceeded (throttle): retry via vm_util.Retry.
-          if 'requestlimitexceeded' in stderr_lower:
-            raise errors.Resource.RetryableDeletionError(stderr or '')
+          if "requestlimitexceeded" in stderr_lower:
+            raise errors.Resource.RetryableDeletionError(stderr or "")
           raise errors.VmUtil.IssueCommandError(
-              f'DeleteNetworkInterface failed: {stderr}'
+              f"DeleteNetworkInterface failed: {stderr}"
           )
 
         # max_retries=5 yields 6 CLI attempts (tries > 5 on 6th failure).
@@ -2405,10 +2591,10 @@ class EksKarpenterCluster(BaseEksCluster):
 
   def _IsReady(self):
     """Returns True if cluster is running. Autopilot defaults to 0 nodes."""
-    stdout, _, _ = kubectl.RunKubectlCommand(['cluster-info'])
+    stdout, _, _ = kubectl.RunKubectlCommand(["cluster-info"])
     # These two strings are printed in sequence, but with ansi color code
     # escape characters in between.
-    return 'Kubernetes control plane' in stdout and 'is running at' in stdout
+    return "Kubernetes control plane" in stdout and "is running at" in stdout
 
   def GetDefaultStorageClass(self) -> str:
     """Gets the default storage class for the provider."""
@@ -2425,7 +2611,7 @@ class EksKarpenterCluster(BaseEksCluster):
     selectors = {}
     machine_family = util.GetMachineFamily(machine_type)
     if machine_family:
-      selectors['karpenter.k8s.aws/instance-family'] = machine_family
+      selectors["karpenter.k8s.aws/instance-family"] = machine_family
     return selectors
 
   def GetNodePoolNames(self) -> list[str]:
@@ -2436,25 +2622,25 @@ class EksKarpenterCluster(BaseEksCluster):
     """
     cmd = [
         FLAGS.kubectl,
-        '--kubeconfig',
+        "--kubeconfig",
         FLAGS.kubeconfig,
-        'get',
-        'nodepool',
-        '-o',
-        'json',
+        "get",
+        "nodepool",
+        "-o",
+        "json",
     ]
     stdout, stderr, retcode = vm_util.IssueCommand(cmd)
     if retcode:
       logging.warning(
-          'Failed to get Karpenter NodePools: %s, error: %s', stdout, stderr
+          "Failed to get Karpenter NodePools: %s, error: %s", stdout, stderr
       )
       return []
     nodepools = json.loads(stdout)
-    return [item['metadata']['name'] for item in nodepools.get('items', [])]
+    return [item["metadata"]["name"] for item in nodepools.get("items", [])]
 
   def AddNodepool(self, batch_name, pool_id):
     kubernetes_commands.ApplyManifest(
-        'provision_node_pools/karpenter/nodepool.yaml.j2',
+        "provision_node_pools/karpenter/nodepool.yaml.j2",
         batch_name=batch_name,
         pool_id=pool_id,
         cluster_name=self.name,
