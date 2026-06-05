@@ -95,11 +95,11 @@ JOB_MANIFEST_TEMPLATE = "provision_node_pools/job_manifest.yaml.j2"
 
 
 def GetConfig(user_config):
-    return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
+  return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
 
 def Prepare(_: bm_spec.BenchmarkSpec) -> None:
-    pass
+  pass
 
 
 def _AddNodePool(
@@ -108,16 +108,16 @@ def _AddNodePool(
     pool_id: str,
     image: str,
 ) -> None:
-    """Adds a node pool to the cluster."""
-    cluster.AddNodepool(batch_name, pool_id=pool_id)
-    kubernetes_commands.ApplyManifest(
-        JOB_MANIFEST_TEMPLATE,
-        batch=batch_name,
-        gpu=USE_GPU.value,
-        image=image,
-        cloud=cluster.CLOUD,
-        id=pool_id,
-    )
+  """Adds a node pool to the cluster."""
+  cluster.AddNodepool(batch_name, pool_id=pool_id)
+  kubernetes_commands.ApplyManifest(
+      JOB_MANIFEST_TEMPLATE,
+      batch=batch_name,
+      gpu=USE_GPU.value,
+      image=image,
+      cloud=cluster.CLOUD,
+      id=pool_id,
+  )
 
 
 def _CreateJobsAndWait(
@@ -126,122 +126,120 @@ def _CreateJobsAndWait(
     jobs: int,
     image: str,
 ) -> list[sample.Sample]:
-    """Creates jobs and waits for all pods to be running."""
-    logging.info(
-        "Creating batch '%s' of %d jobs, each job running in a separate node in a"
-        " separate node pools",
-        batch_name,
-        jobs,
-    )
+  """Creates jobs and waits for all pods to be running."""
+  logging.info(
+      "Creating batch '%s' of %d jobs, each job running in a separate node in a"
+      " separate node pools",
+      batch_name,
+      jobs,
+  )
 
-    samples = []
-    apply_start = time.monotonic()
-    tasks = []
-    for i in range(2, jobs + 1):
-        tasks.append(
-            (
-                _AddNodePool,
-                [cluster, batch_name, "{:03d}".format(i), image],
-                {},
-            )
-        )
-    # Add the first node pool + batch prior to the rest.
-    logging.info("Creating the first node pool 001")
-    _AddNodePool(cluster, batch_name, "001", image)
-    background_tasks.RunParallelThreads(tasks, len(tasks))
-    apply_time = time.monotonic() - apply_start
-    logging.info(
-        "Created %d jobs in batch '%s' in %d seconds. Waiting for all pods to be"
-        " running",
-        jobs,
-        batch_name,
-        apply_time,
-    )
-    samples.append(
-        sample.Sample(
-            "apply_time",
-            apply_time,
-            "seconds",
-        )
-    )
-    start = time.monotonic()
-    # wait up to 2 min per node pool + 45 min for master resizes
-    # synchronous NAP in GKE takes ~1 min per node pool
-    timeout = (jobs * 2 + 45) * 60
-    # RunRetryableKubectlCommand is required as sometimes during master resize
-    # the RunKubectlCommand fails before timeout.
-    while True:
-        try:
-            stdout, _, _ = kubectl.RunKubectlCommand(
-                [
-                    "get",
-                    "pods",
-                    "-l",
-                    "batch=%s" % batch_name,
-                    "--field-selector",
-                    "status.phase=Running",
-                    "--output",
-                    "jsonpath='{.items[*].metadata.name}'",
-                ]
-            )
-            running = 0 if not stdout else len(stdout.split())
-            if running >= jobs:
-                break
-            logging.info(
-                "Waiting for jobs in batch '%s': %d/%d. Time: %d seconds.",
-                batch_name,
-                running,
-                jobs,
-                time.monotonic() - start,
-            )
-        except (
-            errors.VmUtil.IssueCommandError,
-            errors.VmUtil.IssueCommandTimeoutError,
-        ) as e:
-            logging.warning(
-                "Failed to get running jobs in batch '%s': %s. Retrying...",
-                batch_name,
-                e,
-            )
-        if time.monotonic() - start > timeout:
-            raise TimeoutError(
-                "Timed out waiting for all jobs in batch '%s' to be running."
-                % batch_name
-            )
-        time.sleep(60)
-    ready_time = time.monotonic() - start
-    logging.info(
-        "All %d jobs in batch '%s' are running. Wait time: %d seconds.",
-        jobs,
-        batch_name,
-        ready_time,
-    )
-    samples.append(
-        sample.Sample(
-            "ready_time",
-            ready_time,
-            "seconds",
-        )
-    )
-    return samples
+  samples = []
+  apply_start = time.monotonic()
+  tasks = []
+  for i in range(2, jobs + 1):
+    tasks.append((
+        _AddNodePool,
+        [cluster, batch_name, "{:03d}".format(i), image],
+        {},
+    ))
+  # Add the first node pool + batch prior to the rest.
+  logging.info("Creating the first node pool 001")
+  _AddNodePool(cluster, batch_name, "001", image)
+  background_tasks.RunParallelThreads(tasks, len(tasks))
+  apply_time = time.monotonic() - apply_start
+  logging.info(
+      "Created %d jobs in batch '%s' in %d seconds. Waiting for all pods to be"
+      " running",
+      jobs,
+      batch_name,
+      apply_time,
+  )
+  samples.append(
+      sample.Sample(
+          "apply_time",
+          apply_time,
+          "seconds",
+      )
+  )
+  start = time.monotonic()
+  # wait up to 2 min per node pool + 45 min for master resizes
+  # synchronous NAP in GKE takes ~1 min per node pool
+  timeout = (jobs * 2 + 45) * 60
+  # RunRetryableKubectlCommand is required as sometimes during master resize
+  # the RunKubectlCommand fails before timeout.
+  while True:
+    try:
+      stdout, _, _ = kubectl.RunKubectlCommand([
+          "get",
+          "pods",
+          "-l",
+          "batch=%s" % batch_name,
+          "--field-selector",
+          "status.phase=Running",
+          "--output",
+          "jsonpath='{.items[*].metadata.name}'",
+      ])
+      running = 0 if not stdout else len(stdout.split())
+      if running >= jobs:
+        break
+      logging.info(
+          "Waiting for jobs in batch '%s': %d/%d. Time: %d seconds.",
+          batch_name,
+          running,
+          jobs,
+          time.monotonic() - start,
+      )
+    except (
+        errors.VmUtil.IssueCommandError,
+        errors.VmUtil.IssueCommandTimeoutError,
+    ) as e:
+      logging.warning(
+          "Failed to get running jobs in batch '%s': %s. Retrying...",
+          batch_name,
+          e,
+      )
+    if time.monotonic() - start > timeout:
+      raise TimeoutError(
+          "Timed out waiting for all jobs in batch '%s' to be running."
+          % batch_name
+      )
+    time.sleep(60)
+  ready_time = time.monotonic() - start
+  logging.info(
+      "All %d jobs in batch '%s' are running. Wait time: %d seconds.",
+      jobs,
+      batch_name,
+      ready_time,
+  )
+  samples.append(
+      sample.Sample(
+          "ready_time",
+          ready_time,
+          "seconds",
+      )
+  )
+  return samples
 
 
 def _AssertNodes(
     initial_nodes: int,
     added_nodes: int,
 ) -> None:
-    """Asserts expected number of nodes in the cluster."""
-    nodes = len(kubernetes_commands.GetNodeNames())
-    if nodes < added_nodes:
-        raise ValueError(
-            "Cluster has %d nodes, but expected >=%d)" % (nodes, added_nodes)
-        )
-    # Include a buffer of 3 nodes that can be created during master resize.
-    buffer = 3
-    max_nodes = initial_nodes + added_nodes + buffer
-    if nodes > max_nodes:
-        raise ValueError("Cluster has %d nodes, but expected <=%d" % (nodes, max_nodes))
-    logging.info("Cluster has %d nodes", nodes)
+  """Asserts expected number of nodes in the cluster."""
+  nodes = len(kubernetes_commands.GetNodeNames())
+  if nodes < added_nodes:
+    raise ValueError(
+        "Cluster has %d nodes, but expected >=%d)" % (nodes, added_nodes)
+    )
+  # Include a buffer of 3 nodes that can be created during master resize.
+  buffer = 3
+  max_nodes = initial_nodes + added_nodes + buffer
+  if nodes > max_nodes:
+    raise ValueError(
+        "Cluster has %d nodes, but expected <=%d" % (nodes, max_nodes)
+    )
+  logging.info("Cluster has %d nodes", nodes)
 
 
 def _AssertNodePools(
@@ -249,22 +247,22 @@ def _AssertNodePools(
     intital_node_pools: int,
     added_node_pools: int,
 ) -> None:
-    """Asserts expected number of node pools in the cluster."""
-    node_pools = len(cluster.GetNodePoolNames())
-    if node_pools < added_node_pools:
-        raise ValueError(
-            "Cluster has %d node pools, but expected >=%d"
-            % (node_pools, added_node_pools)
-        )
-    # Include a buffer of 3 node pools that can be created during master resize.
-    buffer = 3
-    max_node_pools = intital_node_pools + added_node_pools + buffer
-    if node_pools > max_node_pools:
-        raise ValueError(
-            "Cluster has %d node pools, but expected <=%d"
-            % (node_pools, max_node_pools)
-        )
-    logging.info("Cluster has %d node pools", node_pools)
+  """Asserts expected number of node pools in the cluster."""
+  node_pools = len(cluster.GetNodePoolNames())
+  if node_pools < added_node_pools:
+    raise ValueError(
+        "Cluster has %d node pools, but expected >=%d"
+        % (node_pools, added_node_pools)
+    )
+  # Include a buffer of 3 node pools that can be created during master resize.
+  buffer = 3
+  max_node_pools = intital_node_pools + added_node_pools + buffer
+  if node_pools > max_node_pools:
+    raise ValueError(
+        "Cluster has %d node pools, but expected <=%d"
+        % (node_pools, max_node_pools)
+    )
+  logging.info("Cluster has %d node pools", node_pools)
 
 
 def _CreateNodePools(
@@ -273,76 +271,78 @@ def _CreateNodePools(
     node_pools_to_add: int,
     image: str,
 ) -> List[sample.Sample]:
-    """Creates node pools and measures the time it takes to provision them."""
-    nodes_before = len(kubernetes_commands.GetNodeNames())
-    nodes_pools_before = len(cluster.GetNodePoolNames())
-    start = time.monotonic()
-    samples = _CreateJobsAndWait(cluster, batch_name, node_pools_to_add, image)
-    elapsed = time.monotonic() - start
-    _AssertNodes(nodes_before, node_pools_to_add)
-    _AssertNodePools(cluster, nodes_pools_before, node_pools_to_add)
-    samples.append(
+  """Creates node pools and measures the time it takes to provision them."""
+  nodes_before = len(kubernetes_commands.GetNodeNames())
+  nodes_pools_before = len(cluster.GetNodePoolNames())
+  start = time.monotonic()
+  samples = _CreateJobsAndWait(cluster, batch_name, node_pools_to_add, image)
+  elapsed = time.monotonic() - start
+  _AssertNodes(nodes_before, node_pools_to_add)
+  _AssertNodePools(cluster, nodes_pools_before, node_pools_to_add)
+  samples.append(
+      sample.Sample(
+          "provisioning_time",
+          elapsed,
+          "seconds",
+      )
+  )
+  metadata = {"node_pools_created": node_pools_to_add}
+  metric_batch_name = batch_name.replace("-", "_")
+  final_samples = []
+  for s in samples:
+    metric_name = f"{metric_batch_name}_{s.metric}"
+    final_samples.append(
         sample.Sample(
-            "provisioning_time",
-            elapsed,
-            "seconds",
+            metric_name,
+            s.value,
+            s.unit,
+            metadata,
         )
     )
-    metadata = {"node_pools_created": node_pools_to_add}
-    metric_batch_name = batch_name.replace("-", "_")
-    final_samples = []
-    for s in samples:
-        metric_name = f"{metric_batch_name}_{s.metric}"
-        final_samples.append(
-            sample.Sample(
-                metric_name,
-                s.value,
-                s.unit,
-                metadata,
-            )
+    final_samples.append(
+        sample.Sample(
+            f"{metric_name}_per_node_pool",
+            s.value / node_pools_to_add,
+            s.unit,
+            s.metadata,
         )
-        final_samples.append(
-            sample.Sample(
-                f"{metric_name}_per_node_pool",
-                s.value / node_pools_to_add,
-                s.unit,
-                s.metadata,
-            )
-        )
-    return final_samples
+    )
+  return final_samples
 
 
 def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
-    """Runs the node pools provisioning benchmark."""
-    cluster = benchmark_spec.container_cluster
-    image = benchmark_spec.container_specs["provisioning"].image
-    samples = []
-    start = time.monotonic()
-    if INIT_BATCH_SIZE.value > 0:
-        samples += _CreateNodePools(
-            cluster, INIT_BATCH_NAME, INIT_BATCH_SIZE.value, image
-        )
-    samples += _CreateNodePools(cluster, TEST_BATCH_NAME, TEST_BATCH_SIZE.value, image)
-    elapsed = time.monotonic() - start
-    total_node_pools = INIT_BATCH_SIZE.value + TEST_BATCH_SIZE.value
-    metadata = {
-        "node_pools_init_batch": INIT_BATCH_SIZE.value,
-        "node_pools_test_batch": TEST_BATCH_SIZE.value,
-        "node_pools_total": total_node_pools,
-    }
-    for s in samples:
-        s.metadata.update(metadata)
-    samples += [sample.Sample("total_time", elapsed, "seconds", metadata)]
-    samples += [
-        sample.Sample(
-            "total_time_per_node_pool",
-            elapsed / total_node_pools,
-            "seconds",
-            metadata,
-        ),
-    ]
-    return samples
+  """Runs the node pools provisioning benchmark."""
+  cluster = benchmark_spec.container_cluster
+  image = benchmark_spec.container_specs["provisioning"].image
+  samples = []
+  start = time.monotonic()
+  if INIT_BATCH_SIZE.value > 0:
+    samples += _CreateNodePools(
+        cluster, INIT_BATCH_NAME, INIT_BATCH_SIZE.value, image
+    )
+  samples += _CreateNodePools(
+      cluster, TEST_BATCH_NAME, TEST_BATCH_SIZE.value, image
+  )
+  elapsed = time.monotonic() - start
+  total_node_pools = INIT_BATCH_SIZE.value + TEST_BATCH_SIZE.value
+  metadata = {
+      "node_pools_init_batch": INIT_BATCH_SIZE.value,
+      "node_pools_test_batch": TEST_BATCH_SIZE.value,
+      "node_pools_total": total_node_pools,
+  }
+  for s in samples:
+    s.metadata.update(metadata)
+  samples += [sample.Sample("total_time", elapsed, "seconds", metadata)]
+  samples += [
+      sample.Sample(
+          "total_time_per_node_pool",
+          elapsed / total_node_pools,
+          "seconds",
+          metadata,
+      ),
+  ]
+  return samples
 
 
 def Cleanup(_) -> None:
-    pass
+  pass
