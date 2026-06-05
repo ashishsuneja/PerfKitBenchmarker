@@ -47,7 +47,7 @@ class AzureContainerRegistry(container_registry.BaseContainerRegistry):
     self.region = util.GetRegionFromZone(self.zone)
     self.resource_group = azure_network.GetResourceGroup(self.region)
     self.login_server = None
-    self.sku = 'Basic'
+    self.sku = "Basic"
     self._deleted = False
     self.acr_id = None
 
@@ -56,14 +56,14 @@ class AzureContainerRegistry(container_registry.BaseContainerRegistry):
     if self._deleted:
       return False
     stdout, _, _ = vm_util.IssueCommand(
-        [azure.AZURE_PATH, 'acr', 'show', '--name', self.name]
+        [azure.AZURE_PATH, "acr", "show", "--name", self.name]
         + self.resource_group.args,
         raise_on_failure=False,
     )
     try:
       registry = json.loads(stdout)
-      self.login_server = registry['loginServer']
-      self.acr_id = registry['id']
+      self.login_server = registry["loginServer"]
+      self.acr_id = registry["id"]
       return True
     except ValueError:
       return False
@@ -75,11 +75,11 @@ class AzureContainerRegistry(container_registry.BaseContainerRegistry):
     vm_util.IssueCommand(
         [
             azure.AZURE_PATH,
-            'acr',
-            'create',
-            '--name',
+            "acr",
+            "create",
+            "--name",
             self.name,
-            '--sku',
+            "--sku",
             self.sku,
         ]
         + self.resource_group.args
@@ -98,15 +98,15 @@ class AzureContainerRegistry(container_registry.BaseContainerRegistry):
     """Logs in to the registry."""
     vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'acr',
-        'login',
-        '--name',
+        "acr",
+        "login",
+        "--name",
         self.name,
     ])
 
   def GetFullRegistryTag(self, image):
     """Gets the full tag of the image."""
-    full_tag = '{login_server}/{name}'.format(
+    full_tag = "{login_server}/{name}".format(
         login_server=self.login_server, name=image
     )
     return full_tag
@@ -123,7 +123,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     self.region = util.GetRegionFromZone(self.zone)
     self.resource_group = azure_network.GetResourceGroup(self.region)
     self.node_resource_group = None
-    self.name = 'pkbcluster%s' % FLAGS.run_uri
+    self.name = "pkbcluster%s" % FLAGS.run_uri
     # TODO(pclay): replace with built in service principal once I figure out how
     # to make it work with ACR
     self.cluster_version = FLAGS.container_cluster_version
@@ -147,16 +147,17 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       dict mapping string property key to value.
     """
     result = super().GetResourceMetadata()
-    result['boot_disk_type'] = self.default_nodepool.disk_type
-    result['boot_disk_size'] = self.default_nodepool.disk_size
+    result["boot_disk_type"] = self.default_nodepool.disk_type
+    result["boot_disk_size"] = self.default_nodepool.disk_size
     if FLAGS.azure_aks_auto_node_provisioning:
-      result['auto_node_provisioning_mode'] = True
+      result["auto_node_provisioning_mode"] = True
     return result
 
   def _IsAutoscalerEnabled(self, nodepool_config: container.BaseNodePoolConfig):
     """Returns True if the cluster autoscaler is enabled."""
     return (
-        nodepool_config.min_nodes != nodepool_config.max_nodes
+        nodepool_config.min_nodes
+        != nodepool_config.max_nodes
         # Auto node provisioning mode is incompatible with cluster autoscaler.
     ) and not FLAGS.azure_aks_auto_node_provisioning
 
@@ -164,47 +165,47 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Creates the AKS cluster."""
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'create',
-        '--name',
+        "aks",
+        "create",
+        "--name",
         self.name,
-        '--location',
+        "--location",
         self.region,
-        '--enable-managed-identity',
-        '--ssh-key-value',
+        "--enable-managed-identity",
+        "--ssh-key-value",
         vm_util.GetPublicKeyPath(),
-        '--nodepool-name',
+        "--nodepool-name",
         container_cluster.DEFAULT_NODEPOOL,
-        '--nodepool-labels',
-        f'pkb_nodepool={container_cluster.DEFAULT_NODEPOOL}',
+        "--nodepool-labels",
+        f"pkb_nodepool={container_cluster.DEFAULT_NODEPOOL}",
     ] + self._GetNodeFlags(self.default_nodepool)
     if self.max_total_nodes > 256:
       cmd += [
-          '--network-plugin',
-          'azure',
-          '--network-plugin-mode',
-          'overlay',
+          "--network-plugin",
+          "azure",
+          "--network-plugin-mode",
+          "overlay",
           # Default /16 supports ~250 nodes; /10 provides ~4M IPs for up to 16k.
-          '--pod-cidr',
-          '100.64.0.0/10',
+          "--pod-cidr",
+          "100.64.0.0/10",
           # Free tier caps at 1k nodes; standard scales upto 5k nodes.
-          '--tier',
-          'standard',
+          "--tier",
+          "standard",
           # Standard LB exhausts SNAT ports at ~1k nodes; NAT Gateway required.
-          '--outbound-type',
-          'managedNATGateway',
+          "--outbound-type",
+          "managedNATGateway",
           # 4 IPs = ~256k SNAT ports (~50 ports/node at 5k nodes).
-          '--nat-gateway-managed-outbound-ip-count',
-          '4',
+          "--nat-gateway-managed-outbound-ip-count",
+          "4",
           # Prevent connection drops during long bootstrap or idle keep-alives.
-          '--nat-gateway-idle-timeout',
-          '10',
+          "--nat-gateway-idle-timeout",
+          "10",
       ]
     if self.enable_vpa:
-      cmd.append('--enable-vpa')
+      cmd.append("--enable-vpa")
     if FLAGS.azure_aks_auto_node_provisioning:
       # For provision_node_pools benchmark, add auto provisioning mode
-      cmd.append('--node-provisioning-mode=auto')
+      cmd.append("--node-provisioning-mode=auto")
 
     self._RunCreateClusterCmd(cmd)
 
@@ -228,7 +229,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       retcode = 1
       err = str(e)
     if retcode:
-      if 'InvalidOutputTable' in err:
+      if "InvalidOutputTable" in err:
         # This is a race condition where the logs analytics workspace hasn't
         # finished being created. Retrying solves it.
         raise errors.Resource.RetryableCreationError(err)
@@ -238,15 +239,15 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Creates a node pool."""
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'add',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "add",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(nodepool_config.name),
-        '--labels',
-        f'pkb_nodepool={nodepool_config.name}',
+        "--labels",
+        f"pkb_nodepool={nodepool_config.name}",
     ] + self._GetNodeFlags(nodepool_config)
     _, stderr, retcode = vm_util.IssueCommand(
         cmd, timeout=600, raise_on_failure=False
@@ -255,12 +256,12 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     # Validity should be uncovered during development. Quota and capacity
     # will trigger failures in other VM benchmarks.
     if retcode:
-      if 'OverconstrainedZonalAllocationRequest' in stderr:
+      if "OverconstrainedZonalAllocationRequest" in stderr:
         raise errors.Benchmarks.InsufficientCapacityCloudFailure(
-            'Creation failed. Kubernetes does not support specific failure'
-            ' modes so failure can be due to capacity, quota, or configuration'
-            ' validity. Please run another VM benchmark to validate root cause'
-            ' of failure.'
+            "Creation failed. Kubernetes does not support specific failure"
+            " modes so failure can be due to capacity, quota, or configuration"
+            " validity. Please run another VM benchmark to validate root cause"
+            " of failure."
         )
       else:
         raise errors.Resource.CreationError(stderr)
@@ -272,25 +273,25 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     args = [] + self.resource_group.args
     if nodepool_config.machine_type:
       args += [
-          '--node-vm-size',
+          "--node-vm-size",
           nodepool_config.machine_type,
       ]
     if self._IsAutoscalerEnabled(nodepool_config):
       args += [
-          '--enable-cluster-autoscaler',
-          f'--min-count={nodepool_config.min_nodes}',
-          f'--max-count={nodepool_config.max_nodes}',
+          "--enable-cluster-autoscaler",
+          f"--min-count={nodepool_config.min_nodes}",
+          f"--max-count={nodepool_config.max_nodes}",
       ]
-    args += [f'--node-count={nodepool_config.num_nodes}']
+    args += [f"--node-count={nodepool_config.num_nodes}"]
     if self.default_nodepool.zone and self.default_nodepool.zone != self.region:
-      zones = ' '.join(
-          zone[-1] for zone in self.default_nodepool.zone.split(',')
+      zones = " ".join(
+          zone[-1] for zone in self.default_nodepool.zone.split(",")
       )
-      args += ['--zones', zones]
+      args += ["--zones", zones]
     if self.default_nodepool.disk_size:
-      args += ['--node-osdisk-size', str(self.default_nodepool.disk_size)]
+      args += ["--node-osdisk-size", str(self.default_nodepool.disk_size)]
     if self.cluster_version:
-      args += ['--kubernetes-version', self.cluster_version]
+      args += ["--kubernetes-version", self.cluster_version]
     return args
 
   def _Exists(self):
@@ -300,9 +301,9 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     stdout, _, _ = vm_util.IssueCommand(
         [
             azure.AZURE_PATH,
-            'aks',
-            'show',
-            '--name',
+            "aks",
+            "show",
+            "--name",
             self.name,
         ]
         + self.resource_group.args,
@@ -310,7 +311,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     )
     try:
       cluster = json.loads(stdout)
-      self.node_resource_group = cluster['nodeResourceGroup']
+      self.node_resource_group = cluster["nodeResourceGroup"]
       return True
     except ValueError:
       return False
@@ -341,13 +342,13 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       return
     attach_registry_cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'update',
-        '--name',
+        "aks",
+        "update",
+        "--name",
         self.name,
-        '--resource-group',
+        "--resource-group",
         self.resource_group.name,
-        '--attach-acr',
+        "--attach-acr",
         self.container_registry.name,
     ]
     vm_util.IssueCommand(attach_registry_cmd)
@@ -358,11 +359,11 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     self._WaitForDefaultServiceAccount()
     set_tags_cmd = [
         azure.AZURE_PATH,
-        'group',
-        'update',
-        '-g',
+        "group",
+        "update",
+        "-g",
         self.node_resource_group,
-        '--set',
+        "--set",
         util.GetTagsJson(self.resource_group.timeout_minutes),
     ]
     vm_util.IssueCommand(set_tags_cmd)
@@ -374,7 +375,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         and virtual_machine.GPU_COUNT.value > 0
     ):
       kubernetes_commands.ApplyManifest(
-          'container/azure/nvidia-device-plugin.yaml',
+          "container/azure/nvidia-device-plugin.yaml",
       )
     super()._PostCreate()
 
@@ -388,15 +389,15 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     # Fetch Kubernetes credentials
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'get-credentials',
-        '--name',
+        "aks",
+        "get-credentials",
+        "--name",
         self.name,
-        '--file',
+        "--file",
         FLAGS.kubeconfig,
     ]
     if use_admin:
-      cmd.append('--admin')
+      cmd.append("--admin")
     cmd += self.resource_group.args
     vm_util.IssueCommand(cmd)
 
@@ -404,22 +405,22 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Returns True if the cluster is ready."""
     show_cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'show',
-        '--name',
+        "aks",
+        "show",
+        "--name",
         self.name,
-        '--query',
-        'provisioningState',
-        '--output',
-        'tsv',
+        "--query",
+        "provisioningState",
+        "--output",
+        "tsv",
     ] + self.resource_group.args
     stdout, _, _ = vm_util.IssueCommand(show_cmd, raise_on_failure=False)
 
     try:
       provisioning_state = stdout.strip()
-      if provisioning_state == 'Failed':
-        raise errors.Resource.CreationError('Cluster provisioning failed.')
-      if provisioning_state != 'Succeeded':
+      if provisioning_state == "Failed":
+        raise errors.Resource.CreationError("Cluster provisioning failed.")
+      if provisioning_state != "Succeeded":
         return False
     except json.JSONDecodeError:
       return False
@@ -451,26 +452,26 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       """
       get_service_account_cmd = [
           FLAGS.kubectl,
-          '--kubeconfig',
+          "--kubeconfig",
           FLAGS.kubeconfig,
-          'get',
-          'serviceAccounts',
+          "get",
+          "serviceAccounts",
       ]
       stdout, err, code = vm_util.IssueCommand(
           get_service_account_cmd, raise_on_failure=False
       )
-      if 'default' not in stdout:
+      if "default" not in stdout:
         raise errors.Resource.RetryableCreationError(
-            'Service account not yet ready.'
+            "Service account not yet ready."
         )
       if code != 0:
-        if 'User does not have access to the resource in Azure' in err:
+        if "User does not have access to the resource in Azure" in err:
           raise errors.Resource.RetryableCreationError(
-              'First kubectl command failed with permission denied, but'
-              ' retrying as this can just be a race condition.'
+              "First kubectl command failed with permission denied, but"
+              " retrying as this can just be a race condition."
           )
         raise errors.Resource.CreationError(
-            'First kubectl command failed with error: %s' % err
+            "First kubectl command failed with error: %s" % err
         )
 
     _GetServiceAccount()
@@ -483,7 +484,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Get the default storage class for the provider."""
     # https://docs.microsoft.com/en-us/azure/aks/csi-storage-drivers
     # Premium_LRS
-    return 'managed-csi-premium'
+    return "managed-csi-premium"
 
   def ResizeNodePool(
       self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
@@ -491,14 +492,14 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Change the number of nodes in the node pool."""
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'scale',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "scale",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(node_pool),
-        f'--node-count={new_size}',
+        f"--node-count={new_size}",
     ] + self.resource_group.args
     vm_util.IssueCommand(cmd)
 
@@ -507,33 +508,33 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     if FLAGS.azure_aks_auto_node_provisioning:
       cmd = [
           FLAGS.kubectl,
-          '--kubeconfig',
+          "--kubeconfig",
           FLAGS.kubeconfig,
-          'get',
-          'nodepools',
-          '-o',
-          'json',
+          "get",
+          "nodepools",
+          "-o",
+          "json",
       ]
       stdout, _, _ = vm_util.IssueCommand(cmd)
-      nodepools = json.loads(stdout).get('items', [])
-      return [nodepool['metadata']['name'] for nodepool in nodepools]
+      nodepools = json.loads(stdout).get("items", [])
+      return [nodepool["metadata"]["name"] for nodepool in nodepools]
     else:
       cmd = [
           azure.AZURE_PATH,
-          'aks',
-          'nodepool',
-          'list',
-          '--cluster-name',
+          "aks",
+          "nodepool",
+          "list",
+          "--cluster-name",
           self.name,
       ] + self.resource_group.args
       stdout, _, _ = vm_util.IssueCommand(cmd)
       nodepools = json.loads(stdout)
-      return [nodepool['name'] for nodepool in nodepools]
+      return [nodepool["name"] for nodepool in nodepools]
 
   def AddNodepool(self, batch_name, pool_id):
     """Add a Karpenter NodePool and AKSNodeClass to the AKS cluster."""
     kubernetes_commands.ApplyManifest(
-        'provision_node_pools/aks/nodepool.yaml.j2',
+        "provision_node_pools/aks/nodepool.yaml.j2",
         batch=batch_name,
         id=pool_id,
         cluster_name=self.name,
@@ -549,21 +550,21 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     node_flags = self._GetNodeFlags(nodepool_config)
     if node_version:
       # _GetNodeFlags may have added self.cluster_version; replace or append.
-      if '--kubernetes-version' in node_flags:
-        node_flags[node_flags.index('--kubernetes-version') + 1] = node_version
+      if "--kubernetes-version" in node_flags:
+        node_flags[node_flags.index("--kubernetes-version") + 1] = node_version
       else:
-        node_flags += ['--kubernetes-version', node_version]
+        node_flags += ["--kubernetes-version", node_version]
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'add',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "add",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(nodepool_config.name),
-        '--labels',
-        f'pkb_nodepool={nodepool_config.name}',
+        "--labels",
+        f"pkb_nodepool={nodepool_config.name}",
     ] + node_flags
     _, stderr, retcode = vm_util.IssueCommand(
         cmd, timeout=1800, raise_on_failure=False
@@ -575,12 +576,12 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Deletes the named node pool."""
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'delete',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "delete",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(name),
     ] + self.resource_group.args
     self._RunCreateClusterCmd(cmd)
@@ -589,14 +590,14 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """Upgrades the named node pool to target_version."""
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'upgrade',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "upgrade",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(name),
-        '--kubernetes-version',
+        "--kubernetes-version",
         target_version,
     ] + self.resource_group.args
     vm_util.IssueCommand(cmd, timeout=1800)
@@ -610,12 +611,12 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'update',
-        '--name',
+        "aks",
+        "update",
+        "--name",
         self.name,
-        '--tags',
-        f'k8s-mgmt-ts={int(time.time())}',
+        "--tags",
+        f"k8s-mgmt-ts={int(time.time())}",
     ] + self.resource_group.args
     vm_util.IssueCommand(cmd, timeout=1800)
 
@@ -629,65 +630,65 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     node_flags = self._GetNodeFlags(nodepool_config)
     if node_version:
       # _GetNodeFlags may have added self.cluster_version; replace or append.
-      if '--kubernetes-version' in node_flags:
-        node_flags[node_flags.index('--kubernetes-version') + 1] = node_version
+      if "--kubernetes-version" in node_flags:
+        node_flags[node_flags.index("--kubernetes-version") + 1] = node_version
       else:
-        node_flags += ['--kubernetes-version', node_version]
+        node_flags += ["--kubernetes-version", node_version]
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'add',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "add",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(nodepool_config.name),
-        '--labels',
-        f'pkb_nodepool={nodepool_config.name}',
-        '--no-wait',
+        "--labels",
+        f"pkb_nodepool={nodepool_config.name}",
+        "--no-wait",
     ] + node_flags
     # fix: raise timeout to 600s (AKS can take >300s to accept a
     # --no-wait request under concurrent load) and retry on transient errors
     # that indicate the cluster is temporarily at its concurrent-op or
     # pool-count limit.
     _RETRYABLE = (
-        'OperationNotAllowed',
-        'ConflictingOperationInProgress',
-        'MaxAgentPoolCountReached',
+        "OperationNotAllowed",
+        "ConflictingOperationInProgress",
+        "MaxAgentPoolCountReached",
     )
-    _MAX_RETRIES = 5
-    _RETRY_SLEEP_S = 30
-    for attempt in range(_MAX_RETRIES + 1):
+
+    @vm_util.Retry(
+        retryable_exceptions=(errors.Resource.RetryableCreationError,),
+        max_retries=5,
+        sleep_interval=30,
+        log_errors=True,
+    )
+    def _IssueWithRetry():
+      """Issues create-nodepool command with retry on transient errors."""
       _, stderr, retcode = vm_util.IssueCommand(
           cmd, timeout=600, raise_on_failure=False
       )
-      if not retcode:
-        break
-      if attempt < _MAX_RETRIES and any(e in stderr for e in _RETRYABLE):
-        logging.warning(
-            '[AKS] CreateNodePoolAsync %s: retryable error (attempt %d/%d),'
-            ' sleeping %ds: %s',
-            _AzureNodePoolName(nodepool_config.name),
-            attempt + 1, _MAX_RETRIES, _RETRY_SLEEP_S, stderr[:120],
-        )
-        time.sleep(_RETRY_SLEEP_S)
-        continue
-      raise errors.Resource.CreationError(stderr)
-    return f'np_succeeded:{_AzureNodePoolName(nodepool_config.name)}'
+      if retcode:
+        if any(e in stderr for e in _RETRYABLE):
+          raise errors.Resource.RetryableCreationError(stderr)
+        raise errors.Resource.CreationError(stderr)
+
+    _IssueWithRetry()
+    return f"np_succeeded:{_AzureNodePoolName(nodepool_config.name)}"
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'upgrade',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "upgrade",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(name),
-        '--kubernetes-version',
+        "--kubernetes-version",
         target_version,
-        '--no-wait',
+        "--no-wait",
     ] + self.resource_group.args
     # fix: raise timeout to 600s — az aks nodepool upgrade --no-wait
     # can take >300s to be accepted by Azure under concurrent load.
@@ -696,19 +697,19 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     )
     if retcode:
       raise errors.Resource.CreationError(stderr)
-    return f'np_succeeded:{_AzureNodePoolName(name)}'
+    return f"np_succeeded:{_AzureNodePoolName(name)}"
 
   def DeleteNodePoolAsync(self, name: str) -> str:
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'nodepool',
-        'delete',
-        '--cluster-name',
+        "aks",
+        "nodepool",
+        "delete",
+        "--cluster-name",
         self.name,
-        '--name',
+        "--name",
         _AzureNodePoolName(name),
-        '--no-wait',
+        "--no-wait",
     ] + self.resource_group.args
     # fix: raise timeout to 600s and treat NotFound as success.
     # A pool that never existed or was already removed is the desired end-state
@@ -718,14 +719,14 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         cmd, timeout=600, raise_on_failure=False
     )
     if retcode:
-      if 'NotFound' in stderr or 'not found' in stderr.lower():
+      if "NotFound" in stderr or "not found" in stderr.lower():
         logging.info(
-            '[AKS] DeleteNodePoolAsync: %s already gone — treating as success',
+            "[AKS] DeleteNodePoolAsync: %s already gone — treating as success",
             _AzureNodePoolName(name),
         )
-        return f'np_gone:{_AzureNodePoolName(name)}'
+        return f"np_gone:{_AzureNodePoolName(name)}"
       raise errors.Resource.CreationError(stderr)
-    return f'np_gone:{_AzureNodePoolName(name)}'
+    return f"np_gone:{_AzureNodePoolName(name)}"
 
   def UpdateClusterAsync(self) -> str:
     """Triggers a node-count scale on the system node pool to create a
@@ -738,52 +739,72 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     """
     # Find the system node pool name
     list_cmd = [
-        azure.AZURE_PATH, 'aks', 'nodepool', 'list',
-        '--cluster-name', self.name,
-        '--query', '[?mode==`System`].{name:name,count:count}',
-        '--output', 'json',
+        azure.AZURE_PATH,
+        "aks",
+        "nodepool",
+        "list",
+        "--cluster-name",
+        self.name,
+        "--query",
+        "[?mode==`System`].{name:name,count:count}",
+        "--output",
+        "json",
     ] + self.resource_group.args
     out, _, rc = vm_util.IssueCommand(list_cmd, raise_on_failure=False)
     if not rc and out.strip():
       try:
         pools = json.loads(out.strip())
         if pools:
-          pool_name = pools[0]['name']
-          current_count = int(pools[0]['count'])
+          pool_name = pools[0]["name"]
+          current_count = int(pools[0]["count"])
           # Toggle: scale to current+1 or current-1 (minimum 1)
-          new_count = current_count + 1 if current_count <= 1 else current_count - 1
+          new_count = (
+              current_count + 1 if current_count <= 1 else current_count - 1
+          )
           scale_cmd = [
-              azure.AZURE_PATH, 'aks', 'nodepool', 'scale',
-              '--cluster-name', self.name,
-              '--name', pool_name,
-              '--node-count', str(new_count),
-              '--no-wait',
+              azure.AZURE_PATH,
+              "aks",
+              "nodepool",
+              "scale",
+              "--cluster-name",
+              self.name,
+              "--name",
+              pool_name,
+              "--node-count",
+              str(new_count),
+              "--no-wait",
           ] + self.resource_group.args
           _, stderr, retcode = vm_util.IssueCommand(
               scale_cmd, timeout=300, raise_on_failure=False
           )
           if not retcode:
             logging.info(
-                '[AKS] UpdateClusterAsync: scaling system pool %s %d->%d',
-                pool_name, current_count, new_count,
+                "[AKS] UpdateClusterAsync: scaling system pool %s %d->%d",
+                pool_name,
+                current_count,
+                new_count,
             )
-            return 'cluster_succeeded'
+            return "cluster_succeeded"
       except (ValueError, KeyError, json.JSONDecodeError) as e:
-        logging.warning('[AKS] UpdateClusterAsync: pool parse error: %s', e)
+        logging.info("[AKS] UpdateClusterAsync: pool parse error: %s", e)
     # Fallback: tag update
-    logging.warning('[AKS] UpdateClusterAsync: falling back to tag update')
+    logging.info("[AKS] UpdateClusterAsync: falling back to tag update")
     cmd = [
-        azure.AZURE_PATH, 'aks', 'update',
-        '--name', self.name,
-        '--tags', f'k8s-mgmt-ts={int(time.time())}',
-        '--no-wait',
+        azure.AZURE_PATH,
+        "aks",
+        "update",
+        "--name",
+        self.name,
+        "--tags",
+        f"k8s-mgmt-ts={int(time.time())}",
+        "--no-wait",
     ] + self.resource_group.args
     _, stderr, retcode = vm_util.IssueCommand(
         cmd, timeout=300, raise_on_failure=False
     )
     if retcode:
       raise errors.Resource.CreationError(stderr)
-    return 'cluster_succeeded'
+    return "cluster_succeeded"
 
   def ResolveNodePoolVersions(self) -> tuple[str, str]:
     """Returns (initial, target) AKS node pool versions.
@@ -793,19 +814,21 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     target  = N   (cluster version = latest)
     """
     cluster_ver = self.cluster_version or self.k8s_version
-    parts = cluster_ver.lstrip('v').split('.')
+    parts = cluster_ver.lstrip("v").split(".")
     major, minor = int(parts[0]), int(parts[1])
-    target  = f'{major}.{minor}'
-    initial = f'{major}.{minor - 1}'
+    target = f"{major}.{minor}"
+    initial = f"{major}.{minor - 1}"
     logging.info(
-        '[AKS] ResolveNodePoolVersions: cluster=%s initial=%s target=%s',
-        cluster_ver, initial, target,
+        "[AKS] ResolveNodePoolVersions: cluster=%s initial=%s target=%s",
+        cluster_ver,
+        initial,
+        target,
     )
     return initial, target
 
   def WaitForOperation(self, op_handle: str) -> None:
     """Polls AKS resources until the expected terminal state is observed."""
-    kind, _, name = op_handle.partition(':')
+    kind, _, name = op_handle.partition(":")
 
     @vm_util.Retry(
         poll_interval=5,
@@ -819,37 +842,35 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       out, err, rc = vm_util.IssueCommand(
           [
               azure.AZURE_PATH,
-              'aks',
-              'nodepool',
-              'show',
-              '--cluster-name',
+              "aks",
+              "nodepool",
+              "show",
+              "--cluster-name",
               self.name,
-              '--name',
+              "--name",
               name,
-              '--query',
-              'provisioningState',
-              '--output',
-              'tsv',
+              "--query",
+              "provisioningState",
+              "--output",
+              "tsv",
           ]
           + self.resource_group.args,
           raise_on_failure=False,
           timeout=120,
       )
       if rc:
-        if 'NotFound' in (err or '') or 'not found' in (err or '').lower():
+        if "NotFound" in (err or "") or "not found" in (err or "").lower():
           raise errors.Resource.CreationError(
-              f'nodepool {name} not found while waiting for Succeeded: {err}'
+              f"nodepool {name} not found while waiting for Succeeded: {err}"
           )
         raise errors.Resource.RetryableCreationError(err)
       status = out.strip()
-      if status == 'Succeeded':
+      if status == "Succeeded":
         return
-      if status == 'Failed':
-        raise errors.Resource.CreationError(
-            f'nodepool {name} ended in Failed'
-        )
+      if status == "Failed":
+        raise errors.Resource.CreationError(f"nodepool {name} ended in Failed")
       raise errors.Resource.RetryableCreationError(
-          f'nodepool {name} state={status}'
+          f"nodepool {name} state={status}"
       )
 
     @vm_util.Retry(
@@ -863,24 +884,26 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       _, err, rc = vm_util.IssueCommand(
           [
               azure.AZURE_PATH,
-              'aks',
-              'nodepool',
-              'show',
-              '--cluster-name',
+              "aks",
+              "nodepool",
+              "show",
+              "--cluster-name",
               self.name,
-              '--name',
+              "--name",
               name,
           ]
           + self.resource_group.args,
           raise_on_failure=False,
           timeout=120,
       )
-      if rc and ('NotFound' in (err or '') or 'not found' in (err or '').lower()):
+      if rc and (
+          "NotFound" in (err or "") or "not found" in (err or "").lower()
+      ):
         return
       if rc:
         raise errors.Resource.RetryableDeletionError(err)
       raise errors.Resource.RetryableDeletionError(
-          f'nodepool {name} still present'
+          f"nodepool {name} still present"
       )
 
     @vm_util.Retry(
@@ -894,14 +917,14 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       out, err, rc = vm_util.IssueCommand(
           [
               azure.AZURE_PATH,
-              'aks',
-              'show',
-              '--name',
+              "aks",
+              "show",
+              "--name",
               self.name,
-              '--query',
-              'provisioningState',
-              '--output',
-              'tsv',
+              "--query",
+              "provisioningState",
+              "--output",
+              "tsv",
           ]
           + self.resource_group.args,
           raise_on_failure=False,
@@ -910,22 +933,20 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       if rc:
         raise errors.Resource.RetryableCreationError(err)
       status = out.strip()
-      if status == 'Succeeded':
+      if status == "Succeeded":
         return
-      if status == 'Failed':
-        raise errors.Resource.CreationError('cluster update ended in Failed')
-      raise errors.Resource.RetryableCreationError(
-          f'cluster state={status}'
-      )
+      if status == "Failed":
+        raise errors.Resource.CreationError("cluster update ended in Failed")
+      raise errors.Resource.RetryableCreationError(f"cluster state={status}")
 
-    if kind == 'np_succeeded':
+    if kind == "np_succeeded":
       _wait_np_succeeded()
-    elif kind == 'np_gone':
+    elif kind == "np_gone":
       _wait_np_gone()
-    elif kind == 'cluster_succeeded':
+    elif kind == "cluster_succeeded":
       _wait_cluster_succeeded()
     else:
-      raise ValueError(f'Unknown AKS op handle: {op_handle!r}')
+      raise ValueError(f"Unknown AKS op handle: {op_handle!r}")
 
 
 class AksAutomaticCluster(AksCluster):
@@ -938,7 +959,7 @@ class AksAutomaticCluster(AksCluster):
   """
 
   CLOUD = provider_info.AZURE
-  CLUSTER_TYPE = 'Auto'
+  CLUSTER_TYPE = "Auto"
 
   # Control how long to WaitUntilReady
   READY_TIMEOUT = 40 * 60  # 40 minutes
@@ -947,22 +968,22 @@ class AksAutomaticCluster(AksCluster):
   def _Create(self):
     """Creates the Automatic AKS cluster with tags."""
     tags_dict = util.GetResourceTags(self.resource_group.timeout_minutes)
-    tags_list = [f'{k}={v}' for k, v in tags_dict.items()]
+    tags_list = [f"{k}={v}" for k, v in tags_dict.items()]
     cmd = [
         azure.AZURE_PATH,
-        'aks',
-        'create',
-        '--name',
+        "aks",
+        "create",
+        "--name",
         self.name,
-        '--location',
+        "--location",
         self.region,
-        '--ssh-key-value',
+        "--ssh-key-value",
         vm_util.GetPublicKeyPath(),
-        '--resource-group',
+        "--resource-group",
         self.resource_group.name,
-        '--sku',
-        'automatic',
-        '--tags',
+        "--sku",
+        "automatic",
+        "--tags",
     ] + tags_list
     self._RunCreateClusterCmd(cmd)
 
@@ -970,54 +991,54 @@ class AksAutomaticCluster(AksCluster):
     """Creates a role assignment for the current user."""
     full_cluster_id, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'aks',
-        'show',
-        '--name',
+        "aks",
+        "show",
+        "--name",
         self.name,
-        '--resource-group',
+        "--resource-group",
         self.resource_group.name,
-        '--query',
-        'id',
-        '--output',
-        'tsv',
+        "--query",
+        "id",
+        "--output",
+        "tsv",
     ])
     full_cluster_id = full_cluster_id.strip()
     current_user, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'account',
-        'show',
-        '--query',
-        'user.name',
-        '--output',
-        'tsv',
+        "account",
+        "show",
+        "--query",
+        "user.name",
+        "--output",
+        "tsv",
     ])
     current_user = current_user.strip()
     create_role_assignment_cmd = [
         azure.AZURE_PATH,
-        'role',
-        'assignment',
-        'create',
-        '--assignee',
+        "role",
+        "assignment",
+        "create",
+        "--assignee",
         current_user,
-        '--role',
-        'Azure Kubernetes Service RBAC Admin',
-        '--scope',
+        "--role",
+        "Azure Kubernetes Service RBAC Admin",
+        "--scope",
         full_cluster_id,
     ]
     vm_util.IssueCommand(create_role_assignment_cmd)
 
   def _ConvertCredentialsToAzCli(self):
     """Converts the kubeconfig file to the Azure CLI format."""
-    kubelogin_path, _, _ = vm_util.IssueCommand(['which', 'kubelogin'])
+    kubelogin_path, _, _ = vm_util.IssueCommand(["which", "kubelogin"])
     kubelogin_path = kubelogin_path.strip()
     vm_util.IssueCommand(
         [
             kubelogin_path,
-            'convert-kubeconfig',
-            '-l',
-            'azurecli',
+            "convert-kubeconfig",
+            "-l",
+            "azurecli",
         ],
-        env={'KUBECONFIG': FLAGS.kubeconfig},
+        env={"KUBECONFIG": FLAGS.kubeconfig},
     )
 
   def _GrantResourcePolicyContributorRole(self):
@@ -1027,27 +1048,27 @@ class AksAutomaticCluster(AksCluster):
     """
     account_info, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'account',
-        'show',
-        '--query',
-        '[user.name, id]',
-        '--output',
-        'tsv',
+        "account",
+        "show",
+        "--query",
+        "[user.name, id]",
+        "--output",
+        "tsv",
     ])
 
-    assignee_id, subscription_id = account_info.strip().split('\n')
-    scope = f'/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}'
+    assignee_id, subscription_id = account_info.strip().split("\n")
+    scope = f"/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}"
 
     vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'role',
-        'assignment',
-        'create',
-        '--role',
-        'Resource Policy Contributor',
-        '--assignee',
+        "role",
+        "assignment",
+        "create",
+        "--role",
+        "Resource Policy Contributor",
+        "--assignee",
         assignee_id,
-        '--scope',
+        "--scope",
         scope,
     ])
 
@@ -1064,26 +1085,26 @@ class AksAutomaticCluster(AksCluster):
     """
     subscription_id, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'account',
-        'show',
-        '--query',
-        'id',
-        '--output',
-        'tsv',
+        "account",
+        "show",
+        "--query",
+        "id",
+        "--output",
+        "tsv",
     ])
     subscription_id = subscription_id.strip()
-    policy_scope = f'/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}/providers/Microsoft.ContainerService/managedClusters/{self.name}'
+    policy_scope = f"/subscriptions/{subscription_id}/resourceGroups/{self.resource_group.name}/providers/Microsoft.ContainerService/managedClusters/{self.name}"
 
     vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'policy',
-        'assignment',
-        'update',
-        '--name',
-        'aks-deployment-safeguards-policy-assignment',
-        '--scope',
+        "policy",
+        "assignment",
+        "update",
+        "--name",
+        "aks-deployment-safeguards-policy-assignment",
+        "--scope",
         policy_scope,
-        '--set',
+        "--set",
         'enforcement_mode="DoNotEnforce"',
     ])
 
@@ -1100,20 +1121,20 @@ class AksAutomaticCluster(AksCluster):
       stdout, stderr, retcode = vm_util.IssueCommand(
           [
               FLAGS.kubectl,
-              '--kubeconfig',
+              "--kubeconfig",
               FLAGS.kubeconfig,
-              'get',
-              'constraints',
-              '-o',
+              "get",
+              "constraints",
+              "-o",
               'jsonpath={.items[?(@.kind=="K8sAzureV1ContainerRequests")].spec.enforcementAction}',
           ],
           raise_on_failure=False,
       )
       if retcode != 0:
         raise errors.Resource.RetryableCreationError(
-            f'Failed to check constraint: {stderr}'
+            f"Failed to check constraint: {stderr}"
         )
-      if stdout.strip() != 'dryrun':
+      if stdout.strip() != "dryrun":
         raise errors.Resource.RetryableCreationError(
             f'Enforcement action is "{stdout.strip()}", waiting for "dryrun"'
         )
@@ -1128,20 +1149,20 @@ class AksAutomaticCluster(AksCluster):
     """
     user_type, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
-        'account',
-        'show',
-        '--query',
-        'user.type',
-        '--output',
-        'tsv',
+        "account",
+        "show",
+        "--query",
+        "user.type",
+        "--output",
+        "tsv",
     ])
     user_type = user_type.strip()
-    if user_type == 'servicePrincipal':
+    if user_type == "servicePrincipal":
       self._CreateRoleAssignment()
     self._GrantResourcePolicyContributorRole()
     self._RelaxAKSPolicy()
     self._GetCredentials(use_admin=False)
-    if user_type != 'servicePrincipal':
+    if user_type != "servicePrincipal":
       self._ConvertCredentialsToAzCli()
     self._WaitForDefaultServiceAccount()
     self._AttachContainerRegistry()
@@ -1158,11 +1179,11 @@ class AksAutomaticCluster(AksCluster):
     # Topology spread constraints needed to fix an issue with Azure AKS where
     # admission webhook "validation.gatekeeper.sh" denied the request.
     super()._ModifyPodSpecPlacementYaml(pod_spec_yaml, machine_type)
-    pod_spec_yaml['topologySpreadConstraints'] = [{
-        'maxSkew': 1,
-        'topologyKey': 'kubernetes.io/hostname',
-        'whenUnsatisfiable': 'DoNotSchedule',
-        'labelSelector': {'matchLabels': {'name': name}},
+    pod_spec_yaml["topologySpreadConstraints"] = [{
+        "maxSkew": 1,
+        "topologyKey": "kubernetes.io/hostname",
+        "whenUnsatisfiable": "DoNotSchedule",
+        "labelSelector": {"matchLabels": {"name": name}},
     }]
 
 
