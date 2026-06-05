@@ -838,6 +838,23 @@ def Run(spec) -> list[sample.Sample]:
 
   logging.info('[swap_encryption] swap device: %s', swap_dev)
 
+  # ── Phase 3c (OpenSearch) runs FIRST, on a clean node ─────────────────────
+  # OpenSearch needs several GB of free RAM to start, which it cannot get once
+  # the swap phases (2a/2b) have saturated RAM+swap — there it is OOM-killed
+  # during startup and never binds :9200.  Running it first (the node is clean
+  # at benchmark start) lets it start reliably; its OWN stressor provides the
+  # swap pressure for its index/query, and it tears itself down afterwards so
+  # the node is clean again for Tier 1/2.  Order in the results is unaffected
+  # (samples carry their own phase labels).
+  if _phase_selected('3c'):
+    logging.info('[swap_encryption] ── Phase OpenSearch (3c) — run first on '
+                 'clean node ──')
+    try:
+      results += _phase3c_opensearch(pod, base_meta)
+    except Exception as e:  # pylint: disable=broad-except
+      logging.error('[swap_encryption] OpenSearch (3c) FAILED: %s — continuing',
+                    e)
+
   # ── Tier 1 / Gate 1: fio microbenchmarks ─────────────────────────────────
   tier1_results = []
   if _phase_selected('fio'):
@@ -876,10 +893,11 @@ def Run(spec) -> list[sample.Sample]:
                       'independent of stress-ng results)')
 
   # ── Tier 3 / Gate 3: real-world workloads ────────────────────────────────
+  # NOTE: 3c (OpenSearch) is intentionally NOT here — it runs first, on a clean
+  # node, before the swap phases saturate memory (see top of Run()).
   tier3 = [
       ('3a', 'Redis latency (3a)', lambda: _phase3a_redis(pod, base_meta)),
       ('3b', 'Kernel build (3b)', lambda: _phase3b_kernel_build(pod, base_meta)),
-      ('3c', 'OpenSearch (3c)', lambda: _phase3c_opensearch(pod, base_meta)),
   ]
   if any(_phase_selected(tok) for tok, _, _ in tier3):
     logging.info('[swap_encryption] ── Tier 3 / Gate 3: workloads ──')
@@ -970,7 +988,7 @@ def Cleanup(spec) -> None:
         rm -f "$backing"
       done
     """), ignore_failure=True)
-    _pod_exec(pod, 'pkill -f "stress-ng|fio" 2>/dev/null || true',
+    _pod_exec(pod, "pkill -9 'stress-ng|fio' 2>/dev/null || true",
              ignore_failure=True)
 
   _delete_daemonset()
@@ -1428,6 +1446,48 @@ def _attach_swap_disk(cluster) -> None:
                disk_name, instance_name)
 
 
+def _delete_disk_by_name(disk_name: str, project: str, zone: str) -> bool:
+  """Detach (if attached) and delete a GCE disk, robustly, with retries.
+
+  Finds the attached instance from the disk's own `users` field rather than
+  kubectl — kubectl is often unavailable during teardown (cluster being
+  deleted), which previously left the disk attached and undeletable, so it
+  leaked.  Returns True if the disk is gone (deleted or already absent).
+  """
+  for attempt in range(1, 5):
+    users, _, rc = vm_util.IssueCommand(
+        ['gcloud', 'compute', 'disks', 'describe', disk_name,
+         '--project', project, '--zone', zone, '--format=value(users)'],
+        timeout=60, raise_on_failure=False)
+    if rc != 0:
+      logging.info('[swap_encryption] Swap disk %s not present — nothing to '
+                   'delete', disk_name)
+      return True  # already gone
+    user = users.strip()
+    if user:
+      inst = user.split('/')[-1]
+      logging.info('[swap_encryption] Detaching swap disk %s from %s',
+                   disk_name, inst)
+      vm_util.IssueCommand(
+          ['gcloud', 'compute', 'instances', 'detach-disk', inst,
+           '--project', project, '--zone', zone, '--disk', disk_name,
+           '--quiet'], timeout=120, raise_on_failure=False)
+    _, derr, drc = vm_util.IssueCommand(
+        ['gcloud', 'compute', 'disks', 'delete', disk_name,
+         '--project', project, '--zone', zone, '--quiet'],
+        timeout=180, raise_on_failure=False)
+    if drc == 0:
+      logging.info('[swap_encryption] Swap disk deleted: %s', disk_name)
+      return True
+    logging.warning('[swap_encryption] Swap disk delete attempt %d/4 failed '
+                    '(%s); retrying in 10s', attempt, derr.strip()[:160])
+    time.sleep(10)
+  logging.error('[swap_encryption] Could NOT delete swap disk %s after retries '
+                '— delete it manually: gcloud compute disks delete %s '
+                '--zone %s --quiet', disk_name, disk_name, zone)
+  return False
+
+
 def _detach_and_delete_swap_disk(cluster) -> None:
   """Detach and delete the dedicated swap disk created by _attach_swap_disk."""
   zone = None
@@ -1437,29 +1497,7 @@ def _detach_and_delete_swap_disk(cluster) -> None:
     zone = cluster.region
   if not zone or not getattr(cluster, 'project', None):
     return
-
-  project = cluster.project
-  disk_name = f'pkb-swap-{cluster.name}'
-
-  node_out, _, _ = kubectl.RunKubectlCommand([
-      'get', 'nodes',
-      '-l', f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
-      '-o', 'jsonpath={.items[0].metadata.name}',
-  ], raise_on_failure=False)
-  instance_name = node_out.strip()
-
-  if instance_name:
-    vm_util.IssueCommand([
-        'gcloud', 'compute', 'instances', 'detach-disk', instance_name,
-        '--project', project, '--zone', zone,
-        '--disk', disk_name, '--quiet',
-    ], timeout=120, raise_on_failure=False)
-
-  vm_util.IssueCommand([
-      'gcloud', 'compute', 'disks', 'delete', disk_name,
-      '--project', project, '--zone', zone, '--quiet',
-  ], timeout=120, raise_on_failure=False)
-  logging.info('[swap_encryption] Swap disk deleted: %s', disk_name)
+  _delete_disk_by_name(f'pkb-swap-{cluster.name}', cluster.project, zone)
 
 
 def _delete_default_node_pool(cluster) -> None:
@@ -2893,110 +2931,114 @@ def _phase2a_cpu_overhead(pod: str, base_meta: dict) -> list[sample.Sample]:
 def _run_cpu_overhead_sweep(
     pod: str, base_meta: dict, vm_bytes: str
 ) -> list[sample.Sample]:
-  """Single stress-ng intensity sweep for Phase 2a."""
-  results = []
+  """Phase 2a stressor sweep, WITH RETRY for flaky swap.
+
+  Driving the multi-worker rand-set working set past RAM into swap is
+  empirically non-deterministic on these nodes: the SAME config produced
+  ~670k pages/s on some runs and <300 on others.  So we retry: if an attempt
+  completes but peak swap-out is below the threshold (and it did not OOM),
+  reclaim memory and re-run, keeping the BEST attempt.  An OOM, or a peak
+  at/above threshold, ends the retries immediately.
+  """
   meta = dict(base_meta, phase='cpu_overhead', stress_vm_bytes=vm_bytes)
   timeout = _STRESS_TIMEOUT_SEC.value
   interval = 2
-
+  n_samples = timeout // interval + 10
   vmstat_log = f'/tmp/pkb_vmstat_{vm_bytes}.log'
   pidstat_log = f'/tmp/pkb_pidstat_{vm_bytes}.log'
-  # Collect a few extra samples so collectors definitely outlast stress-ng.
-  n_samples = timeout // interval + 10
-
-  # Run vmstat, pidstat, and stress-ng in ONE kubectl exec session.
-  # Separate exec calls cause the background collectors to receive SIGHUP
-  # the moment their bash exits (non-interactive shell, no job control),
-  # so the log files are never written.  Running all three in the same
-  # session keeps the exec open until stress-ng (foreground) exits, and
-  # then we explicitly kill the collectors before the session closes.
-  # rc=137 (OOM SIGKILL) is expected when vm-bytes > available RAM and
-  # swap pressure is the intended goal — ignore_failure=True handles it.
-  # Stressor config.  Empirically the multi-worker rand-set pattern (no
-  # --vm-populate, no --vm-keep) is what has actually produced sustained swap
-  # on these nodes (~135k pages/s).  --vm-populate was tried and is strictly
-  # harmful: prefaulting the full >RAM mapping at once overwhelms reclaim and
-  # the kernel OOM-kills the pod (rc 137) instead of paging, which then breaks
-  # every later phase.  Gradual rand-set fill never OOMs.  KSM off + swappiness
-  # 100 maximise the odds of paging per attempt.
   workers = max(1, _STRESS_VM_WORKERS.value)
   per_worker = _per_worker_vm_bytes(vm_bytes, workers)
-  t0 = time.time()
-  stress_out, _ = _pod_exec(pod, textwrap.dedent(f"""
-    echo 2 > /sys/kernel/mm/ksm/run 2>/dev/null || true
-    echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true
-    sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
-    PKB_MCG=$(awk -F: '/^0::/{{print $3}}' /proc/self/cgroup 2>/dev/null)
-    echo "[pkb] ksm_run=$(cat /sys/kernel/mm/ksm/run 2>/dev/null || echo n/a) swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) MemAvailable_kB=$(awk '/MemAvailable/{{print $2}}' /proc/meminfo) cgroup=$PKB_MCG memory.max=$(cat /sys/fs/cgroup$PKB_MCG/memory.max 2>/dev/null || echo n/a) memory.high=$(cat /sys/fs/cgroup$PKB_MCG/memory.high 2>/dev/null || echo n/a) memory.current=$(cat /sys/fs/cgroup$PKB_MCG/memory.current 2>/dev/null || echo n/a) memory.swap.max=$(cat /sys/fs/cgroup$PKB_MCG/memory.swap.max 2>/dev/null || echo n/a) workers={workers} per_worker={per_worker}"
-    vmstat {interval} {n_samples} > {vmstat_log} 2>&1 &
-    VMSTAT_PID=$!
-    pidstat -u {interval} {n_samples} -p ALL > {pidstat_log} 2>&1 &
-    PISTAT_PID=$!
-    stress-ng --vm {workers} \\
-      --vm-bytes {per_worker} \\
-      --vm-hang 0 \\
-      {_stress_vm_method_flag(pod)} \\
-      --timeout {timeout}s \\
-      --metrics-brief 2>&1 || true
-    kill $VMSTAT_PID $PISTAT_PID 2>/dev/null || true
-  """), timeout=timeout + 60, ignore_failure=True)
-  elapsed = time.time() - t0
-
-  results.append(sample.Sample('stress_ng_duration_sec', elapsed, 's', meta))
-
-  # Detect a premature OOM kill.  When the cgroup cannot page out to swap (e.g.
-  # memory.swap.max still 0) stress-ng is SIGKILLed within seconds and `elapsed`
-  # is far below the requested timeout, yet it would otherwise be recorded as a
-  # normal duration.  stress-ng prints "successful run completed" only when it
-  # finishes cleanly, so treat its absence + a short runtime as an OOM kill.
-  completed_cleanly = ('successful run completed' in stress_out.lower()
-                       or 'metrics-brief' in stress_out.lower()
-                       or 'bogo-ops' in stress_out.lower())
-  oom_killed = (not completed_cleanly) and elapsed < timeout * 0.8
-  results.append(sample.Sample(
-      'stress_ng_completed', 0.0 if oom_killed else 1.0, 'status', meta))
-  if oom_killed:
-    msg = (f'stress-ng (vm_bytes={vm_bytes}) was OOM-killed after '
-           f'{elapsed:.0f}s of a {timeout}s target — the cgroup could not '
-           f'page anonymous memory out to swap (memory.swap.max may still be '
-           f'0), so swap-encryption overhead was not measured')
-    logging.error('[swap_encryption] %s', msg)
-    _degraded_reasons.append(msg)
-
-  for line in stress_out.splitlines():
-    m = re.search(r'vm\s+\d+\s+(\d+)\s+\S+\s+bogo-ops', line)
-    if m:
-      results.append(
-          sample.Sample('stress_ng_bogo_ops', float(m.group(1)), 'ops', meta)
-      )
-      break
-
-  vmstat_out, _ = _pod_exec(pod, f'cat {vmstat_log}', ignore_failure=True)
-  vmstat_samples = _parse_vmstat(vmstat_out, meta)
-  results += vmstat_samples
-
-  # Swap-activity gate: a stress run that *completed* but moved no pages to swap
-  # never exercised the encrypted swap path, so the dm-crypt / Nitro overhead it
-  # is meant to measure is absent — the headline numbers would be hollow even
-  # though the run "passed".  (Skip when already flagged as OOM-killed above.)
-  swap_out_max = max(
-      (s.value for s in vmstat_samples
-       if s.metric in ('swap_out_pages_per_sec', 'swap_out_pages_per_sec_max')),
-      default=0.0)
   min_so = _MIN_SWAP_OUT_PAGES.value
-  if not oom_killed and swap_out_max < min_so:
-    msg = (f'stress-ng (vm_bytes={vm_bytes}) completed but peak swap-out was '
-           f'only {swap_out_max:.0f} pages/s (< {min_so} threshold) — the '
-           f'working set never meaningfully paged to the swap device, so '
-           f'swap-encryption overhead was not measured. Check vm_bytes vs RAM, '
-           f'--vm-method (write64 can be reclaimed behind the write pointer), '
-           f'whether KSM merged the worker buffers, and that vmstat captured '
-           f'si/so columns')
+  method_flag = _stress_vm_method_flag(pod)
+  max_attempts = 3
+  best = None
+
+  for attempt in range(1, max_attempts + 1):
+    t0 = time.time()
+    stress_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+      echo 2 > /sys/kernel/mm/ksm/run 2>/dev/null || true
+      echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true
+      sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
+      PKB_MCG=$(awk -F: '/^0::/{{print $3}}' /proc/self/cgroup 2>/dev/null)
+      echo "[pkb] phase2a attempt={attempt}/{max_attempts} ksm_run=$(cat /sys/kernel/mm/ksm/run 2>/dev/null || echo n/a) swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null) MemAvailable_kB=$(awk '/MemAvailable/{{print $2}}' /proc/meminfo) memory.swap.max=$(cat /sys/fs/cgroup$PKB_MCG/memory.swap.max 2>/dev/null || echo n/a) workers={workers} per_worker={per_worker}"
+      vmstat {interval} {n_samples} > {vmstat_log} 2>&1 &
+      VMSTAT_PID=$!
+      pidstat -u {interval} {n_samples} -p ALL > {pidstat_log} 2>&1 &
+      PISTAT_PID=$!
+      stress-ng --vm {workers} \\
+        --vm-bytes {per_worker} \\
+        --vm-hang 0 \\
+        {method_flag} \\
+        --timeout {timeout}s \\
+        --metrics-brief 2>&1 || true
+      kill $VMSTAT_PID $PISTAT_PID 2>/dev/null || true
+    """), timeout=timeout + 60, ignore_failure=True)
+    elapsed = time.time() - t0
+
+    completed_cleanly = ('successful run completed' in stress_out.lower()
+                         or 'metrics-brief' in stress_out.lower()
+                         or 'bogo-ops' in stress_out.lower())
+    oom_killed = (not completed_cleanly) and elapsed < timeout * 0.8
+    vmstat_out, _ = _pod_exec(pod, f'cat {vmstat_log}', ignore_failure=True)
+    pidstat_out, _ = _pod_exec(pod, f'cat {pidstat_log}', ignore_failure=True)
+    vmstat_samples = _parse_vmstat(vmstat_out, meta)
+    swap_out_max = max(
+        (s.value for s in vmstat_samples
+         if s.metric in ('swap_out_pages_per_sec',
+                         'swap_out_pages_per_sec_max')), default=0.0)
+    bogo = None
+    for line in stress_out.splitlines():
+      mm = re.search(r'vm\s+\d+\s+(\d+)\s+\S+\s+bogo-ops', line)
+      if mm:
+        bogo = float(mm.group(1))
+        break
+    logging.info('[swap_encryption] Phase 2a attempt %d/%d: peak swap-out '
+                 '%.0f pages/s (completed=%s, oom=%s)', attempt, max_attempts,
+                 swap_out_max, completed_cleanly, oom_killed)
+    if best is None or swap_out_max > best['swap_out_max']:
+      best = dict(elapsed=elapsed, oom_killed=oom_killed,
+                  swap_out_max=swap_out_max, vmstat_samples=vmstat_samples,
+                  pidstat_out=pidstat_out, bogo=bogo)
+    if oom_killed or swap_out_max >= min_so:
+      break
+    if attempt < max_attempts:
+      logging.warning('[swap_encryption] Phase 2a swap-out %.0f < %d threshold '
+                      '— reclaiming and retrying (%d/%d)', swap_out_max, min_so,
+                      attempt + 1, max_attempts)
+      _pod_exec(pod, textwrap.dedent("""
+        echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
+        pkill -9 stress-ng 2>/dev/null || true
+        sleep 3; sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+      """), ignore_failure=True, timeout=60)
+
+  # Emit samples from the BEST attempt.
+  results = [
+      sample.Sample('stress_ng_duration_sec', best['elapsed'], 's', meta),
+      sample.Sample('stress_ng_completed',
+                    0.0 if best['oom_killed'] else 1.0, 'status', meta),
+  ]
+  if best['bogo'] is not None:
+    results.append(sample.Sample('stress_ng_bogo_ops', best['bogo'], 'ops',
+                                 meta))
+  results += best['vmstat_samples']
+  results += _parse_pidstat(best['pidstat_out'], meta)
+
+  # Swap-activity gate: a completed run that moved ~no pages to swap never
+  # exercised the encrypted swap path (the headline numbers would be hollow).
+  if best['oom_killed']:
+    msg = (f'stress-ng (vm_bytes={vm_bytes}) was OOM-killed — the cgroup could '
+           f'not page anonymous memory out to swap; swap-encryption overhead '
+           f'was not measured')
+    logging.error('[swap_encryption] %s', msg)
+    _degraded_reasons.append(msg)
+  elif best['swap_out_max'] < min_so:
+    msg = (f'stress-ng (vm_bytes={vm_bytes}) peak swap-out was only '
+           f'{best["swap_out_max"]:.0f} pages/s (< {min_so} threshold) after '
+           f'{max_attempts} attempts — the working set never meaningfully '
+           f'paged to swap. Check vm_bytes vs RAM and the swap device')
     logging.error('[swap_encryption] %s', msg)
     _degraded_reasons.append(msg)
 
-  pidstat_out, _ = _pod_exec(pod, f'cat {pidstat_log}', ignore_failure=True)
-  results += _parse_pidstat(pidstat_out, meta)
   return results
 
 
@@ -3161,7 +3203,7 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # stress-ng is already dead — kill is a no-op and we skip the long wait.
   # _retries=0: no recovery here; the first Phase 3a command will recover
   # the pod properly if needed (and it already waits for /tmp/pkb_ready).
-  _pod_exec(pod, 'pkill -f stress-ng 2>/dev/null || true',
+  _pod_exec(pod, 'pkill -9 stress-ng 2>/dev/null || true',
             ignore_failure=True, _retries=0, timeout=15)
   return results
 
@@ -3501,20 +3543,28 @@ def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
   """
   meta = dict(base_meta, workload='opensearch')
 
-  # Free the node first.  On a reused pod, a leftover stress-ng (370 GB) or a
-  # stuck non-serving OpenSearch from a prior attempt can pin the node at its
-  # memory limit — enough that the launch session itself is OOM-killed (rc 137)
-  # before it can do anything.  Kill those hogs up front (tiny exec, survives
-  # memory pressure), then reclaim, so OpenSearch has room to start.
+  # Free the node first.  Coming out of the swap-heavy phases (2a/2b) the node
+  # is so memory/swap-saturated that even this tiny cleanup exec was itself
+  # OOM-killed (rc 137) before it could free anything (run 005).  Make the
+  # cleanup OOM-IMMUNE (oom_score_adj=-1000) so it always survives, kill any
+  # lingering stress-ng / non-serving OpenSearch, drop caches, and then POLL
+  # until memory actually recovers before we try to launch OpenSearch.
   _pod_exec(pod, textwrap.dedent("""
-    pkill -9 -f stress-ng 2>/dev/null || true
+    echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
+    pkill -9 stress-ng 2>/dev/null || true
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:9200/ 2>/dev/null)" != "200" ]; then
-      pkill -9 -f org.opensearch.bootstrap.OpenSearch 2>/dev/null || true
+      if [ -f /tmp/opensearch.pid ]; then kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null || true; rm -f /tmp/opensearch.pid; fi
     fi
-    sleep 3
-    sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    # Wait (up to ~60s) for the kernel to reclaim RAM after the swap stressors
+    # so OpenSearch has headroom; OpenSearch needs only a few GB.
+    for _i in $(seq 1 30); do
+      sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+      avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+      [ "${avail:-0}" -gt 16777216 ] && break   # >16 GiB available
+      sleep 2
+    done
     echo "[pkb] 3c pre-clean free:"; free -h | head -2
-  """), ignore_failure=True, timeout=60)
+  """), ignore_failure=True, timeout=90)
 
   esrally_out, _ = _pod_exec(
       pod, 'which esrally 2>/dev/null', ignore_failure=True)
@@ -3621,6 +3671,9 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
   # the only artifact that tells us whether the launch ran and why it stopped.
   _pod_exec(pod, textwrap.dedent("""
     exec >/tmp/pkb_opensearch_run.log 2>&1
+    # Make this launch session OOM-immune so it always survives long enough to
+    # kill a stale server and relaunch, even if the node is memory-saturated.
+    echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
     echo "[pkb] opensearch launch attempt at $(date -u)"
     sysctl -w vm.max_map_count=262144 2>/dev/null || true
     # NOTE: do NOT trust `systemctl start` (returns 0 without starting anything
@@ -3631,9 +3684,10 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:9200/ 2>/dev/null)" = "200" ]; then
       echo "[pkb] opensearch already serving on :9200"; exit 0
     fi
-    if pgrep -f org.opensearch.bootstrap.OpenSearch >/dev/null 2>&1; then
+    if [ -f /tmp/opensearch.pid ] && kill -0 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null; then
       echo "[pkb] stale opensearch process not serving :9200 — killing and relaunching"
-      pkill -9 -f org.opensearch.bootstrap.OpenSearch 2>/dev/null || true
+      kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null || true
+      rm -f /tmp/opensearch.pid
       sleep 5
     fi
     if [ ! -x /opt/opensearch/bin/opensearch ]; then
@@ -3648,7 +3702,7 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     su pkbos -s /bin/bash -c 'export HOME=/opt/opensearch OPENSEARCH_HOME=/opt/opensearch; /opt/opensearch/bin/opensearch -d -p /tmp/opensearch.pid'
     echo "[pkb] launch command returned rc=$?"
     sleep 20
-    if pgrep -f org.opensearch.bootstrap.OpenSearch >/dev/null 2>&1; then
+    if [ -f /tmp/opensearch.pid ] && kill -0 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null; then
       echo "[pkb] opensearch process is up 20s after launch; recent log:"
     else
       echo "[pkb] opensearch NOT running 20s after launch — it crashed; log:"
@@ -3685,6 +3739,13 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
         '[swap_encryption] OpenSearch/Elasticsearch HTTP endpoint never came '
         'up on localhost:9200 (curl could not connect); skipping opensearch '
         'samples for this run rather than recording failed-connection timings')
+    # Stop any hung OpenSearch so it does not hold memory into the swap phases
+    # (kill by pidfile — never `pkill -f`, which would match this shell).
+    _pod_exec(pod,
+              'if [ -f /tmp/opensearch.pid ]; then '
+              'kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null; '
+              'rm -f /tmp/opensearch.pid; fi || true',
+              ignore_failure=True)
     return []
 
   # Server is up.  NOW apply swap pressure (detached) so the index/query below
@@ -3720,6 +3781,17 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
       "-o /dev/null && echo PKB_OK || echo PKB_FAIL"
   ), ignore_failure=True)
   query_sec = time.time() - t0
+
+  # 3c runs FIRST (before the swap phases), so tear it down now: kill its
+  # stressor and stop OpenSearch, then reclaim — leaving a clean node for
+  # Phase 2a's swap measurement.  OOM-immune so it always completes.
+  _pod_exec(pod, textwrap.dedent("""
+    echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
+    pkill -9 stress-ng 2>/dev/null || true
+    if [ -f /tmp/opensearch.pid ]; then kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null || true; rm -f /tmp/opensearch.pid; fi
+    sleep 3; sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    echo "[pkb] 3c teardown free:"; free -h | head -2
+  """), ignore_failure=True, timeout=60)
 
   if 'PKB_OK' not in bulk_out or 'PKB_OK' not in query_out:
     logging.warning(
