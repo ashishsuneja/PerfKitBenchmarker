@@ -43,13 +43,14 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.resources.container_service import (
-    container as container_lib)
+    container as container_lib,
+)
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 
-_SLEEP_POD_NAME = 'pkb-mgmt-sleep'
+_SLEEP_POD_NAME = "pkb-mgmt-sleep"
 
-BENCHMARK_NAME = 'kubernetes_management'
+BENCHMARK_NAME = "kubernetes_management"
 
 BENCHMARK_CONFIG = """
 kubernetes_management:
@@ -80,82 +81,90 @@ kubernetes_management:
         zone: eastus
 """
 
-_VALID_SCENARIOS = frozenset({'A', 'B', 'C'})
+_VALID_SCENARIOS = frozenset({"A", "B", "C"})
 
 _CONCURRENT_NODEPOOLS = flags.DEFINE_integer(
-    'k8s_mgmt_concurrent_nodepools',
+    "k8s_mgmt_concurrent_nodepools",
     5,
-    'Number of node pools to create/upgrade/delete concurrently in Scenario A.',
+    "Number of node pools to create/upgrade/delete concurrently in Scenario A.",
 )
 _LARGE_SCALE_NODEPOOLS = flags.DEFINE_integer(
-    'k8s_mgmt_large_scale_nodepools',
+    "k8s_mgmt_large_scale_nodepools",
     1000,
-    'Number of node pools to provision in the large-scale Scenario C. '
-    + 'Spec target is 1000; ensure VPC/quota is available before running.',
+    "Number of node pools to provision in the large-scale Scenario C. "
+    + "Spec target is 1000; ensure VPC/quota is available before running.",
 )
 _NODES_PER_NODEPOOL = flags.DEFINE_integer(
-    'k8s_mgmt_nodes_per_nodepool',
+    "k8s_mgmt_nodes_per_nodepool",
     2,
-    'Number of nodes per node pool. Google spec: 2 nodes per pool.',
+    "Number of nodes per node pool. Google spec: 2 nodes per pool.",
 )
 _INITIAL_VERSION = flags.DEFINE_string(
-    'k8s_mgmt_initial_version',
+    "k8s_mgmt_initial_version",
     None,
-    'Kubernetes version for newly-created node pools (N-1). None = auto.',
+    "Kubernetes version for newly-created node pools (N-1). None = auto.",
 )
 _TARGET_VERSION = flags.DEFINE_string(
-    'k8s_mgmt_target_version',
+    "k8s_mgmt_target_version",
     None,
-    'Kubernetes version to upgrade node pools to (N). None = cluster version.',
+    "Kubernetes version to upgrade node pools to (N). None = cluster version.",
 )
 _SCENARIOS = flags.DEFINE_list(
-    'k8s_mgmt_scenarios',
-    ['A', 'B', 'C'],
-    'Comma-separated subset of scenarios to run. Valid values: A, B, C.',
+    "k8s_mgmt_scenarios",
+    ["A", "B", "C"],
+    "Comma-separated subset of scenarios to run. Valid values: A, B, C.",
 )
 _SCALE_SWEEP = flags.DEFINE_list(
-    'k8s_mgmt_scale_sweep',
+    "k8s_mgmt_scale_sweep",
     [],
-    'Comma-separated list of node-pool counts for Scenario C scale sweep. '
-    + 'Each scale runs as a separate sub-run with full create/delete cycle. '
-    + 'Example: --k8s_mgmt_scale_sweep=10,50,100,500,1000. '
-    + 'If empty, uses --k8s_mgmt_large_scale_nodepools.',
+    "Comma-separated list of node-pool counts for Scenario C scale sweep. "
+    + "Each scale runs as a separate sub-run with full create/delete cycle. "
+    + "Example: --k8s_mgmt_scale_sweep=10,50,100,500,1000. "
+    + "If empty, uses --k8s_mgmt_large_scale_nodepools.",
 )
 _MAX_CONCURRENT = flags.DEFINE_integer(
-    'k8s_mgmt_max_concurrent',
+    "k8s_mgmt_max_concurrent",
     50,
-    'Cap on concurrent provider API calls within a batch. '
-    + 'Higher = faster but more aggressive on connection pools.',
+    "Cap on concurrent provider API calls within a batch. "
+    + "Higher = faster but more aggressive on connection pools.",
 )
 _PIPELINE_SCENARIO_A = flags.DEFINE_boolean(
-    'k8s_mgmt_pipeline_scenario_a',
+    "k8s_mgmt_pipeline_scenario_a",
     True,
-    'If True, run Scenario A as per-pool pipeline (create->upgrade->delete '
-    + 'back-to-back per thread). Minimizes wall time. '
-    + 'Default False for spec-strict phase-by-phase.',
+    "If True, run Scenario A as per-pool pipeline (create->upgrade->delete "
+    + "back-to-back per thread). Minimizes wall time. "
+    + "Default False for spec-strict phase-by-phase.",
 )
 
 # AKS caps node-pool names at 12 chars — keep all names within that limit.
-_PREFIX = 'pkbm'
+_PREFIX = "pkbm"
 
 
 def _ScenarioAName(i):
-  return f'{_PREFIX}a{i:03d}'
+  return f"{_PREFIX}a{i:03d}"
 
 
-_SCENARIO_B_NAME = f'{_PREFIX}b'
+_SCENARIO_B_NAME = f"{_PREFIX}b"
 
 
 def _ScenarioCName(i):
-  return f'{_PREFIX}c{i:04d}'
+  return f"{_PREFIX}c{i:04d}"
+
 
 @dataclasses.dataclass
 class _OpResult:
   """Holds timing and outcome for a single async management-plane operation."""
+
   name: str
   init_dur: float
   e2e_dur: float
   error: Exception | None = None
+
+  def __iter__(self):
+    yield self.name
+    yield self.init_dur
+    yield self.e2e_dur
+    yield self.error
 
 
 def GetConfig(user_config):
@@ -163,25 +172,27 @@ def GetConfig(user_config):
 
 
 def CheckPrerequisites(
-    benchmark_config: benchmark_config_spec.BenchmarkConfigSpec,):
+    benchmark_config: benchmark_config_spec.BenchmarkConfigSpec,
+):
   """Validates flag values and cluster type before any cloud calls."""
-  invalid = [
-      s for s in _SCENARIOS.value if s.strip() not in _VALID_SCENARIOS
-  ]
+  invalid = [s for s in _SCENARIOS.value if s.strip() not in _VALID_SCENARIOS]
   if invalid:
     raise errors.Config.InvalidValue(
-        f'Invalid value(s) for --k8s_mgmt_scenarios: {invalid}. '
-        + f'Valid options: {sorted(_VALID_SCENARIOS)}.')
+        f"Invalid value(s) for --k8s_mgmt_scenarios: {invalid}. "
+        + f"Valid options: {sorted(_VALID_SCENARIOS)}."
+    )
   for s in _SCALE_SWEEP.value:
     try:
       int(s.strip())
     except ValueError as e:
       raise errors.Config.InvalidValue(
-          f'Non-integer value in --k8s_mgmt_scale_sweep: {s!r}') from e
-  if benchmark_config.container_cluster.type != 'Kubernetes':
+          f"Non-integer value in --k8s_mgmt_scale_sweep: {s!r}"
+      ) from e
+  if benchmark_config.container_cluster.type != "Kubernetes":
     raise errors.Config.InvalidValue(
-        'kubernetes_management benchmark requires a Kubernetes'
-        + ' container cluster.')
+        "kubernetes_management benchmark requires a Kubernetes"
+        + " container cluster."
+    )
 
 
 def Prepare(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
@@ -190,39 +201,32 @@ def Prepare(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
   assert isinstance(cluster, kubernetes_cluster.KubernetesCluster)
   benchmark_spec.always_call_cleanup = True
   logging.info(
-      'kubernetes_management Prepare: cluster=%s, version=%s',
+      "kubernetes_management Prepare: cluster=%s, version=%s",
       cluster.name,
       cluster.k8s_version,
   )
   # Spec workload: "a simple container that sleeps for a given time".
   # Confirms data-plane reachability; generates no data-plane load.
   kubectl.RunKubectlCommand(
-    [
-        'run',
-        _SLEEP_POD_NAME,
-        '--image=busybox',
-        '--restart=Never',
-        '--',
-        'sleep',
-        '86400',
-    ],
+      [
+          "run",
+          _SLEEP_POD_NAME,
+          "--image=busybox",
+          "--restart=Never",
+          "--",
+          "sleep",
+          "86400",
+      ],
   )
+
 
 def _CleanStartSweep(cluster: kubernetes_cluster.KubernetesCluster) -> None:
   """Deletes any stale pkbm* node pools so each run starts clean (spec C.2)."""
-  try:
-    stale = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('CleanStart: failed to list node pools')
-    return
+  stale = [n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)]
   if not stale:
-    logging.info(
-        'CleanStart: no stale pools found — clean start confirmed.')
+    logging.info("CleanStart: no stale pools found — clean start confirmed.")
     return
-  logging.warning('CleanStart: deleting %d stale pools: %s', len(stale),
-                  stale)
+  logging.info("CleanStart: deleting %d stale pools: %s", len(stale), stale)
   background_tasks.RunThreaded(cluster.DeleteNodePool, stale)
 
 
@@ -238,55 +242,62 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
   # Google spec: initial=N-1, target=N (adjacent minor upgrade).
   flag_initial = _INITIAL_VERSION.value
   flag_target = _TARGET_VERSION.value
-  if flag_initial and flag_target:
-    initial, target = flag_initial, flag_target
-    source = 'flags'
-  else:
+  if not (flag_initial and flag_target):
     resolved_initial, resolved_target = cluster.ResolveNodePoolVersions()
-    initial = flag_initial or resolved_initial
-    target = flag_target or resolved_target
-    source = 'auto-resolved' if not (flag_initial or flag_target) else 'mixed'
+    flag_initial = flag_initial or resolved_initial
+    flag_target = flag_target or resolved_target
+  initial, target = flag_initial, flag_target
+  if _INITIAL_VERSION.value and _TARGET_VERSION.value:
+    source = "flags"
+  elif not (_INITIAL_VERSION.value or _TARGET_VERSION.value):
+    source = "auto-resolved"
+  else:
+    source = "mixed"
 
   logging.info(
-      'NodePool versions (%s): initial=%s -> target=%s '
-      + '(cluster k8s_version=%s) | nodes_per_pool=%d | machine_type=%s',
+      "NodePool versions (%s): initial=%s -> target=%s "
+      + "(cluster k8s_version=%s) | nodes_per_pool=%d | machine_type=%s",
       source,
       initial,
       target,
       cluster.k8s_version,
       _NODES_PER_NODEPOOL.value,
       cluster.default_nodepool.machine_type
-      if hasattr(cluster, 'default_nodepool') else 'unknown',
+      if hasattr(cluster, "default_nodepool")
+      else "unknown",
   )
 
   scenarios = {s.strip().upper() for s in _SCENARIOS.value}
   samples: list[sample.Sample] = []
 
-  if 'A' in scenarios:
+  if "A" in scenarios:
     samples += _RunScenarioA(cluster, initial, target)
-  if 'B' in scenarios:
+  if "B" in scenarios:
     samples += _RunScenarioB(cluster, initial)
-  if 'C' in scenarios:
+  if "C" in scenarios:
     # fix: Scenario A/B pools may still be in Deleting state and count
     # toward AKS's 100-pool cluster limit.  Sweep them out before Scenario C
     # so we don't hit MaxAgentPoolCountReached mid-run.
     _CleanStartSweep(cluster)
-    scales = ([int(x.strip()) for x in _SCALE_SWEEP.value]
-              if _SCALE_SWEEP.value else [_LARGE_SCALE_NODEPOOLS.value])
-    logging.info('Scenario C: scale sweep = %s', scales)
+    scales = (
+        [int(x.strip()) for x in _SCALE_SWEEP.value]
+        if _SCALE_SWEEP.value
+        else [_LARGE_SCALE_NODEPOOLS.value]
+    )
+    logging.info("Scenario C: scale sweep = %s", scales)
     for scale in scales:
       scenario_c_samples = _RunScenarioC(cluster, initial, scale)
       for s in scenario_c_samples:
-        s.metadata['scenario_c_scale'] = str(scale)
+        s.metadata["scenario_c_scale"] = str(scale)
       samples += scenario_c_samples
 
   # Tag all samples with version path and run config for published results.
   run_meta = {
-      'initial_version': str(initial),
-      'target_version': str(target),
-      'cluster_k8s_version': str(cluster.k8s_version),
-      'nodes_per_nodepool': str(_NODES_PER_NODEPOOL.value),
-      'concurrent_nodepools': str(_CONCURRENT_NODEPOOLS.value),
+      "initial_version": str(initial),
+      "target_version": str(target),
+      "cluster_k8s_version": str(cluster.k8s_version),
+      "nodes_per_nodepool": str(_NODES_PER_NODEPOOL.value),
+      "concurrent_nodepools": str(_CONCURRENT_NODEPOOLS.value),
   }
   for s in samples:
     s.metadata.update(run_meta)
@@ -300,19 +311,13 @@ def Cleanup(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
   if cluster is None:
     return
   kubectl.RunKubectlCommand(
-      ['delete', 'pod', _SLEEP_POD_NAME, '--ignore-not-found'],
+      ["delete", "pod", _SLEEP_POD_NAME, "--ignore-not-found"],
       raise_on_failure=False,
   )
-  try:
-    leftover = [
-        n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)
-    ]
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Cleanup: failed to list node pools')
-    return
+  leftover = [n for n in cluster.GetNodePoolNames() if n.startswith(_PREFIX)]
   if not leftover:
     return
-  logging.info('Cleanup: deleting %d leftover node pools', len(leftover))
+  logging.info("Cleanup: deleting %d leftover node pools", len(leftover))
   background_tasks.RunThreaded(cluster.DeleteNodePool, leftover)
 
 
@@ -330,13 +335,19 @@ def _RunScenarioA(
   n = _CONCURRENT_NODEPOOLS.value
   if _PIPELINE_SCENARIO_A.value:
     logging.info(
-        'Scenario A (pipelined): %d pools, initial=%s, target=%s',
-        n, initial, target)
+        "Scenario A (pipelined): %d pools, initial=%s, target=%s",
+        n,
+        initial,
+        target,
+    )
     return _RunScenarioAPipelined(cluster, n, initial, target)
 
   logging.info(
-      'Scenario A (phase-by-phase): %d pools, initial=%s, target=%s',
-      n, initial, target)
+      "Scenario A (phase-by-phase): %d pools, initial=%s, target=%s",
+      n,
+      initial,
+      target,
+  )
   pool_names = [_ScenarioAName(i) for i in range(n)]
   configs_ = [_MakeNodePoolConfig(cluster, name) for name in pool_names]
   samples: list[sample.Sample] = []
@@ -344,29 +355,30 @@ def _RunScenarioA(
   # ── Phase 1: concurrent creates ─────────────────────────────────────────
   create_results = _RunAsync(
       kickoff=lambda cfg: cluster.CreateNodePoolAsync(
-          cfg, node_version=initial),
+          cfg, node_version=initial
+      ),
       wait_fn=cluster.WaitForOperation,
       items=configs_,
       get_name=lambda cfg: cfg.name,
   )
-  samples += _OpSamples('ScenarioA_Create',
-                        create_results,
-                        attempted_ops=len(pool_names))
+  samples += _OpSamples(
+      "ScenarioA_Create", create_results, attempted_ops=len(pool_names)
+  )
 
   # ── Phase 2: concurrent upgrades (only successfully created pools) ───────
   created = [r.name for r in create_results if r.error is None]
   logging.info(
-      'Scenario A: %d/%d pools created — proceeding to upgrade',
-      len(created), n)
+      "Scenario A: %d/%d pools created — proceeding to upgrade", len(created), n
+  )
   upgrade_results = _RunAsync(
       kickoff=lambda name: cluster.UpgradeNodePoolAsync(name, target),
       wait_fn=cluster.WaitForOperation,
       items=created,
       get_name=str,
   )
-  samples += _OpSamples('ScenarioA_Upgrade',
-                        upgrade_results,
-                        attempted_ops=len(created))
+  samples += _OpSamples(
+      "ScenarioA_Upgrade", upgrade_results, attempted_ops=len(created)
+  )
 
   # # ── Idiomatic Control Plane Synchronization Barrier ──────────────────────
   # # Give the GKE control plane a brief window to register the async ops.
@@ -391,12 +403,12 @@ def _RunScenarioA(
   #   time.sleep(5)
 
   # ── Phase 3: concurrent deletes (live-list to catch EKS rollbacks) ──────
-  alive = [
-      p for p in cluster.GetNodePoolNames() if p.startswith(f'{_PREFIX}a')
-  ]
+  alive = [p for p in cluster.GetNodePoolNames() if p.startswith(f"{_PREFIX}a")]
   logging.info(
-      'Scenario A: %d live pools found for delete (originally %d)',
-      len(alive), n)
+      "Scenario A: %d live pools found for delete (originally %d)",
+      len(alive),
+      n,
+  )
   delete_results = _RunAsync(
       kickoff=cluster.DeleteNodePoolAsync,
       wait_fn=cluster.WaitForOperation,
@@ -405,7 +417,7 @@ def _RunScenarioA(
   )
   # attempted_ops=n: success rate reflects original request, not just live.
   # EKS rolls back timed-out pools silently — without this shows 100%.
-  samples += _OpSamples('ScenarioA_Delete', delete_results, attempted_ops=n)
+  samples += _OpSamples("ScenarioA_Delete", delete_results, attempted_ops=n)
   return samples
 
 
@@ -452,11 +464,9 @@ def _RunScenarioAPipelined(
       max_concurrent_threads=min(n, _MAX_CONCURRENT.value),
   )
   samples: list[sample.Sample] = []
-  samples += _OpSamples('ScenarioA_Create', creates.entries, attempted_ops=n)
-  samples += _OpSamples('ScenarioA_Upgrade',
-                        upgrades.entries,
-                        attempted_ops=n)
-  samples += _OpSamples('ScenarioA_Delete', deletes.entries, attempted_ops=n)
+  samples += _OpSamples("ScenarioA_Create", creates.entries, attempted_ops=n)
+  samples += _OpSamples("ScenarioA_Upgrade", upgrades.entries, attempted_ops=n)
+  samples += _OpSamples("ScenarioA_Delete", deletes.entries, attempted_ops=n)
   return samples
 
 
@@ -474,38 +484,43 @@ def _RunScenarioB(
   Both ops kick off async on separate threads; initiation + E2E latency
   recorded independently. Overlap window = ClusterUpdate E2E latency.
   """
-  logging.info('Scenario B: overlapping cluster update + node-pool create')
+  logging.info("Scenario B: overlapping cluster update + node-pool create")
   cfg = _MakeNodePoolConfig(cluster, _SCENARIO_B_NAME)
   results = _Results()
 
   def DoClusterUpdate():
-    init, e2e, err = _TimedAsync(cluster.UpdateClusterAsync,
-                                 cluster.WaitForOperation)
-    results.add('ScenarioB_ClusterUpdate', init, e2e, err)
-    logging.info('Scenario B ClusterUpdate: init=%.2fs e2e=%.2fs ok=%s',
-                 init, e2e, err is None)
+    init, e2e, err = _TimedAsync(
+        cluster.UpdateClusterAsync, cluster.WaitForOperation
+    )
+    results.add("ScenarioB_ClusterUpdate", init, e2e, err)
+    logging.info(
+        "Scenario B ClusterUpdate: init=%.2fs e2e=%.2fs ok=%s",
+        init,
+        e2e,
+        err is None,
+    )
 
   def DoCreate():
     init, e2e, err = _TimedAsync(
         lambda: cluster.CreateNodePoolAsync(cfg, node_version=initial),
         cluster.WaitForOperation,
     )
-    results.add('ScenarioB_NodePoolCreate', init, e2e, err)
-    logging.info('Scenario B NodePoolCreate: init=%.2fs e2e=%.2fs ok=%s',
-                 init, e2e, err is None)
+    results.add("ScenarioB_NodePoolCreate", init, e2e, err)
+    logging.info(
+        "Scenario B NodePoolCreate: init=%.2fs e2e=%.2fs ok=%s",
+        init,
+        e2e,
+        err is None,
+    )
 
-  background_tasks.RunThreaded(lambda fn: fn(),
-                               [DoClusterUpdate, DoCreate])
+  background_tasks.RunThreaded(lambda fn: fn(), [DoClusterUpdate, DoCreate])
 
   samples: list[sample.Sample] = []
   for entry in results.entries:
     samples += _OpSamples(entry.name, [entry], attempted_ops=1)
 
   # Remove test pool (best-effort).
-  try:
-    cluster.DeleteNodePool(_SCENARIO_B_NAME)
-  except Exception:  # pylint: disable=broad-except
-    logging.exception('Scenario B: failed to delete test pool')
+  cluster.DeleteNodePool(_SCENARIO_B_NAME)
   return samples
 
 
@@ -527,7 +542,7 @@ def _RunScenarioC(
   excluded from the denominator correctly.
   """
   logging.info(
-      'Scenario C: scale=%d, max_concurrent=%d, initial_version=%s',
+      "Scenario C: scale=%d, max_concurrent=%d, initial_version=%s",
       scale,
       _MAX_CONCURRENT.value,
       initial,
@@ -539,35 +554,35 @@ def _RunScenarioC(
   # ── Creates ──────────────────────────────────────────────────────────────
   create_results = _RunAsync(
       kickoff=lambda cfg: cluster.CreateNodePoolAsync(
-          cfg, node_version=initial),
+          cfg, node_version=initial
+      ),
       wait_fn=cluster.WaitForOperation,
       items=configs_,
       get_name=lambda cfg: cfg.name,
   )
   created_ok = sum(1 for r in create_results if r.error is None)
-  logging.info('Scenario C scale=%d: %d/%d creates succeeded', scale,
-               created_ok, scale)
-  samples += _OpSamples('ScenarioC_Create',
-                        create_results,
-                        attempted_ops=scale)
+  logging.info(
+      "Scenario C scale=%d: %d/%d creates succeeded", scale, created_ok, scale
+  )
+  samples += _OpSamples("ScenarioC_Create", create_results, attempted_ops=scale)
 
   # ── Deletes (live-list) ──────────────────────────────────────────────────
-  alive = [
-      p for p in cluster.GetNodePoolNames() if p.startswith(f'{_PREFIX}c')
-  ]
+  alive = [p for p in cluster.GetNodePoolNames() if p.startswith(f"{_PREFIX}c")]
   logging.info(
-      'Scenario C scale=%d: %d live pools for delete (originally %d;'
-      + ' %d rolled back by cloud)',
+      "Scenario C scale=%d: %d live pools for delete (originally %d;"
+      + " %d rolled back by cloud)",
       scale,
       len(alive),
       scale,
       scale - len(alive),
   )
   if not alive:
-    logging.warning(
-        'Scenario C scale=%d: 0 live pools — all timed-out creates were'
-        + ' rolled back. Recording 0%% delete success rate.', scale)
-    samples += _OpSamples('ScenarioC_Delete', [], attempted_ops=scale)
+    logging.info(
+        "Scenario C scale=%d: 0 live pools — all creates rolled back."
+        " Recording 0%% delete success rate.",
+        scale,
+    )
+    samples += _OpSamples("ScenarioC_Delete", [], attempted_ops=scale)
     return samples
 
   delete_results = _RunAsync(
@@ -577,9 +592,7 @@ def _RunScenarioC(
       get_name=str,
   )
   # attempted_ops=scale: accurate rate against original request count.
-  samples += _OpSamples('ScenarioC_Delete',
-                        delete_results,
-                        attempted_ops=scale)
+  samples += _OpSamples("ScenarioC_Delete", delete_results, attempted_ops=scale)
   return samples
 
 
@@ -595,8 +608,9 @@ class _Results:
     self._lock = threading.Lock()
     self.entries: list[_OpResult] = []
 
-  def add(self, name: str, init_dur: float, e2e_dur: float,
-        err: Exception | None) -> None:
+  def add(
+      self, name: str, init_dur: float, e2e_dur: float, err: Exception | None
+  ) -> None:
     result = _OpResult(name, init_dur, e2e_dur, err)
     with self._lock:
       self.entries.append(result)
@@ -646,8 +660,13 @@ def _RunAsync(
     init_dur, e2e_dur, err = _TimedAsync(lambda: kickoff(item), wait_fn)
     name = get_name(item)
     results.add(name, init_dur, e2e_dur, err)
-    logging.info('%s ok=%s initiation=%.2fs end_to_end=%.2fs', name,
-                 err is None, init_dur, e2e_dur)
+    logging.info(
+        "%s ok=%s initiation=%.2fs end_to_end=%.2fs",
+        name,
+        err is None,
+        init_dur,
+        e2e_dur,
+    )
 
   background_tasks.RunThreaded(DoWrap, items, max_concurrent_threads=cap)
   return results.entries
@@ -687,19 +706,28 @@ def _OpSamples(
   success = 0
 
   for r in results:
-    meta = {'operation_name': r.name, 'success': str(r.error is None)}
+    if isinstance(r, tuple):
+      r = _OpResult(*r)
+    meta = {"operation_name": r.name, "success": str(r.error is None)}
     if r.error is not None:
-        meta['error'] = str(r.error)[:200]
+      meta["error"] = str(r.error)[:200]
     else:
-        success += 1
-        init_latencies.append(r.init_dur)
-        e2e_latencies.append(r.e2e_dur)
+      success += 1
+      init_latencies.append(r.init_dur)
+      e2e_latencies.append(r.e2e_dur)
     samples.append(
-        sample.Sample(f'{metric_prefix}_InitiationLatency', r.init_dur,
-                      'seconds', dict(meta)))
+        sample.Sample(
+            f"{metric_prefix}_InitiationLatency",
+            r.init_dur,
+            "seconds",
+            dict(meta),
+        )
+    )
     samples.append(
-        sample.Sample(f'{metric_prefix}_EndToEndLatency', r.e2e_dur,
-                      'seconds', dict(meta)))
+        sample.Sample(
+            f"{metric_prefix}_EndToEndLatency", r.e2e_dur, "seconds", dict(meta)
+        )
+    )
 
   # ── Success rate ─────────────────────────────────────────────────────────
   total = attempted_ops if attempted_ops is not None else len(results)
@@ -707,21 +735,22 @@ def _OpSamples(
   if total > 0:
     samples.append(
         sample.Sample(
-            f'{metric_prefix}_SuccessRate',
+            f"{metric_prefix}_SuccessRate",
             100.0 * success / total,
-            'percent',
+            "percent",
             {
-                'total_ops': str(total),
-                'executed_ops': str(executed),
-                'successful_ops': str(success),
-                'skipped_ops': str(total - executed),
+                "total_ops": str(total),
+                "executed_ops": str(executed),
+                "successful_ops": str(success),
+                "skipped_ops": str(total - executed),
             },
-        ))
+        )
+    )
 
   # ── Aggregate stats (successful ops only) ────────────────────────────────
   for phase_label, latencies in (
-      ('InitiationLatency', init_latencies),
-      ('EndToEndLatency', e2e_latencies),
+      ("InitiationLatency", init_latencies),
+      ("EndToEndLatency", e2e_latencies),
   ):
     if len(latencies) >= 2:
       samples += _AggregateSamples(metric_prefix, phase_label, latencies)
@@ -731,42 +760,45 @@ def _OpSamples(
   return samples
 
 
-def _AggregateSamples(metric_prefix: str, phase_label: str,
-                      latencies: list[float]) -> list[sample.Sample]:
+def _AggregateSamples(
+    metric_prefix: str, phase_label: str, latencies: list[float]
+) -> list[sample.Sample]:
   """Emits Mean/StdDev/Min/Median/P90/P99/Max samples for a latency series."""
   n = len(latencies)
-  meta = {'sample_count': str(n)}
+  meta = {"sample_count": str(n)}
 
   # statistics.quantiles with method='inclusive' matches linear interpolation
   # and returns n-1 cut points; index 89→P90, 98→P99.
-  quantiles = statistics.quantiles(latencies, n=100, method='inclusive')
+  quantiles = statistics.quantiles(latencies, n=100, method="inclusive")
 
   stats = [
-    ('Mean', statistics.mean(latencies)),
-    ('StdDev', statistics.pstdev(latencies)),
-    ('Min', min(latencies)),
-    ('Median', statistics.median(latencies)),
-    ('P90', quantiles[89]),
-    ('P99', quantiles[98]),
-    ('Max', max(latencies)),
+      ("Mean", statistics.mean(latencies)),
+      ("StdDev", statistics.pstdev(latencies)),
+      ("Min", min(latencies)),
+      ("Median", statistics.median(latencies)),
+      ("P90", quantiles[89]),
+      ("P99", quantiles[98]),
+      ("Max", max(latencies)),
   ]
   result = []
   for label, value in stats:
     result.append(
         sample.Sample(
-            f'{metric_prefix}_{phase_label}_{label}',
+            f"{metric_prefix}_{phase_label}_{label}",
             value,
-            'seconds',
+            "seconds",
             dict(meta),
-        ))
+        )
+    )
   return result
 
 
-def _OutlierSamples(metric_prefix: str, phase_label: str,
-                    latencies: list[float]) -> list[sample.Sample]:
+def _OutlierSamples(
+    metric_prefix: str, phase_label: str, latencies: list[float]
+) -> list[sample.Sample]:
   """Emits a single OutlierCount sample using IQR-fence outlier detection."""
   # statistics.quantiles(n=4) returns [Q1, Q2, Q3]; indices 0 and 2.
-  quartiles = statistics.quantiles(latencies, n=4, method='inclusive')
+  quartiles = statistics.quantiles(latencies, n=4, method="inclusive")
   q1, q3 = quartiles[0], quartiles[2]
   iqr = q3 - q1
   lower_fence = q1 - 1.5 * iqr
@@ -775,18 +807,18 @@ def _OutlierSamples(metric_prefix: str, phase_label: str,
       1 for v in latencies if v < lower_fence or v > upper_fence
   )
   meta = {
-      'q1': str(q1),
-      'q3': str(q3),
-      'iqr': str(iqr),
-      'upper_fence': str(upper_fence),
-      'lower_fence': str(lower_fence),
-      'sample_count': str(len(latencies)),
+      "q1": str(q1),
+      "q3": str(q3),
+      "iqr": str(iqr),
+      "upper_fence": str(upper_fence),
+      "lower_fence": str(lower_fence),
+      "sample_count": str(len(latencies)),
   }
   return [
       sample.Sample(
-          f'{metric_prefix}_{phase_label}_OutlierCount',
+          f"{metric_prefix}_{phase_label}_OutlierCount",
           outlier_count,
-          'count',
+          "count",
           meta,
       )
   ]

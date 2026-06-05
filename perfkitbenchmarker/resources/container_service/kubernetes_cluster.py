@@ -11,14 +11,16 @@ from perfkitbenchmarker import units
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import container_spec as container_spec_lib
 from perfkitbenchmarker.resources import kubernetes_inference_server
-from perfkitbenchmarker.resources.container_service import (container as container_lib)
+from perfkitbenchmarker.resources.container_service import (
+    container as container_lib,
+)
 from perfkitbenchmarker.resources.container_service import container_cluster
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
 from perfkitbenchmarker.resources.container_service import kubernetes_events
 
-INGRESS_JSONPATH = '{.status.loadBalancer.ingress[0]}'
+INGRESS_JSONPATH = "{.status.loadBalancer.ingress[0]}"
 RESOURCE_DELETE_SLEEP_SECONDS = 5
 
 
@@ -73,7 +75,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
       self.event_poller.StopPolling()
     _DeleteAllFromDefaultNamespace()
 
-  def GetEvents(self) -> set['kubernetes_events.KubernetesEvent']:
+  def GetEvents(self) -> set["kubernetes_events.KubernetesEvent"]:
     """Gets the events for the cluster, including previously polled events."""
     if self.event_poller:
       return self.event_poller.GetEvents()
@@ -81,8 +83,8 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
 
   def __getstate__(self):
     state = self.__dict__.copy()
-    if 'event_poller' in state:
-      del state['event_poller']
+    if "event_poller" in state:
+      del state["event_poller"]
     return state
 
   def __setstate__(self, state):
@@ -98,7 +100,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     """Returns a dict containing metadata about the cluster."""
     result = super().GetResourceMetadata()
     if self.created:
-      result['version'] = self.k8s_version
+      result["version"] = self.k8s_version
     return result
 
   def DeployContainer(
@@ -126,7 +128,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     """Usable memory of each node in cluster in KiB."""
     stdout, _, _ = kubectl.RunKubectlCommand(
         # TODO(pclay): Take a minimum of all nodes?
-        ['get', 'nodes', '-o', 'jsonpath={.items[0].status.allocatable.memory}']
+        ["get", "nodes", "-o", "jsonpath={.items[0].status.allocatable.memory}"]
     )
     return units.ParseExpression(stdout)
 
@@ -134,7 +136,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
   def node_num_cpu(self) -> int:
     """vCPU of each node in cluster."""
     stdout, _, _ = kubectl.RunKubectlCommand(
-        ['get', 'nodes', '-o', 'jsonpath={.items[0].status.capacity.cpu}']
+        ["get", "nodes", "-o", "jsonpath={.items[0].status.capacity.cpu}"]
     )
     return int(stdout)
 
@@ -142,7 +144,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     """Propagate cluster labels to disks if not done by cloud provider."""
     pass
 
-  def HasLocalSsd(self, nodepool_name: str = 'default') -> bool:
+  def HasLocalSsd(self, nodepool_name: str = "default") -> bool:
     """Returns true if the given nodepool has local SSDs."""
     raise NotImplementedError
 
@@ -176,14 +178,14 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     """
     modified = False
     for yaml_dict in yaml_dicts:
-      if yaml_dict['spec']['template']['spec']:
+      if yaml_dict["spec"]["template"]["spec"]:
         self._ModifyPodSpecPlacementYaml(
-            yaml_dict['spec']['template']['spec'], name, machine_type
+            yaml_dict["spec"]["template"]["spec"], name, machine_type
         )
         modified = True
     if not modified:
       raise ValueError(
-          'No pod spec yaml found to modify. Was the wrong jinja passed in?'
+          "No pod spec yaml found to modify. Was the wrong jinja passed in?"
       )
 
   def _ModifyPodSpecPlacementYaml(
@@ -206,19 +208,19 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     del name
     node_selectors = self.GetNodeSelectors(machine_type)
     if node_selectors:
-      pod_spec_yaml.setdefault('nodeSelector', {}).update(node_selectors)
+      pod_spec_yaml.setdefault("nodeSelector", {}).update(node_selectors)
 
   @property
   def _ingress_manifest_path(self) -> str:
     """The path to the ingress manifest template file."""
-    return 'container/loadbalancer.yaml.j2'
+    return "container/loadbalancer.yaml.j2"
 
   def DeployIngress(
       self,
       name: str,
       namespace: str,
       port: int,
-      health_path: str = '',
+      health_path: str = "",
       node_selectors: dict[str, str] | None = None,
   ) -> str:
     """Deploys an Ingress/load balancer resource to the cluster.
@@ -242,29 +244,29 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     )
     if node_selectors:
       for yaml_doc in yaml_docs:
-        if yaml_doc['kind'] == 'Service':
-          yaml_doc['spec']['selector'] = node_selectors
+        if yaml_doc["kind"] == "Service":
+          yaml_doc["spec"]["selector"] = node_selectors
     kubernetes_commands.ApplyYaml(yaml_docs)
     return self._WaitForIngress(name, namespace, port)
 
   def _WaitForIngress(self, name: str, namespace: str, port: int) -> str:
     """Waits for a deployed Ingress/load balancer resource."""
-    name = f'service/{name}'
+    name = f"service/{name}"
     kubernetes_commands.WaitForResource(
         name,
         INGRESS_JSONPATH,
         namespace=namespace,
-        condition_type='jsonpath=',
+        condition_type="jsonpath=",
     )
     stdout, _, _ = kubectl.RunKubectlCommand([
-        'get',
+        "get",
         name,
-        '-n',
+        "-n",
         namespace,
-        '-o',
-        f'jsonpath={INGRESS_JSONPATH}',
+        "-o",
+        f"jsonpath={INGRESS_JSONPATH}",
     ])
-    return f'{self._GetAddressFromIngress(stdout)}:{port}'
+    return f"{self._GetAddressFromIngress(stdout)}:{port}"
 
   def ApplyManifest(self, manifest_file: str, **kwargs) -> Any:
     """Applies a declarative Kubernetes manifest; possibly with jinja."""
@@ -277,7 +279,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
       namespace: str | None = None,
       timeout: int = vm_util.DEFAULT_TIMEOUT,
       wait_for_all: bool = False,
-      condition_type: str = 'condition=',
+      condition_type: str = "condition=",
       extra_args: list[str] | None = None,
       **kwargs,
   ) -> None:
@@ -296,15 +298,15 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
   def _GetAddressFromIngress(self, ingress_out: str):
     """Gets the endpoint address from the Ingress resource."""
     ingress = json.loads(ingress_out.strip("'"))
-    if 'ip' in ingress:
-      ip = ingress['ip']
-    elif 'hostname' in ingress:
-      ip = ingress['hostname']
+    if "ip" in ingress:
+      ip = ingress["ip"]
+    elif "hostname" in ingress:
+      ip = ingress["hostname"]
     else:
       raise errors.Benchmarks.RunError(
-          'No IP or hostname found in ingress from stdout ' + ingress_out
+          "No IP or hostname found in ingress from stdout " + ingress_out
       )
-    return 'http://' + ip.strip()
+    return "http://" + ip.strip()
 
   def AddNodepool(self, batch_name: str, pool_id: str) -> None:
     """Adds a node pool; delegates to CreateNodePool for standard clusters.
@@ -312,7 +314,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     Karpenter-based subclasses override this to apply a manifest instead.
     """
     nodepool_config = container_lib.BaseNodePoolConfig(
-        name=f'{batch_name}-{pool_id}',
+        name=f"{batch_name}-{pool_id}",
     )
     self.CreateNodePool(nodepool_config)
 
@@ -409,23 +411,23 @@ def BareMinor(version: str) -> str:
 
   Accepts and normalizes formats like 'v1.35.4', '1.35.4-gke.1234', '1.35'.
   """
-  if version.startswith('v'):
+  if version.startswith("v"):
     version = version[1:]
-  bare = version.split('-', 1)[0]
-  parts = bare.split('.')
+  bare = version.split("-", 1)[0]
+  parts = bare.split(".")
   if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-    raise ValueError(f'Cannot parse K8s version: {version!r}')
-  return f'{parts[0]}.{parts[1]}'
+    raise ValueError(f"Cannot parse K8s version: {version!r}")
+  return f"{parts[0]}.{parts[1]}"
 
 
 def AdjacentMinorBelow(version: str) -> str:
   """Returns the bare minor one below the given version: '1.35.4' -> '1.34'."""
   bare = BareMinor(version)
-  major_s, minor_s = bare.split('.')
+  major_s, minor_s = bare.split(".")
   minor = int(minor_s)
   if minor <= 0:
-    raise ValueError(f'No adjacent minor below {version!r}')
-  return f'{major_s}.{minor - 1}'
+    raise ValueError(f"No adjacent minor below {version!r}")
+  return f"{major_s}.{minor - 1}"
 
 
 def _DeleteAllFromDefaultNamespace():
@@ -438,30 +440,30 @@ def _DeleteAllFromDefaultNamespace():
   try:
     # Delete deployments and jobs first as otherwise autorepair will redeploy
     # deleted pods.
-    run_cmd = ['delete', 'deployment', '--all', '-n', 'default']
+    run_cmd = ["delete", "deployment", "--all", "-n", "default"]
     kubectl.RunRetryableKubectlCommand(run_cmd)
 
-    run_cmd = ['delete', 'job', '--all', '-n', 'default']
+    run_cmd = ["delete", "job", "--all", "-n", "default"]
     kubectl.RunRetryableKubectlCommand(run_cmd)
 
     timeout = 60 * 60  # 1 hour for kubectl delete all -n default (teardown)
     run_cmd = [
-        'delete',
-        'all',
-        '--all',
-        '-n',
-        'default',
-        f'--timeout={timeout}s',
+        "delete",
+        "all",
+        "--all",
+        "-n",
+        "default",
+        f"--timeout={timeout}s",
     ]
     kubectl.RunRetryableKubectlCommand(run_cmd, timeout=timeout)
 
-    run_cmd = ['delete', 'pvc', '--all', '-n', 'default']
+    run_cmd = ["delete", "pvc", "--all", "-n", "default"]
     kubectl.RunRetryableKubectlCommand(run_cmd, timeout=timeout)
     # There maybe a slight race if resources are cleaned up in the background
     # where deleting the cluster immediately prevents the PVCs from being
     # deleted.
     logging.info(
-        'Sleeping for %s seconds to give resources time to delete.',
+        "Sleeping for %s seconds to give resources time to delete.",
         RESOURCE_DELETE_SLEEP_SECONDS,
     )
     time.sleep(RESOURCE_DELETE_SLEEP_SECONDS)
@@ -470,11 +472,11 @@ def _DeleteAllFromDefaultNamespace():
       vm_util.TimeoutExceededRetryError,
   ) as e:
     raise errors.Resource.RetryableDeletionError(
-        'Timed out while deleting all resources from default namespace. We'
-        ' should still continue trying to delete everything.'
+        "Timed out while deleting all resources from default namespace. We"
+        " should still continue trying to delete everything."
     ) from e
   except errors.VmUtil.IssueCommandError as e:
-    if 'kubeconfig1: no such file or directory' in str(e):
-      logging.info('Kubeconfig not found, assuming cluster is already deleted.')
+    if "kubeconfig1: no such file or directory" in str(e):
+      logging.info("Kubeconfig not found, assuming cluster is already deleted.")
       return
     raise e

@@ -281,10 +281,11 @@ class CleanStartSweepTest(pkb_common_test_case.PkbCommonTestCase):
     kubernetes_management_benchmark._CleanStartSweep(cluster)
     cluster.DeleteNodePool.assert_not_called()
 
-  def testToleratesGetNodePoolNamesException(self):
+  def testCleanStartSweepRaisesOnGetNodePoolNamesException(self):
     cluster = _make_mock_cluster()
     cluster.GetNodePoolNames.side_effect = RuntimeError('API error')
-    kubernetes_management_benchmark._CleanStartSweep(cluster)
+    with self.assertRaises(RuntimeError):
+      kubernetes_management_benchmark._CleanStartSweep(cluster)
 
 
 class ResultsTest(pkb_common_test_case.PkbCommonTestCase):
@@ -683,7 +684,8 @@ class RunTest(pkb_common_test_case.PkbCommonTestCase):
         kubernetes_management_benchmark, '_RunScenarioC', return_value=[]
     ):
       kubernetes_management_benchmark.Run(bm_spec)
-    mock_clean.assert_called_once_with(cluster)
+    self.assertEqual(mock_clean.call_count, 2)
+    mock_clean.assert_called_with(cluster)
 
   @flagsaver.flagsaver(
       k8s_mgmt_scenarios=['A'],
@@ -1021,10 +1023,11 @@ class RunScenarioBTest(pkb_common_test_case.PkbCommonTestCase):
       k8s_mgmt_nodes_per_nodepool=1,
       k8s_mgmt_max_concurrent=50,
   )
-  def testToleratesDeleteFailure(self):
+  def testDeleteFailureRaisesInScenarioB(self):
     cluster = _make_mock_cluster(pool_names=[])
     cluster.DeleteNodePool.side_effect = RuntimeError('delete failed')
-    kubernetes_management_benchmark._RunScenarioB(cluster, '1.33')
+    with self.assertRaises(RuntimeError):
+      kubernetes_management_benchmark._RunScenarioB(cluster, '1.33')
 
   @flagsaver.flagsaver(
       k8s_mgmt_nodes_per_nodepool=1,
