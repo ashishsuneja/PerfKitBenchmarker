@@ -43,7 +43,7 @@ from perfkitbenchmarker.resources.container_service import kubernetes_commands
 
 FLAGS = flags.FLAGS
 
-SERVICE_ACCOUNT_PATTERN = r'.*((?<!iam)|{project}.iam).gserviceaccount.com'
+SERVICE_ACCOUNT_PATTERN = r".*((?<!iam)|{project}.iam).gserviceaccount.com"
 ONE_HOUR = 60 * 60
 
 
@@ -55,7 +55,7 @@ def _CalculateCidrSize(nodes: int) -> int:
   # So 2^(32 - nodes) - 2^(32 - 20) >= 2^(32 - 24) * CIDR
   # OR CIDR <= 32 - log2(2^8 * nodes + 2^12)
   cidr_size = int(32 - math.log2((nodes << 8) + (1 << 12)))
-  # /16 is narrowest CIDR range GKE supports
+  # /16 is the narrowest CIDR range GKE supports (not /17)
   return min(cidr_size, 16)
 
 
@@ -70,38 +70,38 @@ class GoogleArtifactRegistry(container_registry.BaseContainerRegistry):
     self.region = util.GetRegionFromZone(self.zone)
     # Remove from gcloud commands
     self.zone = None
-    self.endpoint = f'{self.region}-docker.pkg.dev'
+    self.endpoint = f"{self.region}-docker.pkg.dev"
 
   def GetFullRegistryTag(self, image: str) -> str:
     """Gets the full tag of the image."""
-    project = self.project.replace(':', '/')
-    full_tag = f'{self.endpoint}/{project}/{self.name}/{image}'
+    project = self.project.replace(":", "/")
+    full_tag = f"{self.endpoint}/{project}/{self.name}/{image}"
     return full_tag
 
   def Login(self):
     """Configures docker to be able to push to remote repo."""
-    util.GcloudCommand(self, 'auth', 'configure-docker', self.endpoint).Issue()
+    util.GcloudCommand(self, "auth", "configure-docker", self.endpoint).Issue()
 
   def _Create(self):
     self.Login()
     util.GcloudCommand(
         self,
-        'artifacts',
-        'repositories',
-        'create',
+        "artifacts",
+        "repositories",
+        "create",
         self.name,
-        '--repository-format=docker',
-        f'--location={self.region}',
+        "--repository-format=docker",
+        f"--location={self.region}",
     ).Issue()
 
   def _Delete(self):
     util.GcloudCommand(
         self,
-        'artifacts',
-        'repositories',
-        'delete',
+        "artifacts",
+        "repositories",
+        "delete",
         self.name,
-        f'--location={self.region}',
+        f"--location={self.region}",
     ).Issue()
 
   def RemoteBuild(self, image: container.ContainerImage):
@@ -111,7 +111,7 @@ class GoogleArtifactRegistry(container_registry.BaseContainerRegistry):
     else:
       full_tag = gcp_flags.CONTAINER_REMOTE_BUILD_CONFIG.value
     build_cmd = util.GcloudCommand(
-        self, 'builds', 'submit', '--tag', full_tag, image.directory
+        self, "builds", "submit", "--tag", full_tag, image.directory
     )
     build_cmd.Issue(timeout=None)
 
@@ -126,11 +126,11 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     self.release_channel: str | None = gcp_flags.CONTAINER_RELEASE_CHANNEL.value
     self.use_application_default_credentials: bool = True
     self.zones = (
-        self.default_nodepool.zone and self.default_nodepool.zone.split(',')
+        self.default_nodepool.zone and self.default_nodepool.zone.split(",")
     )
     if not self.zones:
       raise errors.Config.MissingOption(
-          'container_cluster.vm_spec.GCP.zone is required.'
+          "container_cluster.vm_spec.GCP.zone is required."
       )
     elif len(self.zones) == 1 and util.IsRegion(self.default_nodepool.zone):
       self.region: str = self.default_nodepool.zone
@@ -148,9 +148,9 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
       dict mapping string property key to value.
     """
     metadata = super().GetResourceMetadata()
-    metadata['project'] = self.project
+    metadata["project"] = self.project
     if self.release_channel:
-      metadata['release_channel'] = self.release_channel
+      metadata["release_channel"] = self.release_channel
     return metadata
 
   def _GcloudCommand(self, *args, **kwargs) -> util.GcloudCommand:
@@ -163,37 +163,37 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     # Specifying one uses default for the other. Specifying both can be needed
     # as some versions are only supported in some release channels.
     if self.cluster_version:
-      cmd.flags['cluster-version'] = self.cluster_version
+      cmd.flags["cluster-version"] = self.cluster_version
     if self.release_channel:
       if FLAGS.gke_enable_alpha:
         raise errors.Config.InvalidValue(
-            'Kubernetes Alpha is not compatible with release channels'
+            "Kubernetes Alpha is not compatible with release channels"
         )
-      cmd.flags['release-channel'] = self.release_channel
+      cmd.flags["release-channel"] = self.release_channel
 
     if FLAGS.gke_enable_alpha:
-      cmd.args.append('--enable-kubernetes-alpha')
-      cmd.args.append('--no-enable-autorepair')
-    cmd.flags['monitoring'] = 'SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER'
+      cmd.args.append("--enable-kubernetes-alpha")
+      cmd.args.append("--no-enable-autorepair")
+    cmd.flags["monitoring"] = "SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER"
 
     user = util.GetDefaultUser()
     if FLAGS.gcp_service_account:
-      cmd.flags['service-account'] = FLAGS.gcp_service_account
+      cmd.flags["service-account"] = FLAGS.gcp_service_account
     # Matches service accounts that either definitely belongs to this project or
     # are a GCP managed service account like the GCE default service account,
     # which we can't tell to which project they belong.
     elif re.match(SERVICE_ACCOUNT_PATTERN, user):
       logging.info(
-          'Re-using configured service-account for GKE Cluster: %s', user
+          "Re-using configured service-account for GKE Cluster: %s", user
       )
-      cmd.flags['service-account'] = user
+      cmd.flags["service-account"] = user
       self.use_application_default_credentials = False
     else:
-      logging.info('Using default GCE service account for GKE cluster')
-      cmd.flags['scopes'] = 'cloud-platform'
+      logging.info("Using default GCE service account for GKE cluster")
+      cmd.flags["scopes"] = "cloud-platform"
 
     if self.enable_vpa:
-      cmd.flags['enable-vertical-pod-autoscaling'] = True
+      cmd.flags["enable-vertical-pod-autoscaling"] = True
 
     self._IssueResourceCreationCommand(cmd)
 
@@ -210,22 +210,22 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
   def _GetKubeconfig(self):
     """Returns the kubeconfig for the cluster."""
     cmd = self._GcloudCommand(
-        'container', 'clusters', 'get-credentials', self.name
+        "container", "clusters", "get-credentials", self.name
     )
     env = os.environ.copy()
-    env['KUBECONFIG'] = FLAGS.kubeconfig
+    env["KUBECONFIG"] = FLAGS.kubeconfig
     cmd.IssueRetryable(env=env)
 
   def _IsDeleting(self):
-    cmd = self._GcloudCommand('container', 'clusters', 'describe', self.name)
+    cmd = self._GcloudCommand("container", "clusters", "describe", self.name)
     stdout, _, _ = cmd.Issue(raise_on_failure=False)
     return True if stdout else False
 
   def _Delete(self):
     """Deletes the cluster."""
     super()._Delete()
-    cmd = self._GcloudCommand('container', 'clusters', 'delete', self.name)
-    cmd.args.append('--async')
+    cmd = self._GcloudCommand("container", "clusters", "delete", self.name)
+    cmd.args.append("--async")
     _, err, retcode = cmd.Issue(raise_on_failure=False)
     if retcode:
       # Some known retryable errors:
@@ -235,7 +235,7 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
 
   def _Exists(self):
     """Returns True if the cluster exits."""
-    cmd = self._GcloudCommand('container', 'clusters', 'describe', self.name)
+    cmd = self._GcloudCommand("container", "clusters", "describe", self.name)
     _, _, retcode = cmd.Issue(raise_on_failure=False)
     return retcode == 0
 
@@ -243,15 +243,15 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     """Gets the default storage class for the provider."""
     # https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/gce-pd-csi-driver
     # PD-SSD
-    return 'premium-rwo'
+    return "premium-rwo"
 
-  def HasLocalSsd(self, nodepool_name: str = 'default') -> bool:
+  def HasLocalSsd(self, nodepool_name: str = "default") -> bool:
     """Returns true if the given nodepool has local SSDs."""
-    if nodepool_name == 'default':
+    if nodepool_name == "default":
       nodepool = self.default_nodepool
     elif nodepool_name not in self.nodepools:
       raise errors.Config.InvalidValue(
-          f'Nodepool {nodepool_name} not found in cluster.'
+          f"Nodepool {nodepool_name} not found in cluster."
       )
     else:
       nodepool = self.nodepools[nodepool_name]
@@ -261,12 +261,12 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     """Get node pool names for the cluster."""
     # Command `gcloud container node-pools list` does not work for Autopilot
     # clusters - node pools are hidden and command results in 4xx.
-    cmd = self._GcloudCommand('container', 'clusters', 'describe', self.name)
-    cmd.flags['format'] = 'json'
+    cmd = self._GcloudCommand("container", "clusters", "describe", self.name)
+    cmd.flags["format"] = "json"
     stdout, _, _ = cmd.Issue()
     try:
       cluster_info = json.loads(stdout)
-      return [np['name'] for np in cluster_info.get('nodePools', [])]
+      return [np["name"] for np in cluster_info.get("nodePools", [])]
     except (json.JSONDecodeError, ValueError, KeyError, TypeError):
       return stdout.split()
 
@@ -276,11 +276,11 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     if machine_type is not None:
       return machine_type
     out, _, _ = kubectl.RunKubectlCommand([
-        'get',
-        'node',
+        "get",
+        "node",
         node_name,
-        '-o',
-        r'jsonpath={.metadata.labels.node\.kubernetes\.io/instance-type}',
+        "-o",
+        r"jsonpath={.metadata.labels.node\.kubernetes\.io/instance-type}",
     ])
     return out.strip() or None
 
@@ -302,11 +302,11 @@ class GkeCluster(BaseGkeCluster):
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
     super().__init__(spec)
     # Initialize event_poller to None to avoid AttributeError
-    if not hasattr(self, 'event_poller'):
+    if not hasattr(self, "event_poller"):
       self.event_poller = None
     # Update the environment for gcloud commands:
     if gcp_flags.GKE_API_OVERRIDE.value:
-      os.environ['CLOUDSDK_API_ENDPOINT_OVERRIDES_CONTAINER'] = (
+      os.environ["CLOUDSDK_API_ENDPOINT_OVERRIDES_CONTAINER"] = (
           gcp_flags.GKE_API_OVERRIDE.value
       )
 
@@ -316,7 +316,7 @@ class GkeCluster(BaseGkeCluster):
         self.enable_nccl_fast_socket = True
       else:
         raise errors.Config.InvalidValue(
-            'NCCL fast socket is only supported on secondary node pools.'
+            "NCCL fast socket is only supported on secondary node pools."
         )
     self.image_type = gcp_flags.GKE_IMAGE_TYPE.value
 
@@ -344,15 +344,15 @@ class GkeCluster(BaseGkeCluster):
     """Fix zone and region."""
     cmd = super()._GcloudCommand(*args, **kwargs)
     if len(self.zones) != 1:
-      del cmd.flags['zone']
-      cmd.flags['region'] = self.region
+      del cmd.flags["zone"]
+      cmd.flags["region"] = self.region
     return cmd
 
   def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
     """Targets the default pool ComputeClass when custom classes are enabled."""
     del machine_type
     if self._UsesCustomComputeClass(self.default_nodepool):
-      return {'cloud.google.com/compute-class': self.default_nodepool.name}
+      return {"cloud.google.com/compute-class": self.default_nodepool.name}
     return {}
 
   def GetResourceMetadata(self) -> dict[str, Any]:
@@ -362,25 +362,25 @@ class GkeCluster(BaseGkeCluster):
       dict mapping string property key to value.
     """
     result = super().GetResourceMetadata()
-    result['boot_disk_type'] = self.default_nodepool.disk_type
-    result['boot_disk_size'] = self.default_nodepool.disk_size
+    result["boot_disk_type"] = self.default_nodepool.disk_type
+    result["boot_disk_size"] = self.default_nodepool.disk_size
     if self.default_nodepool.max_local_disks:
-      result['gce_local_ssd_count'] = self.default_nodepool.max_local_disks
-      result['gce_local_ssd_interface'] = self.default_nodepool.ssd_interface
-    result['gke_nccl_fast_socket'] = self.enable_nccl_fast_socket
-    if 'nccl' in self.nodepools:
-      result['gpu_type'] = self.nodepools['nccl'].gpu_type
-      result['gpu_count'] = self.nodepools['nccl'].gpu_count
+      result["gce_local_ssd_count"] = self.default_nodepool.max_local_disks
+      result["gce_local_ssd_interface"] = self.default_nodepool.ssd_interface
+    result["gke_nccl_fast_socket"] = self.enable_nccl_fast_socket
+    if "nccl" in self.nodepools:
+      result["gpu_type"] = self.nodepools["nccl"].gpu_type
+      result["gpu_count"] = self.nodepools["nccl"].gpu_count
     if self.image_type:
-      result['image_type'] = self.image_type
+      result["image_type"] = self.image_type
     if gcp_flags.MAX_CPU.value:
-      result['max-cpu'] = gcp_flags.MAX_CPU.value
+      result["max-cpu"] = gcp_flags.MAX_CPU.value
     if gcp_flags.MAX_MEMORY.value:
-      result['max-memory'] = gcp_flags.MAX_MEMORY.value
+      result["max-memory"] = gcp_flags.MAX_MEMORY.value
     if gcp_flags.MAX_ACCELERATOR.value:
-      result['max-accelerator'] = gcp_flags.MAX_ACCELERATOR.value
+      result["max-accelerator"] = gcp_flags.MAX_ACCELERATOR.value
     if gcp_flags.GKE_AUTOSCALING_PROFILE.value:
-      result['gke_autoscaling_profile'] = (
+      result["gke_autoscaling_profile"] = (
           gcp_flags.GKE_AUTOSCALING_PROFILE.value
       )
 
@@ -388,48 +388,48 @@ class GkeCluster(BaseGkeCluster):
 
   def _Create(self):
     """Creates the cluster."""
-    cmd = self._GcloudCommand('container', 'clusters', 'create', self.name)
+    cmd = self._GcloudCommand("container", "clusters", "create", self.name)
     if self.default_nodepool.network:
-      cmd.flags['network'] = self.default_nodepool.network.network_resource.name
+      cmd.flags["network"] = self.default_nodepool.network.network_resource.name
 
     if gcp_flags.GKE_ENABLE_SHIELDED_NODES.value:
-      cmd.args.append('--enable-shielded-nodes')
+      cmd.args.append("--enable-shielded-nodes")
     else:
-      cmd.args.append('--no-enable-shielded-nodes')
+      cmd.args.append("--no-enable-shielded-nodes")
     if gcp_flags.GKE_ADDONS.value:
-      cmd.args.append(f'--addons={gcp_flags.GKE_ADDONS.value}')
+      cmd.args.append(f"--addons={gcp_flags.GKE_ADDONS.value}")
     if not self.release_channel:
-      cmd.args.append('--no-enable-autoupgrade')
+      cmd.args.append("--no-enable-autoupgrade")
     self._AddNodeParamsToCmd(
         self.default_nodepool,
         cmd,
     )
     if self._UsesCustomComputeClass(self.default_nodepool):
-      cmd.args.append('--enable-default-compute-class')
+      cmd.args.append("--enable-default-compute-class")
     enable_autoprovisioning = False
     if gcp_flags.MAX_CPU.value:
-      cmd.flags['max-cpu'] = gcp_flags.MAX_CPU.value
+      cmd.flags["max-cpu"] = gcp_flags.MAX_CPU.value
       enable_autoprovisioning = True
     if gcp_flags.MAX_MEMORY.value:
-      cmd.flags['max-memory'] = gcp_flags.MAX_MEMORY.value
+      cmd.flags["max-memory"] = gcp_flags.MAX_MEMORY.value
       enable_autoprovisioning = True
     if gcp_flags.MAX_ACCELERATOR.value:
-      cmd.flags['max-accelerator'] = gcp_flags.MAX_ACCELERATOR.value
+      cmd.flags["max-accelerator"] = gcp_flags.MAX_ACCELERATOR.value
       enable_autoprovisioning = True
     if enable_autoprovisioning:
-      cmd.args.append('--enable-autoprovisioning')
+      cmd.args.append("--enable-autoprovisioning")
 
     if gcp_flags.GKE_AUTOSCALING_PROFILE.value:
-      cmd.flags['autoscaling-profile'] = gcp_flags.GKE_AUTOSCALING_PROFILE.value
+      cmd.flags["autoscaling-profile"] = gcp_flags.GKE_AUTOSCALING_PROFILE.value
     cidr_size = (
         gcp_flags.GKE_CLUSTER_IPV4_CIDR_SIZE.value
         or _CalculateCidrSize(self.max_total_nodes)
     )
-    cmd.flags['cluster-ipv4-cidr'] = f'/{cidr_size}'
-    cmd.flags['metadata'] = util.MakeFormattedDefaultTags()
+    cmd.flags["cluster-ipv4-cidr"] = f"/{cidr_size}"
+    cmd.flags["metadata"] = util.MakeFormattedDefaultTags()
 
     if self.enable_aam:
-      cmd.args.append('--auto-monitoring-scope=ALL')
+      cmd.args.append("--auto-monitoring-scope=ALL")
 
     self._RunClusterCreateCommand(cmd)
     self._GetKubeconfig()
@@ -440,7 +440,7 @@ class GkeCluster(BaseGkeCluster):
     """Creates additional nodepools for the cluster, if applicable."""
     for name, nodepool in self.nodepools.items():
       cmd = self._GcloudCommand(
-          'container', 'node-pools', 'create', name, '--cluster', self.name
+          "container", "node-pools", "create", name, "--cluster", self.name
       )
       self._AddNodeParamsToCmd(
           nodepool,
@@ -456,46 +456,46 @@ class GkeCluster(BaseGkeCluster):
     if not self._UsesCustomComputeClass(nodepool_config):
       return
     compute_manifest = {
-        'apiVersion': 'cloud.google.com/v1',
-        'kind': 'ComputeClass',
-        'metadata': {
-            'name': nodepool_config.name,
+        "apiVersion": "cloud.google.com/v1",
+        "kind": "ComputeClass",
+        "metadata": {
+            "name": nodepool_config.name,
         },
     }
     priorities = []
     for machine_family in nodepool_config.machine_families:
       priorities.append({
-          'machineFamily': machine_family,
+          "machineFamily": machine_family,
       })
     is_default_class = (
         nodepool_config.name == container_cluster.DEFAULT_NODEPOOL
     )
-    compute_manifest['spec'] = {'priorities': priorities}
+    compute_manifest["spec"] = {"priorities": priorities}
     if is_default_class:
-      compute_manifest['spec']['nodePoolAutoCreation'] = {'enabled': True}
+      compute_manifest["spec"]["nodePoolAutoCreation"] = {"enabled": True}
     kubernetes_commands.ApplyYaml([compute_manifest])
     if is_default_class:
       return
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'update',
+        "container",
+        "node-pools",
+        "update",
         nodepool_config.name,
-        '--cluster',
+        "--cluster",
         self.name,
-        '--node-labels',
-        f'cloud.google.com/compute-class={nodepool_config.name}',
+        "--node-labels",
+        f"cloud.google.com/compute-class={nodepool_config.name}",
     )
     cmd.Issue()
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'update',
+        "container",
+        "node-pools",
+        "update",
         nodepool_config.name,
-        '--cluster',
+        "--cluster",
         self.name,
-        '--node-taints',
-        f'cloud.google.com/compute-class={nodepool_config.name}:NoSchedule',
+        "--node-taints",
+        f"cloud.google.com/compute-class={nodepool_config.name}:NoSchedule",
     )
     cmd.Issue()
 
@@ -506,120 +506,120 @@ class GkeCluster(BaseGkeCluster):
   ):
     """Modifies cmd to include node specific command arguments."""
     # Apply labels to all nodepools.
-    cmd.flags['labels'] = util.MakeFormattedDefaultTags()
+    cmd.flags["labels"] = util.MakeFormattedDefaultTags()
     # Allow a long timeout due to the many minutes it can take to provision a
     # large GPU-accelerated GKE cluster.
     # Parameter is not documented well but is available in CLI.
-    cmd.flags['timeout'] = ONE_HOUR
+    cmd.flags["timeout"] = ONE_HOUR
 
     if nodepool_config.gpu_count:
-      if 'a2-' not in nodepool_config.machine_type:
+      if "a2-" not in nodepool_config.machine_type:
         accelerator_spec = gce_virtual_machine.GenerateAcceleratorSpecString(
             nodepool_config.gpu_type, nodepool_config.gpu_count
         )
         if gcp_flags.GKE_GPU_DRIVER_VERSION.value:
           accelerator_spec += (
-              ',gpu-driver-version=' + gcp_flags.GKE_GPU_DRIVER_VERSION.value
+              ",gpu-driver-version=" + gcp_flags.GKE_GPU_DRIVER_VERSION.value
           )
-        cmd.flags['accelerator'] = accelerator_spec
+        cmd.flags["accelerator"] = accelerator_spec
 
     gce_tags = FLAGS.gce_tags
     if nodepool_config.gce_tags:
       gce_tags = nodepool_config.gce_tags
     if gce_tags:
-      cmd.flags['tags'] = ','.join(gce_tags)
+      cmd.flags["tags"] = ",".join(gce_tags)
     if nodepool_config.min_cpu_platform:
-      cmd.flags['min-cpu-platform'] = nodepool_config.min_cpu_platform
+      cmd.flags["min-cpu-platform"] = nodepool_config.min_cpu_platform
 
-    if gcp_flags.GCE_PROVISIONING_MODEL.value == 'SPOT':
-      cmd.args.append('--spot')
+    if gcp_flags.GCE_PROVISIONING_MODEL.value == "SPOT":
+      cmd.args.append("--spot")
 
     if nodepool_config.threads_per_core:
       # TODO(user): Remove when threads-per-core is available in GA
       cmd.use_alpha_gcloud = True
-      cmd.flags['threads-per-core'] = nodepool_config.threads_per_core
+      cmd.flags["threads-per-core"] = nodepool_config.threads_per_core
 
     if nodepool_config.disk_size:
-      cmd.flags['disk-size'] = nodepool_config.disk_size
+      cmd.flags["disk-size"] = nodepool_config.disk_size
     if nodepool_config.disk_type:
-      cmd.flags['disk-type'] = nodepool_config.disk_type
+      cmd.flags["disk-type"] = nodepool_config.disk_type
     if nodepool_config.max_local_disks:
       # https://cloud.google.com/kubernetes-engine/docs/concepts/local-ssd
       if nodepool_config.ssd_interface == gce_virtual_machine.NVME:
         if gcp_flags.GKE_USE_LSSD_AS_EPHEMERAL_STORAGE.value:
-          ssd_flag = 'ephemeral-storage-local-ssd'
+          ssd_flag = "ephemeral-storage-local-ssd"
         else:
-          ssd_flag = 'local-nvme-ssd-block'
+          ssd_flag = "local-nvme-ssd-block"
         # Technically the count paramter is optional for gen 3+ VMs.
         # However gce_virtual_machine always passes it explitly, so be
         # consistent here.
-        cmd.flags[ssd_flag] = f'count={nodepool_config.max_local_disks}'
+        cmd.flags[ssd_flag] = f"count={nodepool_config.max_local_disks}"
       else:
-        cmd.flags['local-ssd-count'] = nodepool_config.max_local_disks
+        cmd.flags["local-ssd-count"] = nodepool_config.max_local_disks
 
-    cmd.flags['num-nodes'] = nodepool_config.num_nodes
+    cmd.flags["num-nodes"] = nodepool_config.num_nodes
     # zone may be split a comma separated list. For regional clusters, zone
     # holds the region name; do not set node-locations so GKE uses default.
     if nodepool_config.zone and not util.IsRegion(nodepool_config.zone):
-      cmd.flags['node-locations'] = nodepool_config.zone
+      cmd.flags["node-locations"] = nodepool_config.zone
 
     if nodepool_config.machine_type:
-      cmd.flags['machine-type'] = nodepool_config.machine_type
+      cmd.flags["machine-type"] = nodepool_config.machine_type
     elif nodepool_config.cpus and nodepool_config.memory_mib:
-      cmd.flags['machine-type'] = 'custom-{}-{}'.format(
+      cmd.flags["machine-type"] = "custom-{}-{}".format(
           nodepool_config.cpus, nodepool_config.memory_mib
       )
     else:
       assert (
           nodepool_config.machine_families
-      ), 'No machine type nor custom type nor machine family specified.'
+      ), "No machine type nor custom type nor machine family specified."
 
     if FLAGS.gke_enable_gvnic:
-      cmd.args.append('--enable-gvnic')
+      cmd.args.append("--enable-gvnic")
     else:
-      cmd.args.append('--no-enable-gvnic')
+      cmd.args.append("--no-enable-gvnic")
     if (
         self.enable_nccl_fast_socket
         and nodepool_config.name != container_cluster.DEFAULT_NODEPOOL
     ):
-      cmd.args.append('--enable-fast-socket')
+      cmd.args.append("--enable-fast-socket")
 
     if FLAGS.gke_node_system_config is not None:
-      cmd.flags['system-config-from-file'] = FLAGS.gke_node_system_config
+      cmd.flags["system-config-from-file"] = FLAGS.gke_node_system_config
 
     if nodepool_config.sandbox_config is not None:
-      cmd.flags['sandbox'] = nodepool_config.sandbox_config.ToSandboxFlag()
+      cmd.flags["sandbox"] = nodepool_config.sandbox_config.ToSandboxFlag()
 
     if self.image_type:
-      cmd.flags['image-type'] = self.image_type
+      cmd.flags["image-type"] = self.image_type
 
-    cmd.flags['node-labels'] = f'pkb_nodepool={nodepool_config.name}'
+    cmd.flags["node-labels"] = f"pkb_nodepool={nodepool_config.name}"
     if nodepool_config.min_nodes != nodepool_config.max_nodes:
-      cmd.args.append('--enable-autoscaling')
-      cmd.flags['min-nodes'] = nodepool_config.min_nodes
-      cmd.flags['max-nodes'] = nodepool_config.max_nodes
+      cmd.args.append("--enable-autoscaling")
+      cmd.flags["min-nodes"] = nodepool_config.min_nodes
+      cmd.flags["max-nodes"] = nodepool_config.max_nodes
 
   def _PostCreate(self):
     """Waits for kube-dns to be available."""
     super()._PostCreate()
 
     # GKE does not wait for kube-dns by default
-    logging.info('Waiting for kube-dns')
+    logging.info("Waiting for kube-dns")
     kubernetes_commands.WaitForResource(
-        'deployment/kube-dns',
-        condition_name='Available',
-        namespace='kube-system',
+        "deployment/kube-dns",
+        condition_name="Available",
+        namespace="kube-system",
     )
 
   def _GetInstanceGroups(self):
-    cmd = self._GcloudCommand('container', 'node-pools', 'list')
-    cmd.flags['cluster'] = self.name
+    cmd = self._GcloudCommand("container", "node-pools", "list")
+    cmd.flags["cluster"] = self.name
     stdout, _, _ = cmd.Issue()
     json_output = json.loads(stdout)
     instance_groups = []
     for node_pool in json_output:
-      for group_url in node_pool['instanceGroupUrls']:
-        instance_groups.append(group_url.split('/')[-1])  # last url part
+      for group_url in node_pool["instanceGroupUrls"]:
+        instance_groups.append(group_url.split("/")[-1])  # last url part
     return instance_groups
 
   def LabelDisks(self):
@@ -631,17 +631,17 @@ class GkeCluster(BaseGkeCluster):
     """
     pvcs = kubernetes_commands.GetPvcs()
     for pvc in pvcs:
-      gce_disk.AddLabels(self, pvc['spec']['volumeName'])
+      gce_disk.AddLabels(self, pvc["spec"]["volumeName"])
 
   def ResizeNodePool(
       self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
   ):
     """Changes the number of nodes in the node pool."""
-    cmd = self._GcloudCommand('container', 'clusters', 'resize', self.name)
-    cmd.flags['num-nodes'] = new_size
+    cmd = self._GcloudCommand("container", "clusters", "resize", self.name)
+    cmd.flags["num-nodes"] = new_size
     # updates default node pool by default
     if node_pool != container_cluster.DEFAULT_NODEPOOL:
-      cmd.flags['node-pool'] = node_pool
+      cmd.flags["node-pool"] = node_pool
     cmd.Issue()
 
   def CreateNodePool(
@@ -651,44 +651,44 @@ class GkeCluster(BaseGkeCluster):
   ) -> None:
     """Creates a single named node pool on the cluster."""
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'create',
+        "container",
+        "node-pools",
+        "create",
         nodepool_config.name,
-        '--cluster',
+        "--cluster",
         self.name,
     )
     self._AddNodeParamsToCmd(nodepool_config, cmd)
     if node_version:
-      cmd.flags['node-version'] = node_version
+      cmd.flags["node-version"] = node_version
     self._IssueResourceCreationCommand(cmd)
 
   def DeleteNodePool(self, name: str) -> None:
     """Deletes the named node pool."""
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'delete',
+        "container",
+        "node-pools",
+        "delete",
         name,
-        '--cluster',
+        "--cluster",
         self.name,
     )
-    cmd.args.append('--quiet')
+    cmd.args.append("--quiet")
     cmd.Issue(timeout=ONE_HOUR)
 
   def UpgradeNodePool(self, name: str, target_version: str) -> None:
     """Upgrades the named node pool to target_version."""
     cmd = self._GcloudCommand(
-        'container',
-        'clusters',
-        'upgrade',
+        "container",
+        "clusters",
+        "upgrade",
         self.name,
-        '--node-pool',
+        "--node-pool",
         name,
-        '--cluster-version',
+        "--cluster-version",
         target_version,
     )
-    cmd.args.append('--quiet')
+    cmd.args.append("--quiet")
     cmd.Issue(timeout=ONE_HOUR)
 
   def UpdateCluster(self) -> None:
@@ -698,30 +698,30 @@ class GkeCluster(BaseGkeCluster):
     without destructively altering cluster configuration. Always succeeds
     because the label value changes every call.
     """
-    cmd = self._GcloudCommand('container', 'clusters', 'update', self.name)
-    cmd.flags['update-labels'] = f'k8s-mgmt-ts={int(time.time())}'
+    cmd = self._GcloudCommand("container", "clusters", "update", self.name)
+    cmd.flags["update-labels"] = f"k8s-mgmt-ts={int(time.time())}"
     cmd.Issue(timeout=ONE_HOUR)
 
   # ---- Async variants (return opaque handles) -------------------------------
 
   def _IssueAsync(self, cmd: util.GcloudCommand) -> str:
     """Issues a gcloud command with --async, returns the operation name."""
-    cmd.args.append('--async')
-    cmd.flags['format'] = 'value(name)'
+    cmd.args.append("--async")
+    cmd.flags["format"] = "value(name)"
     stdout, stderr, retcode = cmd.Issue(timeout=600, raise_on_failure=False)
     if retcode:
       raise errors.Resource.CreationError(stderr)
-    op_name = stdout.strip().splitlines()[-1].strip() if stdout else ''
+    op_name = stdout.strip().splitlines()[-1].strip() if stdout else ""
     if not op_name:
       raise errors.Resource.CreationError(
-          f'GKE async command returned no operation name; stderr={stderr}'
+          f"GKE async command returned no operation name; stderr={stderr}"
       )
     return op_name
 
   def _GetLatestOperationName(
       self,
-      operation_type: str = 'UPGRADE_NODES',
-      target_name: str = '',
+      operation_type: str = "UPGRADE_NODES",
+      target_name: str = "",
       max_attempts: int = 5,
       retry_delay: int = 3,
       op_start_time: float = 0.0,
@@ -756,55 +756,66 @@ class GkeCluster(BaseGkeCluster):
       # Broaden the status filter and add a startTime guard (with a 30-second
       # buffer for clock skew) to avoid picking up older completed operations.
       from_time = time.strftime(
-          '%Y-%m-%dT%H:%M:%SZ', time.gmtime(op_start_time - 30)
+          "%Y-%m-%dT%H:%M:%SZ", time.gmtime(op_start_time - 30)
       )
-      status_filter = '(status=RUNNING OR status=PENDING OR status=DONE)'
+      status_filter = "(status=RUNNING OR status=PENDING OR status=DONE)"
       time_filter = f' AND startTime>="{from_time}"'
     else:
       # Slow operations (e.g. node pool upgrades): only look for active ops.
-      status_filter = '(status=RUNNING OR status=PENDING)'
-      time_filter = ''
+      status_filter = "(status=RUNNING OR status=PENDING)"
+      time_filter = ""
 
     filter_str = (
-        f'operationType={operation_type} AND '
-        f'{status_filter} AND '
-        f'targetLink ~ {link_target}'
-        f'{time_filter}'
+        f"operationType={operation_type} AND "
+        f"{status_filter} AND "
+        f"targetLink ~ {link_target}"
+        f"{time_filter}"
     )
     for attempt in range(1, max_attempts + 1):
-      list_cmd = self._GcloudCommand('container', 'operations', 'list')
-      list_cmd.flags['filter'] = filter_str
-      list_cmd.flags['sort-by'] = '~startTime'
-      list_cmd.flags['limit'] = 1
-      list_cmd.flags['format'] = 'value(name)'
+      list_cmd = self._GcloudCommand("container", "operations", "list")
+      list_cmd.flags["filter"] = filter_str
+      list_cmd.flags["sort-by"] = "~startTime"
+      list_cmd.flags["limit"] = 1
+      list_cmd.flags["format"] = "value(name)"
       stdout, stderr, _ = list_cmd.Issue(raise_on_failure=False)
       op_name = stdout.strip()
       if op_name:
         logging.info(
-            '_GetLatestOperationName: found op %s (type=%s target=%s) '
-            '(attempt %d/%d)', op_name, operation_type, link_target,
-            attempt, max_attempts,
+            "_GetLatestOperationName: found op %s (type=%s target=%s) "
+            "(attempt %d/%d)",
+            op_name,
+            operation_type,
+            link_target,
+            attempt,
+            max_attempts,
         )
         return op_name
-      logging.warning(
-          '_GetLatestOperationName: no %s op found for target=%s '
-          '(attempt %d/%d), retrying in %ds. stderr=%s',
-          operation_type, link_target, attempt, max_attempts, retry_delay,
-          stderr,
+      logging.info(
+          "_GetLatestOperationName: no %s op found for target=%s "
+          "(attempt %d/%d), retrying in %ds.",
+          operation_type,
+          link_target,
+          attempt,
+          max_attempts,
+          retry_delay,
       )
       time.sleep(retry_delay)
-    return ''
-  
-#   def HasActiveUpgradeOperations(self) -> bool:
-#     """Checks if there are any active node pool upgrades running on the cluster."""
-#     cmd = self._GcloudCommand('container', 'operations', 'list')
-#     cmd.flags['project'] = self.project
-#     cmd.flags['zone'] = self.zone
-#     cmd.flags['filter'] = 'operationType=UPGRADE_NODES AND status=RUNNING'
-#     cmd.flags['sort-by'] = '~startTime'
-#     cmd.flags['limit'] = 1
-#     cmd.flags['format'] = 'value(name)'
-    
+    raise errors.Resource.GetError(
+        f"_GetLatestOperationName: no {operation_type} op found "
+        f"for target={link_target} after {max_attempts} attempts. "
+        f"stderr={stderr}"
+    )
+
+    #   def HasActiveUpgradeOperations(self) -> bool:
+    #     """Checks if there are any active node pool upgrades running on the cluster."""
+    #     cmd = self._GcloudCommand('container', 'operations', 'list')
+    #     cmd.flags['project'] = self.project
+    #     cmd.flags['zone'] = self.zone
+    #     cmd.flags['filter'] = 'operationType=UPGRADE_NODES AND status=RUNNING'
+    #     cmd.flags['sort-by'] = '~startTime'
+    #     cmd.flags['limit'] = 1
+    #     cmd.flags['format'] = 'value(name)'
+
     # Issue the command using PKB's native GcloudCommand wrapper
     stdout, _, _ = cmd.Issue(raise_on_failure=False)
     return bool(stdout.strip())
@@ -815,70 +826,72 @@ class GkeCluster(BaseGkeCluster):
       node_version: str | None = None,
   ) -> str:
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'create',
+        "container",
+        "node-pools",
+        "create",
         nodepool_config.name,
-        '--cluster',
+        "--cluster",
         self.name,
     )
     self._AddNodeParamsToCmd(nodepool_config, cmd)
     if node_version:
-      cmd.flags['node-version'] = node_version
+      cmd.flags["node-version"] = node_version
     # --async is incompatible with the long --timeout flag in some gcloud
     # builds; remove it so the CLI just hands back the op name immediately.
-    cmd.flags.pop('timeout', None)
+    cmd.flags.pop("timeout", None)
     return self._IssueAsync(cmd)
 
   def UpgradeNodePoolAsync(self, name: str, target_version: str) -> str:
     cmd = self._GcloudCommand(
-        'container',
-        'clusters',
-        'upgrade',
+        "container",
+        "clusters",
+        "upgrade",
         self.name,
-        '--node-pool',
+        "--node-pool",
         name,
-        '--cluster-version',
+        "--cluster-version",
         target_version,
     )
     try:
-        return self._IssueAsync(cmd)
+      return self._IssueAsync(cmd)
     except errors.Resource.CreationError as e:
-        if 'returned no operation name' not in str(e):
-            raise
-        # Fallback: gcloud succeeded but printed nothing. Query the operations
-        # list scoped to this specific nodepool to find the operation name.
-        logging.warning(
-            'UpgradeNodePoolAsync: falling back to operations list for '
-            'nodepool %s. Original error: %s', name, e
-        )
-        op_name = self._GetLatestOperationName(
-            operation_type='UPGRADE_NODES', target_name=name
-        )
-        if not op_name:
-            raise
-        return op_name
+      if "returned no operation name" not in str(e):
+        raise
+      # Fallback: gcloud succeeded but printed nothing. Query the operations
+      # list scoped to this specific nodepool to find the operation name.
+      logging.info(
+          "UpgradeNodePoolAsync: falling back to operations list for "
+          "nodepool %s. Original error: %s",
+          name,
+          e,
+      )
+      op_name = self._GetLatestOperationName(
+          operation_type="UPGRADE_NODES", target_name=name
+      )
+      if not op_name:
+        raise
+      return op_name
 
   def DeleteNodePoolAsync(self, name: str) -> str:
     cmd = self._GcloudCommand(
-        'container',
-        'node-pools',
-        'delete',
+        "container",
+        "node-pools",
+        "delete",
         name,
-        '--cluster',
+        "--cluster",
         self.name,
     )
-    cmd.args.append('--quiet')
+    cmd.args.append("--quiet")
     return self._IssueAsync(cmd)
 
   def UpdateClusterAsync(self) -> str:
-    cmd = self._GcloudCommand('container', 'clusters', 'update', self.name)
-    cmd.flags['update-labels'] = f'k8s-mgmt-ts={int(time.time())}'
+    cmd = self._GcloudCommand("container", "clusters", "update", self.name)
+    cmd.flags["update-labels"] = f"k8s-mgmt-ts={int(time.time())}"
     # 'gcloud container clusters update --async' suppresses stdout when
     # --quiet is active (same behaviour as 'clusters upgrade'), so the
     # operation name is never printed.  Remove --quiet here; the label-update
     # is non-interactive so no confirmation prompt is needed.
-    cmd.flags.pop('quiet', None)
+    cmd.flags.pop("quiet", None)
     # Record start time BEFORE issuing.  The label-update operation completes
     # in seconds, so it may already be DONE by the time the fallback queries
     # the operations list.  The timestamp lets us safely include DONE ops
@@ -887,17 +900,19 @@ class GkeCluster(BaseGkeCluster):
     try:
       return self._IssueAsync(cmd)
     except errors.Resource.CreationError as e:
-      if 'returned no operation name' not in str(e):
+      if "returned no operation name" not in str(e):
         raise
       # Fallback: gcloud returned retcode=0 but empty stdout.  Query the
       # operations list including DONE status (fast label-update ops complete
       # before we query) guarded by op_start_time to avoid stale matches.
-      logging.warning(
-          'UpdateClusterAsync: falling back to operations list for cluster %s.'
-          ' Original error: %s', self.name, e
+      logging.info(
+          "UpdateClusterAsync: falling back to operations list for cluster %s."
+          " Original error: %s",
+          self.name,
+          e,
       )
       op_name = self._GetLatestOperationName(
-          operation_type='UPDATE_CLUSTER',
+          operation_type="UPDATE_CLUSTER",
           target_name=self.name,
           op_start_time=op_start_time,
       )
@@ -912,22 +927,22 @@ class GkeCluster(BaseGkeCluster):
     so we query `gcloud container get-server-config` and pick the newest
     valid version per minor.
     """
-    cmd = self._GcloudCommand('container', 'get-server-config')
-    cmd.flags['format'] = 'json'
+    cmd = self._GcloudCommand("container", "get-server-config")
+    cmd.flags["format"] = "json"
     stdout, stderr, retcode = cmd.Issue(raise_on_failure=False)
     if retcode:
       raise errors.Resource.GetError(
-          f'gcloud get-server-config failed: {stderr}'
+          f"gcloud get-server-config failed: {stderr}"
       )
     config = json.loads(stdout)
-    valid = list(config.get('validNodeVersions', []))
+    valid = list(config.get("validNodeVersions", []))
     if not valid:
       raise errors.Resource.GetError(
-          'GKE get-server-config returned no validNodeVersions'
+          "GKE get-server-config returned no validNodeVersions"
       )
 
     def _version_tuple(v):
-      return tuple(int(x) for x in v.split('-', 1)[0].split('.'))
+      return tuple(int(x) for x in v.split("-", 1)[0].split("."))
 
     valid.sort(key=_version_tuple, reverse=True)
     target = valid[0]
@@ -936,8 +951,8 @@ class GkeCluster(BaseGkeCluster):
       if kubernetes_cluster.BareMinor(v) == initial_minor:
         return v, target
     raise errors.Resource.GetError(
-        f'No GKE node version found for minor {initial_minor!r}; '
-        f'available top 5: {valid[:5]}'
+        f"No GKE node version found for minor {initial_minor!r}; "
+        f"available top 5: {valid[:5]}"
     )
 
   def WaitForOperation(self, op_handle: str) -> None:
@@ -951,38 +966,39 @@ class GkeCluster(BaseGkeCluster):
     )
     def _poll():
       describe = self._GcloudCommand(
-          'container',
-          'operations',
-          'describe',
+          "container",
+          "operations",
+          "describe",
           op_handle,
       )
-      #describe.flags['format'] = 'value(status)'
-      describe.flags['format'] = 'json'
+      # describe.flags['format'] = 'value(status)'
+      describe.flags["format"] = "json"
       out, err, rc = describe.Issue(raise_on_failure=False)
       if rc:
         raise errors.Resource.RetryableCreationError(
-            f'describe op failed: {err}'
+            f"describe op failed: {err}"
         )
-      #status = out.strip()
+      # status = out.strip()
       try:
-        status = json.loads(out).get('status')
+        status = json.loads(out).get("status")
       except (json.JSONDecodeError, ValueError):
         status = out.strip()
-      if status == 'DONE':
+      if status == "DONE":
         return
-      if status in ('ABORTING', 'ABORTED'):
-        raise errors.Resource.CreationError(f'op {op_handle} aborted')
+      if status in ("ABORTING", "ABORTED"):
+        raise errors.Resource.CreationError(f"op {op_handle} aborted")
       raise errors.Resource.RetryableCreationError(
-          f'op {op_handle} status={status}'
+          f"op {op_handle} status={status}"
       )
 
     _poll()
+
 
 class GkeAutopilotCluster(BaseGkeCluster):
   """Class representing an Autopilot GKE cluster, which has no nodepools."""
 
   CLOUD = provider_info.GCP
-  CLUSTER_TYPE = 'Auto'
+  CLUSTER_TYPE = "Auto"
 
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
     super().__init__(spec)
@@ -1004,41 +1020,41 @@ class GkeAutopilotCluster(BaseGkeCluster):
   def _GcloudCommand(self, *args, **kwargs) -> util.GcloudCommand:
     """Creates a gcloud command."""
     cmd = super()._GcloudCommand(*args, **kwargs)
-    if 'zone' in cmd.flags:
-      del cmd.flags['zone']
-    cmd.flags['region'] = self.region
+    if "zone" in cmd.flags:
+      del cmd.flags["zone"]
+    cmd.flags["region"] = self.region
     return cmd
 
   def _Create(self):
     """Creates the cluster."""
     cmd = self._GcloudCommand(
-        'container',
-        'clusters',
-        'create-auto',
+        "container",
+        "clusters",
+        "create-auto",
         self.name,
-        '--no-autoprovisioning-enable-insecure-kubelet-readonly-port',
+        "--no-autoprovisioning-enable-insecure-kubelet-readonly-port",
     )
     if self.default_nodepool.network:
-      cmd.flags['network'] = self.default_nodepool.network.network_resource.name
-    cmd.flags['labels'] = util.MakeFormattedDefaultTags()
+      cmd.flags["network"] = self.default_nodepool.network.network_resource.name
+    cmd.flags["labels"] = util.MakeFormattedDefaultTags()
 
     if self.enable_aam:
-      cmd.args.append('--auto-monitoring-scope=ALL')
+      cmd.args.append("--auto-monitoring-scope=ALL")
 
     self._RunClusterCreateCommand(cmd)
     self._GetKubeconfig()
 
   def GetResourceMetadata(self) -> dict[str, Any]:
     metadata = super().GetResourceMetadata()
-    metadata['zone'] = self.zone
-    metadata['region'] = self.region
+    metadata["zone"] = self.zone
+    metadata["region"] = self.region
     # Override node specific metadata set in parent.
-    metadata['machine_type'] = (
+    metadata["machine_type"] = (
         util.GetMachineFamily(self.default_nodepool.machine_type)
         or self.CLUSTER_TYPE
     )
-    metadata['size'] = self.CLUSTER_TYPE
-    metadata['nodepools'] = self.CLUSTER_TYPE
+    metadata["size"] = self.CLUSTER_TYPE
+    metadata["nodepools"] = self.CLUSTER_TYPE
     return metadata
 
   def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
@@ -1047,33 +1063,33 @@ class GkeAutopilotCluster(BaseGkeCluster):
     compute_class = None
     machine_family: str | None = util.GetMachineFamily(machine_type)
     if machine_family:
-      selectors['cloud.google.com/machine-family'] = machine_family
+      selectors["cloud.google.com/machine-family"] = machine_family
       # Mandate one pod per node, which also handles packing small pods into
       # bigger nodes.
-      compute_class = 'Performance'
+      compute_class = "Performance"
     # https://cloud.google.com/kubernetes-engine/docs/how-to/autopilot-gpus#request-gpus
     if self.gpu_type:
       gpu_count = self.gpu_count or 1
       gpu_type = self.gpu_type
-      suffix = ''
+      suffix = ""
       if gpu_type in gce_virtual_machine.GPU_TYPE_TO_SUFFIX:
         suffix = gce_virtual_machine.GPU_TYPE_TO_SUFFIX[gpu_type]
-      gpu_type = f'nvidia-{gpu_type}{suffix}'
+      gpu_type = f"nvidia-{gpu_type}{suffix}"
       gpu_driver_version = gcp_flags.GKE_GPU_DRIVER_VERSION.value
       selectors.update({
-          'cloud.google.com/gke-accelerator': gpu_type,
+          "cloud.google.com/gke-accelerator": gpu_type,
           # Quote to avoid YAML parsing as int.
-          'cloud.google.com/gke-accelerator-count': str(gpu_count),
-          'cloud.google.com/gke-gpu-driver-version': str(gpu_driver_version),
+          "cloud.google.com/gke-accelerator-count": str(gpu_count),
+          "cloud.google.com/gke-gpu-driver-version": str(gpu_driver_version),
       })
       # Override earlier compute class, as only one can be set & Accelerator
       # (or nothing) is required for GPUs.
-      compute_class = 'Accelerator'
+      compute_class = "Accelerator"
     if compute_class:
-      selectors['cloud.google.com/compute-class'] = compute_class
+      selectors["cloud.google.com/compute-class"] = compute_class
     return selectors
 
   def ResizeNodePool(
       self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
   ):
-    raise NotImplementedError('Autopilot clusters do not support resizing.')
+    raise NotImplementedError("Autopilot clusters do not support resizing.")
