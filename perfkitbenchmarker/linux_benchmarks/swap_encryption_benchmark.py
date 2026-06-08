@@ -131,8 +131,17 @@ _SWAP_SIZE_GB = flags.DEFINE_integer(
 _SWAP_TYPE = flags.DEFINE_enum(
     'swap_encryption_swap_type',
     'auto',
-    ['auto', 'hyperdisk', 'lssd', 'instance_store'],
-    'Swap backing storage type.  auto = detect from cloud and instance type.',
+    ['auto', 'hyperdisk', 'lssd', 'boot_disk', 'instance_store', 'io2'],
+    'Swap backing storage target, one per methodology test-matrix row:\n'
+    '  GKE:  boot_disk (swap file on the OS boot disk — pd-balanced or '
+    'hyperdisk-balanced, chosen via --swap_encryption_boot_disk_type),\n'
+    '        hyperdisk (dedicated hyperdisk-balanced data disk),\n'
+    '        lssd (dedicated Local SSD RAID-0).\n'
+    '  AWS:  instance_store (NVMe Instance Store, Nitro-encrypted),\n'
+    '        io2 (EBS io2 data/root volume).\n'
+    'dm-crypt is applied on the GKE targets when '
+    '--swap_encryption_enable_dmcrypt is set; AWS targets are encrypted by '
+    'Nitro at the hardware level.  auto = detect from cloud + instance type.',
 )
 _FIO_RUNTIME_SEC = flags.DEFINE_integer(
     'swap_encryption_fio_runtime_sec',
@@ -484,6 +493,8 @@ def _daemonset_yaml(image: str) -> str:
                   python3-pip \\
                   libevent-dev \\
                   libssl-dev \\
+                  libpcre3-dev \\
+                  zlib1g-dev \\
                   build-essential \\
                   autoconf \\
                   automake \\
@@ -1878,6 +1889,8 @@ def _setup_gke_swap(pod: str) -> None:
 
   if swap_type == 'lssd':
     _setup_gke_lssd_swap(pod)
+  elif swap_type == 'boot_disk':
+    _setup_gke_bootdisk_swap(pod)
   else:
     _setup_gke_hyperdisk_swap(pod)
 
@@ -2062,9 +2075,90 @@ def _setup_gke_loop_device_swap(pod: str) -> None:
   )
 
 
+def _setup_gke_bootdisk_swap(pod: str) -> None:
+  """Swap on the OS BOOT disk — methodology Table 0 rows 1-4.
+
+  Creates a loop-backed swap file on /mnt/stateful_partition (the node's boot
+  disk, whose type — pd-balanced or hyperdisk-balanced — is chosen at
+  nodepool-creation time via --swap_encryption_boot_disk_type).  dm-crypt is
+  layered on the loop device when --swap_encryption_enable_dmcrypt is set
+  (encryption-on rows 2/4); otherwise plain swap is used (encryption-off rows
+  1/3).
+
+  Reuses the same loop-creation and dmsetup patterns as the LSSD/hyperdisk
+  paths — no shared provider module is touched.  Requires an Ubuntu node image
+  (dm-crypt from a pod is blocked on COS).
+  """
+  size_gb = _SWAP_SIZE_GB.value
+  backing = '/mnt/stateful_partition/pkb_swap_backing'
+  logging.info('[swap_encryption] GKE: boot-disk swap (%dG backing, dmcrypt=%s)',
+               size_gb, _ENABLE_DMCRYPT.value)
+
+  # Clean up any stale loop/mapping from a previous run.
+  _pod_exec(pod, textwrap.dedent(f"""
+    swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
+    dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
+    losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | while read d
+    do
+      swapoff "$d" 2>/dev/null || true
+      losetup -d "$d" 2>/dev/null || true
+    done
+    rm -f {backing}
+  """), ignore_failure=True)
+
+  # Allocate the backing file on the boot-disk ext4 stateful partition.
+  _pod_exec(pod, textwrap.dedent(f"""
+    fallocate -l {size_gb}G {backing} 2>/dev/null || truncate -s {size_gb}G {backing}
+  """))
+
+  loop_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+    LOOP=$(losetup -f) && losetup --direct-io=on "$LOOP" {backing} && echo "$LOOP"
+  """))
+  loop_dev = loop_out.strip().splitlines()[-1].strip() if loop_out.strip() else ''
+  if not loop_dev.startswith('/dev/loop'):
+    raise RuntimeError(
+        f'[swap_encryption] boot-disk losetup failed: {loop_out!r}')
+  logging.info('[swap_encryption] GKE: boot-disk loop device: %s', loop_dev)
+
+  if _ENABLE_DMCRYPT.value:
+    _pod_exec(pod, textwrap.dedent(f"""
+      grep -q dm_crypt /proc/modules 2>/dev/null || {{
+        KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
+        [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
+      }}
+      KEY=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \\n')
+      SIZE=$(blockdev --getsz {loop_dev})
+      printf "0 %s crypt aes-xts-plain64 %s 0 %s 0\\n" "$SIZE" "$KEY" "{loop_dev}" | \\
+        dmsetup create swap_encrypted --noudevrules --noudevsync
+      unset KEY
+      dmsetup mknodes swap_encrypted 2>/dev/null || true
+      mkswap /dev/mapper/swap_encrypted
+      swapon /dev/mapper/swap_encrypted
+    """))
+    logging.info('[swap_encryption] GKE: boot-disk dm-crypt swap active on '
+                 '/dev/mapper/swap_encrypted')
+  else:
+    _pod_exec(pod, textwrap.dedent(f"""
+      mkswap {loop_dev} && swapon {loop_dev}
+    """))
+    logging.info('[swap_encryption] GKE: boot-disk plain swap active on %s',
+                 loop_dev)
+
+
 def _setup_gke_lssd_swap(pod: str) -> None:
   """Configure dm-crypt on LSSD RAID-0 array (go/gke-swap-lssd)."""
   logging.info('[swap_encryption] GKE: setting up LSSD RAID-0 swap')
+
+  # Reused-node hygiene: a previous run on this node may have left an ACTIVE
+  # dm-crypt swap (e.g. /dev/nvme0n1 └─swap_encrypted [SWAP]).  That makes the
+  # LSSD look "unclean/busy" to the device selector below, which then wrongly
+  # falls back to the hyperdisk path and tries the boot disk.  Tear down any
+  # prior PKB swap mapping FIRST so the underlying LSSD is freed and selectable.
+  _pod_exec(pod, textwrap.dedent("""
+    swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
+    swapoff -a 2>/dev/null || true
+    dmsetup remove --force --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
+  """), ignore_failure=True)
 
   # Log the full block-device topology up front for diagnosis (every prior
   # swap failure traced back to picking the wrong device).
@@ -2564,6 +2658,11 @@ def _phase1_fio(
   for name, rw, bs, depth, label in _FIO_JOBS:
     logging.info('[swap_encryption] fio: %s', name)
     out_file = f'/tmp/pkb_fio_{name}.json'
+    # Remove any stale output first so a parse can never silently reuse a
+    # previous job's/run's result (rules out byte-identical results between
+    # runs being a caching artifact rather than a true device ceiling).
+    _pod_exec(pod, f'rm -f {out_file}', ignore_failure=True, _retries=0,
+              timeout=15)
     run_cmd = (
         f'fio --name={name} --filename={swap_dev} '
         f'--ioengine=libaio --direct=1 --verify=0 --randrepeat=0 '
@@ -3420,33 +3519,48 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   # Run the latency workload.  Prefer memtier_benchmark (gives per-percentile
   # JSON) but fall back to redis-benchmark --csv which is always available via
   # the redis-tools package installed in the DaemonSet init script.
-  memtier_avail, _ = _pod_exec(
-      pod, 'command -v memtier_benchmark 2>/dev/null', ignore_failure=True)
-  if memtier_avail.strip():
+  # memtier installs via `make install` to /usr/local/bin; a non-login
+  # kubectl-exec shell often drops that from PATH, so `command -v` misses a
+  # binary that IS present (this is why earlier runs fell back to throughput-
+  # only).  Resolve the absolute path explicitly.
+  mt_out, _ = _pod_exec(
+      pod,
+      'command -v memtier_benchmark 2>/dev/null; '
+      'ls /usr/local/bin/memtier_benchmark 2>/dev/null',
+      ignore_failure=True)
+  mt_bin = next((l.strip() for l in mt_out.splitlines() if l.strip()), '')
+  if mt_bin:
     meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
     mt_cmd = (
-        'memtier_benchmark '
+        f'{mt_bin} '
         '--server 127.0.0.1 --port 6379 --protocol redis '
-        '--clients 50 --threads 4 --test-time 60 '
-        '--data-size 128 '
-        '--ratio 1:1 '
-        '--hide-histogram '
-        '--json-out-file /tmp/pkb_memtier.json '
-        '2>&1'
+        '--clients 50 --threads 4 --test-time 60 --data-size 128 '
+        '--ratio 1:1 --hide-histogram '
+        '--json-out-file /tmp/pkb_memtier.json 2>&1'
     )
     _pod_exec(pod, mt_cmd, ignore_failure=True, timeout=120)
     results += _parse_memtier_json('/tmp/pkb_memtier.json', pod, meta)
   else:
-    # redis-benchmark fallback: --csv gives us latency percentiles
-    logging.warning('[swap_encryption] memtier_benchmark not found; '
-                    'using redis-benchmark as fallback')
+    # Fallback: redis-benchmark (always present via redis-tools).  Run WITHOUT
+    # --csv so the latency percentile distribution is printed, then parse both
+    # throughput and percentiles (the --csv format is throughput-only, which is
+    # why P50/P90/P99 were missing before).
+    logging.warning('[swap_encryption] memtier_benchmark not on PATH or in '
+                    '/usr/local/bin; using redis-benchmark for latency')
+    # Surface WHY memtier is missing so the build failure is diagnosable from
+    # the PKB log instead of only inside the pod (best-effort).
+    blog, _ = _pod_exec(
+        pod, 'tail -n 15 /tmp/pkb_memtier_build.log 2>/dev/null || echo "(no build log)"',
+        ignore_failure=True, _retries=0, timeout=15)
+    logging.warning('[swap_encryption] memtier build log tail:\n%s',
+                    (blog or '').strip())
     meta = dict(base_meta, workload='redis', tool='redis_benchmark_fallback')
-    rb_out, _ = _pod_exec(pod, textwrap.dedent("""
-      redis-benchmark -h 127.0.0.1 -p 6379 \
-        -c 50 -n 100000 -d 128 -t get,set \
-        --csv 2>&1
-    """), ignore_failure=True, timeout=120)
-    results += _parse_redis_benchmark_csv(rb_out, meta)
+    rb_out, _ = _pod_exec(
+        pod,
+        'redis-benchmark -h 127.0.0.1 -p 6379 -c 50 -n 100000 -d 128 '
+        '-t get,set 2>&1',
+        ignore_failure=True, timeout=180)
+    results += _parse_redis_benchmark(rb_out, meta)
 
   _reset_memory_high_guard(pod)
   return results
@@ -3529,35 +3643,84 @@ def _parse_memtier_json(
   return results
 
 
-def _parse_redis_benchmark_csv(
+def _parse_redis_benchmark(
     output: str, base_meta: dict
 ) -> list[sample.Sample]:
-  """Parse redis-benchmark --csv output into PKB Samples.
+  """Parse redis-benchmark (non-CSV) output: throughput + latency percentiles.
 
-  redis-benchmark --csv emits lines like:
-    "SET","107526.88"
-    "GET","115207.37"
-  Each line gives the test name and throughput (requests/sec).
-  Latency percentiles are not available in the CSV format; we emit only
-  ops/sec so the run still produces comparable throughput data.
+  redis-benchmark groups its output per operation.  We track the current op
+  from '====== SET ======' / '====== GET ======' headers and extract:
+    * throughput  — 'throughput summary: N requests per second' OR the older
+      'N requests per second' line  -> redis_<op>_ops_per_sec
+    * percentiles — the 'latency summary (msec)' table (redis 7+, columns
+      avg/min/p50/p95/p99/max) OR the 'NN.NNN% <= X milliseconds' percentile
+      distribution lines (redis 6) -> redis_<op>_lat_p{50,95,99}_ms
+
+  Best-effort across redis-tools versions; whatever percentiles the installed
+  redis-benchmark prints are captured.  Throughput is always emitted.
   """
   results = []
-  for line in output.splitlines():
-    line = line.strip()
-    if not line or line.startswith('#'):
+  op = None
+  buckets: list[tuple[float, float]] = []  # (cumulative_pct, latency_ms) for op
+  expect_summary_row = False
+
+  def _flush(cur_op, bkts):
+    """Emit P50/P90/P99 by inverting the cumulative distribution: for each
+    target percentile, take the smallest latency whose cumulative %% >= target.
+    """
+    if not cur_op or not bkts:
+      return
+    ordered = sorted(bkts, key=lambda x: x[0])  # ascending cumulative pct
+    m = dict(base_meta, operation=cur_op)
+    for target, lbl in ((50.0, 'p50'), (90.0, 'p90'), (99.0, 'p99')):
+      lat = next((ms for pct, ms in ordered if pct >= target), None)
+      if lat is not None:
+        results.append(
+            sample.Sample(f'redis_{cur_op}_lat_{lbl}_ms', lat, 'ms', m))
+
+  for raw in output.splitlines():
+    line = raw.strip()
+    header = re.search(r'======\s*([A-Za-z_]+)\s*======', line)
+    if header:
+      _flush(op, buckets)              # finalise the previous op's percentiles
+      op = header.group(1).lower()
+      buckets = []
+      expect_summary_row = False
       continue
-    parts = line.replace('"', '').split(',')
-    if len(parts) < 2:
-      continue
-    op = parts[0].lower()       # e.g. "set", "get"
-    try:
-      ops = float(parts[1])
-    except ValueError:
+    if op is None:
       continue
     m = dict(base_meta, operation=op)
-    results.append(sample.Sample(f'redis_{op}_ops_per_sec', ops, 'ops/s', m))
+
+    tput = re.search(r'([\d.]+)\s+requests per second', line)
+    if tput:
+      results.append(
+          sample.Sample(f'redis_{op}_ops_per_sec', float(tput.group(1)),
+                        'ops/s', m))
+      continue
+
+    # redis 7+ summary table: 'latency summary (msec):' header then a row of
+    # avg/min/p50/p95/p99/max values.
+    if 'latency summary' in line.lower():
+      expect_summary_row = True
+      continue
+    if expect_summary_row and re.match(r'^[\d.]+(\s+[\d.]+){3,}', line):
+      cols = line.split()
+      for lbl, val in zip(['avg', 'min', 'p50', 'p95', 'p99', 'max'], cols):
+        if lbl in ('p50', 'p95', 'p99'):
+          results.append(
+              sample.Sample(f'redis_{op}_lat_{lbl}_ms', float(val), 'ms', m))
+      expect_summary_row = False
+      continue
+
+    # redis 6 CUMULATIVE distribution: 'NN.NN% <= X milliseconds'.  The
+    # percentages are arbitrary cumulative buckets (e.g. 80.27%, 95.65%,
+    # 99.14%), NOT fixed 50/95/99 — collect them and invert in _flush().
+    pdist = re.search(r'([\d.]+)%\s*<=\s*([\d.]+)\s*milli', line)
+    if pdist:
+      buckets.append((float(pdist.group(1)), float(pdist.group(2))))
+  _flush(op, buckets)                  # finalise the last op
   if not results:
-    logging.warning('[swap_encryption] redis-benchmark CSV parse produced no samples')
+    logging.warning('[swap_encryption] redis-benchmark parse produced no samples')
   return results
 
 
@@ -3896,15 +4059,13 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     return []
 
   # Server is up.  NOW apply swap pressure (detached) so the index/query below
-  # run under memory pressure — which is the point of the phase — without
-  # starving the JVM during its startup.
-  _pod_exec(pod, textwrap.dedent(f"""
-    nohup stress-ng --vm 1 --vm-bytes {_STRESS_VM_BYTES.value} \\
-      {_stress_vm_method_flag(pod)} --timeout {_STRESS_TIMEOUT_SEC.value}s \\
-      >/tmp/pkb_stress_opensearch.log 2>&1 &
-    disown
-    echo STRESS_STARTED
-  """), timeout=30)
+  # run under memory pressure — which is the point of the phase — WITHOUT
+  # evicting the pod.  This phase runs FIRST, so a pod eviction here would
+  # cascade into every later phase (fio Gate 1, stress 2a, …) and fail the
+  # whole run.  Use the confined stressor (capped at 60% RAM in its own cgroup)
+  # so it cannot starve the OpenSearch JVM or trip the node OOM/eviction.
+  _launch_confined_bg_stress(pod, _STRESS_TIMEOUT_SEC.value,
+                             '/tmp/pkb_stress_opensearch.log')
   time.sleep(10)
 
   doc = '{"index":{}}\n{"field":"benchmark","ts":"2026-01-01"}\n'
@@ -4065,22 +4226,28 @@ def _detect_swap_device(pod: str) -> str:
   if _SWAP_DEVICE.value:
     return _SWAP_DEVICE.value
 
-  # Prefer dm-crypt mapped device (GKE).
-  # Two-step check avoids a compound one-liner that triggers PKB's
-  # semicolon/pipe-chain warning.
+  # /proc/swaps is the source of truth: it lists the swap device that is
+  # ACTUALLY active.  We must NOT just `test -e /dev/mapper/swap_encrypted`,
+  # because a stale dm-crypt mapping from a previous run on a reused node can
+  # still exist as a /dev node while being non-functional (fio/swapoff then
+  # fail with "No such device or address").  So read the active device from
+  # /proc/swaps first; only fall back to the mapper path if /proc/swaps is
+  # somehow empty but the mapper is genuinely present.
   dm_out, _ = _pod_exec(
       pod,
       textwrap.dedent("""
-        if test -e /dev/mapper/swap_encrypted
+        ACTIVE=$(awk 'NR==2{print $1}' /proc/swaps 2>/dev/null)
+        if [ -n "$ACTIVE" ]
+        then
+          echo "$ACTIVE"
+        elif test -e /dev/mapper/swap_encrypted
         then
           echo /dev/mapper/swap_encrypted
-        else
-          awk 'NR==2{print $1}' /proc/swaps
         fi
       """),
       ignore_failure=True,
   )
-  dev = dm_out.strip()
+  dev = dm_out.strip().splitlines()[-1].strip() if dm_out.strip() else ''
   if dev:
     return dev
   raise ValueError(
@@ -4165,7 +4332,9 @@ def _build_metadata(pod: str, swap_dev: str) -> dict:
       'swap_device': swap_dev,
       'swap_size_gb': swap_gb,
       'swap_encryption': enc,
-      # Test-matrix columns: encryption on/off, node image type, IOPS target
+      # Test-matrix columns: storage target, encryption on/off, image, IOPS
+      'storage_target': _SWAP_TYPE.value,
+      'boot_disk_type': _BOOT_DISK_TYPE.value,
       'dmcrypt_enabled': _ENABLE_DMCRYPT.value,
       'node_image_type': _NODE_IMAGE_TYPE.value,
       'boot_disk_iops_target': _BOOT_DISK_IOPS.value,
