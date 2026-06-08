@@ -384,6 +384,11 @@ _degraded_reasons: list[str] = []
 # build) is invisible to the degradation gate because _active_pod is never
 # renamed.  Consumed by Run()'s final gate.
 _pod_lost: list[str] = []
+# Short descriptions of rc=137 (SIGKILL/OOM) events seen during the run.  An
+# OOM that restarts the container IN PLACE keeps the same pod name, so neither
+# the "pod replaced" nor the "pod NotFound" check fires — the run would look
+# clean.  Recording every rc=137 here lets the gate flag those too.
+_oom_events: list[str] = []
 
 _BENCHMARK_NODEPOOL = 'benchmark'
 _DEFAULT_NODEPOOL = 'default-pool'
@@ -498,10 +503,18 @@ def _daemonset_yaml(image: str) -> str:
                 exit 1
               fi
               echo "[pkb] Installing memtier_benchmark from source..."
+              # Pin a stable release tag — building from the moving default
+              # branch (HEAD) intermittently broke (memtier_benchmark not found
+              # → Phase 3a lost its P50/P90/P99 latency).  2.1.1 builds cleanly
+              # against the apt deps installed above.  Fall back to HEAD only if
+              # the tagged clone fails (e.g. tag renamed upstream).
               if ! command -v memtier_benchmark >/dev/null 2>&1; then
                 (cd /tmp && \\
                   rm -rf memtier_benchmark && \\
-                  git clone --depth 1 https://github.com/RedisLabs/memtier_benchmark.git 2>&1 && \\
+                  ( git clone --depth 1 --branch 2.1.1 \\
+                      https://github.com/RedisLabs/memtier_benchmark.git 2>&1 || \\
+                    git clone --depth 1 \\
+                      https://github.com/RedisLabs/memtier_benchmark.git 2>&1 ) && \\
                   cd memtier_benchmark && \\
                   autoreconf -ivf 2>&1 && \\
                   ./configure 2>&1 && \\
@@ -830,6 +843,7 @@ def Run(spec) -> list[sample.Sample]:
   _active_pod.append(pod)
   _degraded_reasons.clear()
   _pod_lost.clear()
+  _oom_events.clear()
   original_pod = pod
   swap_dev = _detect_swap_device(pod)
   base_meta = _build_metadata(pod, swap_dev)
@@ -935,6 +949,12 @@ def Run(spec) -> list[sample.Sample]:
         f'— the pod died (node memory-pressure eviction or container exit) and '
         f'any phase running at or after that point (e.g. kernel-build baseline, '
         f'OpenSearch) produced invalid data')
+  if _oom_events:
+    _degraded_reasons.append(
+        f'OOM kill(s) (rc=137) occurred during the run on pod(s) '
+        f'{", ".join(_oom_events)} — a phase exceeded memory and was killed by '
+        f'the OOM killer (the container may have restarted in place), so the '
+        f'affected phase(s) produced no or partial data')
   if _phase_selected('fio') and not tier1_results:
     _degraded_reasons.append(
         'Gate 1 (fio microbenchmarks) produced no samples — the raw swap '
@@ -1309,6 +1329,15 @@ def _create_benchmark_node_pool(cluster) -> None:
                                             raise_on_failure=False)
 
   if rc != 0:
+    # Idempotent prepare: if the nodepool already exists (e.g. re-running
+    # --run_stage=prepare,run to redeploy the DaemonSet onto an existing
+    # cluster), reuse it instead of failing.  gcloud returns a 409 /
+    # "Already exists" message in this case.
+    low = (stderr or '').lower()
+    if 'already exists' in low or 'alreadyexists' in low or 'code=409' in low:
+      logging.info('[swap_encryption] Benchmark nodepool already exists — '
+                   'reusing it (idempotent prepare); proceeding to DaemonSet')
+      return
     raise errors.Benchmarks.RunError(
         f'[swap_encryption] Failed to create benchmark nodepool '
         f'(rc={rc}): {stderr}'
@@ -1614,6 +1643,11 @@ def _pod_exec(
     # In both cases we call _recover_pod to wait for tools + sentinel, and
     # we do NOT retry the OOM-triggering command itself.
     if rc == 137:
+      # Record the OOM so the run-level gate can flag it even if the container
+      # restarts in place under the same pod name (which leaves both the
+      # "pod replaced" and "pod NotFound" checks silent).
+      if active not in _oom_events:
+        _oom_events.append(active)
       # CRITICAL: sleep before checking pod state.  Kubernetes takes a few
       # seconds to mark a just-evicted pod as Terminating / NotFound.  Without
       # this delay _recover_pod sees the pod still in "Running" phase, returns
@@ -2032,33 +2066,51 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   """Configure dm-crypt on LSSD RAID-0 array (go/gke-swap-lssd)."""
   logging.info('[swap_encryption] GKE: setting up LSSD RAID-0 swap')
 
-  # Step 1: identify boot device (findmnt returns 'overlay' inside the
-  # container so lsblk silently fails — default to nvme0n1).
-  boot_out, _ = _pod_exec(
-      pod,
-      'lsblk -no pkname "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1',
-      ignore_failure=True,
-  )
-  boot_base = boot_out.strip() or 'nvme0n1'
+  # Log the full block-device topology up front for diagnosis (every prior
+  # swap failure traced back to picking the wrong device).
+  topo, _ = _pod_exec(
+      pod, 'lsblk -o NAME,TYPE,SIZE,ROTA,MOUNTPOINT 2>/dev/null',
+      ignore_failure=True)
+  logging.info('[swap_encryption] block device topology:\n%s',
+               (topo or '').strip())
 
-  # Step 2: list all non-rotational disks that are not the boot device.
+  # Identify candidate swap devices = whole disks that are NOT the boot/OS
+  # disk.  We must NOT rely on a device name (boot disk enumerates as nvme0n1
+  # on some nodes, nvme1n1 on others) and we cannot use `findmnt /` because the
+  # container root is an overlay.  Instead we EXCLUDE any disk that:
+  #   * has partition children (boot disk has p1/p14/p15/p16), or
+  #   * has any mounted filesystem (itself or a child).
+  # A raw local SSD intended for swap has neither.  This robustly prevents the
+  # catastrophic bug where the 100 GB boot disk (root mounted) was RAIDed into
+  # the swap device, yielding a non-functional swap (fio empty + stress OOM).
   lssd_out, _ = _pod_exec(
       pod,
-      f"lsblk -d -o NAME,ROTA | awk '$2==\"0\"{{print \"/dev/\"$1}}' "
-      f"| grep -v '^/dev/{boot_base}$'",
+      textwrap.dedent("""
+        for d in $(lsblk -dno NAME,ROTA | awk '$2==0{print $1}')
+        do
+          if lsblk -no TYPE "/dev/$d" 2>/dev/null | grep -q '^part$'; then
+            continue   # has partitions -> boot/OS disk
+          fi
+          if lsblk -no MOUNTPOINT "/dev/$d" 2>/dev/null | grep -q '[^[:space:]]'; then
+            continue   # mounted somewhere -> not a free swap device
+          fi
+          echo "/dev/$d"
+        done
+      """),
       ignore_failure=True,
   )
   devices = [d.strip() for d in lssd_out.strip().splitlines() if d.strip()]
   if not devices:
     logging.warning(
-        '[swap_encryption] No LSSD devices found, falling back to hyperdisk')
+        '[swap_encryption] No clean (unpartitioned, unmounted) local SSD found '
+        '— falling back to hyperdisk swap path')
     _setup_gke_hyperdisk_swap(pod)
     return
 
   device_list = ' '.join(devices)
   n = len(devices)
-  logging.info('[swap_encryption] GKE: LSSD RAID-0 across %d devices: %s  '
-               'dmcrypt=%s', n, device_list, _ENABLE_DMCRYPT.value)
+  logging.info('[swap_encryption] GKE: LSSD RAID-0 across %d clean device(s): '
+               '%s  dmcrypt=%s', n, device_list, _ENABLE_DMCRYPT.value)
 
   # Clean up stale mappings, RAID arrays, and GKE-managed mounts.
   #
@@ -2967,7 +3019,6 @@ def _run_cpu_overhead_sweep(
       PISTAT_PID=$!
       stress-ng --vm {workers} \\
         --vm-bytes {per_worker} \\
-        --vm-hang 0 \\
         {method_flag} \\
         --timeout {timeout}s \\
         --metrics-brief 2>&1 || true
@@ -3138,12 +3189,98 @@ def _parse_pidstat(output: str, base_meta: dict) -> list[sample.Sample]:
 # Phase 2b – I/O Interference
 # ---------------------------------------------------------------------------
 
+def _launch_confined_bg_stress(pod: str, timeout_s: int, logfile: str) -> None:
+  """Launch the Phase 2b/3a background swap stressor confined to its OWN
+  memory-capped cgroup, so it drives swap pressure WITHOUT starving the
+  concurrent foreground workload (fio / Redis) or OOM-killing the pod.
+
+  On a small node (config1, 30 GB) a flat 32 GB stressor plus a concurrent
+  workload exhausts RAM faster than the kernel pages out, and the OOM killer
+  takes the foreground process (the under-pressure app_io fio died with
+  rc=137).  Confining the stressor to memory.max = 60% of RAM (with unlimited
+  swap) makes it page within its own budget; the other ~40% of RAM stays free
+  for the workload, and if the stressor overruns its cap only IT is killed —
+  never the pod or the workload.
+
+  Config-2 safety: on a 256 GB node, 60% = ~150 GB, far above the 32 GB
+  stressor, so the cap is never reached and behaviour is unchanged.
+  Best-effort: if the cgroup can't be created the stressor still runs in the
+  main cgroup (degrades to prior behaviour, not worse).  MemTotal is read with
+  grep/cut (no awk) to keep this clear of f-string brace escaping.
+  """
+  method = _stress_vm_method_flag(pod)
+  vm_bytes = _STRESS_VM_BYTES.value
+  _pod_exec(pod, textwrap.dedent(f"""
+    nohup bash -c '
+      BG=/sys/fs/cgroup/pkb_bgstress
+      mkdir -p "$BG" 2>/dev/null || true
+      echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+      echo max > "$BG/memory.swap.max" 2>/dev/null || true
+      MT_KB=$(grep -m1 MemTotal /proc/meminfo | tr -s " " | cut -d" " -f2)
+      echo $(( MT_KB * 1024 * 60 / 100 )) > "$BG/memory.max" 2>/dev/null || true
+      echo $$ > "$BG/cgroup.procs" 2>/dev/null || true
+      exec stress-ng --vm 1 --vm-bytes {vm_bytes} {method} --timeout {timeout_s}s
+    ' >{logfile} 2>&1 &
+    disown
+    echo STRESS_STARTED
+  """), timeout=30)
+
+
+def _set_memory_high_guard(pod: str, fraction: float = 0.9) -> None:
+  """Cap the container cgroup ``memory.high`` at `fraction` x RAM.
+
+  Phases 2b (I/O interference) and 3a (Redis) run a background stressor *and* a
+  concurrent foreground workload (an 8 GB fio file / a Redis dataset).  On a
+  small-RAM node (config1, 30 GB) their combined footprint exceeds RAM and the
+  hard OOM killer (``memory.max``) terminates the pod (rc=137), wiping out both
+  phases.  ``memory.high`` is a soft limit: when the cgroup crosses it the
+  kernel reclaims and *swaps* aggressively (throttling the cgroup) instead of
+  killing it — which is exactly the swap pressure these phases want to create.
+
+  Config-2 safety: this is a no-op in effect on large-RAM nodes.  On
+  n4-highmem-32 (256 GB) the 32 GB background workload never approaches 0.9 x
+  256 GB = 230 GB, so the soft limit is never crossed and behaviour is
+  unchanged.  Phase 2a is deliberately NOT guarded (it works on both configs).
+  Best-effort; any failure is ignored.
+  """
+  _pod_exec(pod, textwrap.dedent(f"""
+    PKB_MCG=$(awk -F: '/^0::/{{print $3}}' /proc/self/cgroup 2>/dev/null)
+    MT_KB=$(awk '/MemTotal/{{print $2}}' /proc/meminfo)
+    HIGH=$(( MT_KB * 1024 / 100 * {int(fraction * 100)} ))
+    if [ -n "$PKB_MCG" ] && [ -f "/sys/fs/cgroup$PKB_MCG/memory.high" ]; then
+      echo $HIGH > "/sys/fs/cgroup$PKB_MCG/memory.high" 2>/dev/null \
+        && echo "[pkb] memory.high set to $HIGH bytes ({int(fraction * 100)}% RAM) — pod will swap, not OOM" \
+        || echo "[pkb] WARNING: could not set memory.high" >&2
+    fi
+  """), ignore_failure=True, timeout=30, _retries=0)
+
+
+def _reset_memory_high_guard(pod: str) -> None:
+  """Restore ``memory.high`` to ``max`` after a guarded phase."""
+  _pod_exec(pod, textwrap.dedent("""
+    PKB_MCG=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup 2>/dev/null)
+    if [ -n "$PKB_MCG" ] && [ -f "/sys/fs/cgroup$PKB_MCG/memory.high" ]; then
+      echo max > "/sys/fs/cgroup$PKB_MCG/memory.high" 2>/dev/null || true
+    fi
+  """), ignore_failure=True, timeout=30, _retries=0)
+
+
 def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Quantify drop in application I/O when swap is under simultaneous pressure."""
   results = []
-  app_file = '/tmp/pkb_app_io'
+  # IMPORTANT: keep this OFF tmpfs.  /tmp is RAM-backed (tmpfs/overlay), so an
+  # 8 GB fio file there consumes 8 GB of RAM and OOM-kills the pod on a small
+  # node (config1, rc=137 at "Laying out IO file") before any swap pressure is
+  # even applied.  /mnt/stateful_partition is the node's persistent boot disk
+  # (hostPath mount) — the file lives on disk, not RAM, and the fio results
+  # then measure real disk I/O under swap pressure, which is the intent.
+  app_file = '/mnt/stateful_partition/pkb_app_io'
   timeout = _STRESS_TIMEOUT_SEC.value
   meta = dict(base_meta, phase='io_interference')
+
+  # Relieve memory pressure via swap rather than the OOM killer (see helper).
+  # No-op on large-RAM nodes; prevents the config1 Phase 2b OOM (rc=137).
+  _set_memory_high_guard(pod)
 
   # Ensure fio is available — apt-get may have failed during DaemonSet init.
   _pod_exec(pod, textwrap.dedent("""
@@ -3152,20 +3289,40 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
     }
   """), ignore_failure=True, timeout=120)
 
-  # Create test file on the container filesystem (tmpfs or overlay).
-  # --direct=0 (buffered I/O) because /tmp is overlay/tmpfs and O_DIRECT
-  # is not supported on those filesystems — direct=1 returns EINVAL.
-  # Give generous timeout for large file creation.
+  # Reclaim node memory BEFORE creating the test file.  By this point Phase 2a
+  # has hard-swapped the node and Phase 3c's OpenSearch (which runs first) may
+  # have left a multi-GB JVM footprint; on a 30 GB node the file create then
+  # gets OOM-killed (rc=137) at the NODE level — which neither --direct=1 nor
+  # the cgroup memory.high guard can prevent (those are cgroup/page-cache
+  # tools, not node-eviction controls).  Kill any leftover stressors/servers,
+  # flush dirty pages, and drop caches so the node starts Phase 2b clean.
+  _pod_exec(pod, textwrap.dedent("""
+    pkill -9 stress-ng 2>/dev/null || true
+    pkill -9 -f 'opensearch|elasticsearch' 2>/dev/null || true
+    pkill -9 redis-server 2>/dev/null || true
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    sleep 2
+    echo "[pkb] pre-2b MemAvailable_kB=$(awk '/MemAvailable/{print $2}' /proc/meminfo) SwapFree_kB=$(awk '/SwapFree/{print $2}' /proc/meminfo)"
+  """), ignore_failure=True, timeout=60)
+
+  # Create the test file on the persistent disk (see app_file note above).
+  # --direct=1 (O_DIRECT, ext4 supports it) bypasses the page cache.  Size is
+  # kept at 4 GB (not 8) so the create + the concurrent background stressor
+  # cannot exhaust a 30 GB node even with swap already in use.
   _pod_exec(pod, (
       f'fio --name=create --filename={app_file} '
-      f'--rw=write --bs=1m --size=8G --verify=0 --direct=0'
+      f'--rw=write --bs=1m --size=4G --verify=0 --direct=1'
   ), timeout=600, ignore_failure=True)
 
   def _run_app_fio(pressure_label: str) -> list[sample.Sample]:
+    # --direct=1 (O_DIRECT) avoids page-cache buildup; ext4 on the persistent
+    # disk supports it.  --size=4G matches the file created above.  This
+    # measures the disk's I/O under swap pressure directly.
     cmd = (
         f'fio --name=app_io --filename={app_file} '
-        f'--ioengine=libaio --direct=0 '
-        f'--rw=randrw --bs=4k --iodepth=32 --size=8G --verify=0 '
+        f'--ioengine=libaio --direct=1 '
+        f'--rw=randrw --bs=4k --iodepth=32 --size=4G --verify=0 '
         f'--time_based --runtime=60s --output-format=json'
     )
     # ignore_failure=True: fio rc=137 is expected when the pod is OOM-evicted
@@ -3186,16 +3343,9 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # otherwise kubectl exec keeps the session alive until stress-ng finishes
   # (300 s) and PKB's IssueCommand times out.
   logging.info('[swap_encryption] I/O interference: under swap pressure')
-  # Use the runtime-detected vm-method (mmap preferred; write64 fallback).
-  _pod_exec(pod, textwrap.dedent(f"""
-    nohup stress-ng --vm 1 \\
-      --vm-bytes {_STRESS_VM_BYTES.value} \\
-      {_stress_vm_method_flag(pod)} \\
-      --timeout {timeout}s \\
-      >/tmp/pkb_stress_io.log 2>&1 &
-    disown
-    echo STRESS_STARTED
-  """), timeout=30)
+  # Confined background stressor: pages within a 60%-RAM cgroup so it can't
+  # OOM the concurrent app_io fio on a small node (see helper).
+  _launch_confined_bg_stress(pod, timeout, '/tmp/pkb_stress_io.log')
   time.sleep(10)  # let swap pressure build
   results += _run_app_fio('with_swap_pressure')
 
@@ -3205,6 +3355,7 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # the pod properly if needed (and it already waits for /tmp/pkb_ready).
   _pod_exec(pod, 'pkill -9 stress-ng 2>/dev/null || true',
             ignore_failure=True, _retries=0, timeout=15)
+  _reset_memory_high_guard(pod)
   return results
 
 
@@ -3222,6 +3373,10 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   """
   results = []
   meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
+
+  # Swap, don't OOM, when the dataset + background stressor exceed RAM.
+  # No-op on large-RAM nodes (config2).
+  _set_memory_high_guard(pod)
 
   # Start Redis and wait up to 30 s for it to accept connections.
   # `service redis-server start` fails inside a container (no init system)
@@ -3257,18 +3412,9 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
            f'redis-benchmark -n {n_keys} -d 128 -t SET -q >/dev/null 2>&1',
            ignore_failure=True, timeout=600)
 
-  # Apply swap pressure — detach so kubectl exec returns immediately.
-  # Use runtime-detected vm-method (mmap preferred; write64 fallback) to avoid
-  # --vm-method all cycling through 70+ methods that allocate kernel structures
-  # beyond --vm-bytes and OOM-kill the container.
-  _pod_exec(pod, textwrap.dedent(f"""
-    nohup stress-ng --vm 1 \\
-      --vm-bytes {_STRESS_VM_BYTES.value} \\
-      {_stress_vm_method_flag(pod)} --timeout 120s \\
-      >/tmp/pkb_stress_redis.log 2>&1 &
-    disown
-    echo STRESS_STARTED
-  """), timeout=30)
+  # Apply swap pressure with the confined stressor so it can't OOM Redis or
+  # the pod on a small node (pages within a 60%-RAM cgroup; see helper).
+  _launch_confined_bg_stress(pod, 120, '/tmp/pkb_stress_redis.log')
   time.sleep(8)
 
   # Run the latency workload.  Prefer memtier_benchmark (gives per-percentile
@@ -3302,6 +3448,7 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
     """), ignore_failure=True, timeout=120)
     results += _parse_redis_benchmark_csv(rb_out, meta)
 
+  _reset_memory_high_guard(pod)
   return results
 
 
