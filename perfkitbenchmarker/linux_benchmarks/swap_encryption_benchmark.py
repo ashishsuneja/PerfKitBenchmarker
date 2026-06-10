@@ -967,9 +967,19 @@ def Run(spec) -> list[sample.Sample]:
         f'the OOM killer (the container may have restarted in place), so the '
         f'affected phase(s) produced no or partial data')
   if _phase_selected('fio') and not tier1_results:
-    _degraded_reasons.append(
-        'Gate 1 (fio microbenchmarks) produced no samples — the raw swap '
-        'device was never characterised')
+    if swap_dev.startswith('/dev/loop'):
+      # Expected: COS blocks device-mapper from pod namespaces on single-disk
+      # nodes (n2/n4 without --swap_encryption_add_swap_disk or lssd).
+      # Tier 2/3 results are still valid; do NOT mark the run as degraded.
+      logging.warning(
+          '[swap_encryption] Gate 1 (fio) skipped — loop device %s has no '
+          'dm-crypt support from inside a pod.  Tier 2/3 results are valid. '
+          'Use c4-*-lssd or --swap_encryption_add_swap_disk for fio data.',
+          swap_dev)
+    else:
+      _degraded_reasons.append(
+          'Gate 1 (fio microbenchmarks) produced no samples — the raw swap '
+          'device was never characterised')
 
   degraded = bool(_degraded_reasons)
   results.append(sample.Sample(
@@ -1984,21 +1994,24 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
 
 
 def _setup_gke_loop_device_swap(pod: str) -> None:
-  """Plain loop-device swap for single-disk GKE COS nodes (dm-crypt unavailable).
+  """Plain loop-device swap for single-disk GKE nodes (no dedicated swap disk).
 
   Used when _setup_gke_hyperdisk_swap finds no dedicated second disk (e.g.
-  n4-highmem-8 / n4-highmem-32 single-boot-disk nodes).
+  n2-highmem-32 / n4-highmem-32 single-boot-disk nodes, regardless of image
+  type).
 
-  COS restriction: the device-mapper kernel subsystem is inaccessible from
-  inside a Kubernetes pod (even privileged) on Container-Optimised OS.
-  Calls to cryptsetup/dmsetup block indefinitely at the kernel level and are
-  eventually killed by the PKB timeout.  This is not a permissions issue — it
-  is a deliberate COS security restriction on dm operations from container
-  namespaces.  For dedicated block devices (hyperdisk, LSSD) nsenter into
-  the host mount namespace works around this (see _setup_gke_hyperdisk_swap).
-  The loop device path skips dm-crypt because the loop device itself is
-  created in the container namespace and its behaviour under nsenter is
-  untested; plain loop swap is used instead.
+  dm-crypt is skipped on this path for two reasons:
+  1. On COS (Container-Optimised OS): the device-mapper kernel subsystem is
+     inaccessible from inside a Kubernetes pod (even privileged).  Calls to
+     cryptsetup/dmsetup block indefinitely and are killed by the PKB timeout.
+     This is a deliberate COS security restriction, not a permissions issue.
+  2. On UBUNTU_CONTAINERD: the loop device is created in the container
+     namespace; its behaviour under nsenter (needed for dm-crypt on dedicated
+     disks) is untested, so plain loop swap is used for safety.
+  For dedicated block devices (hyperdisk, LSSD) nsenter into the host mount
+  namespace works around the COS restriction (see _setup_gke_hyperdisk_swap).
+  The loop device path skips dm-crypt on all image types; plain loop swap is
+  used instead.
 
   Therefore this path uses a plain loop device as swap without dm-crypt.
   Phase 1 (fio) is skipped for plain loop devices — the goal is enc-on vs
@@ -2061,7 +2074,7 @@ def _setup_gke_loop_device_swap(pod: str) -> None:
     )
   logging.info('[swap_encryption] GKE: loop device: %s  direct-io=on', loop_dev)
 
-  # ── Step 3: plain mkswap + swapon (dm-crypt unavailable on COS pods) ──────
+  # ── Step 3: plain mkswap + swapon (dm-crypt skipped on loop devices) ────────
   _pod_exec(pod, f'mkswap {loop_dev}')
   _pod_exec(pod, f'swapon {loop_dev}')
   logging.warning(
@@ -2601,23 +2614,23 @@ def _phase1_fio(
 ) -> list[sample.Sample]:
   """Run fio directly on the swap block device for raw I/O characterisation.
 
-  Skipped for plain loop devices (single-disk GKE COS node fallback):
-  COS blocks device-mapper from inside pods, so dm-crypt is unavailable on
-  single-disk nodes and the loop device is used as plain swap.  Running fio
-  on a plain loop device measures the backing filesystem (stateful_partition
-  ext4), not the swap stack, making results misleading for the enc comparison.
+  Skipped for plain loop devices (single-disk nodes without a dedicated swap
+  disk, regardless of image type):  fio on a loop-backed device measures the
+  underlying ext4 filesystem (stateful_partition), not the swap stack, making
+  results meaningless for an enc-on vs enc-off comparison.
 
   For dedicated second disks (hyperdisk, LSSD, NVMe) direct I/O is always
   used and swap is restored (mkswap + swapon) after the fio run.
-  To get fio results on GCP use c4-*-lssd (local NVMe, bypasses this path)
-  or provision a dedicated hyperdisk on a second disk slot.
+  To get fio results use c4-*-lssd (local NVMe) or
+  --swap_encryption_add_swap_disk to provision a dedicated second disk.
   """
   if swap_dev.startswith('/dev/loop'):
     logging.warning(
         '[swap_encryption] Phase 1 (fio) SKIPPED for plain loop device %s. '
-        'COS blocks device-mapper from pod namespaces so dm-crypt is '
-        'unavailable on single-disk nodes. '
-        'Use c4-*-lssd or attach a dedicated second disk for fio results.',
+        'fio on a loop-backed device measures the underlying ext4 filesystem '
+        '(stateful_partition), not the swap stack — results would be '
+        'meaningless for an enc-on vs enc-off comparison. '
+        'Use c4-*-lssd or --swap_encryption_add_swap_disk for fio data.',
         swap_dev,
     )
     return []
