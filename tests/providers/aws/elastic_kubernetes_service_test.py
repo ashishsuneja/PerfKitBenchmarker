@@ -563,6 +563,10 @@ class EksKarpenterTest(BaseEksTest):
 class EksManagementPlaneTest(BaseEksTest):
   """Tests for EKS management-plane methods (k8s_management_benchmark)."""
 
+  def setUp(self):
+    super().setUp()
+    self.enter_context(mock.patch('time.sleep'))
+
   def _make_cluster(self, spec_dict=None):
     spec = container_spec.ContainerClusterSpec(
         'NAME',
@@ -625,9 +629,12 @@ class EksManagementPlaneTest(BaseEksTest):
   def testUpgradeNodePoolAsyncReturnsNgActiveHandle(self):
     """UpgradeNodePoolAsync calls update-nodegroup-version; returns handle."""
     cluster = self._make_cluster()
-    mock_cmd = self.MockIssueCommand(
-        {'update-nodegroup-version': [('', '', 0)]}
-    )
+    # Also mock describe-subnets called by _DiscoverSubnetsPerAZ
+    subnets_out = json.dumps({'Subnets': []})
+    mock_cmd = self.MockIssueCommand({
+        'describe-subnets': [(subnets_out, '', 0)],
+        'update-nodegroup-version': [('', '', 0)],
+    })
     handle = cluster.UpgradeNodePoolAsync('my-ng', '1.34')
 
     self.assertEqual('ng_active:my-ng', handle)
