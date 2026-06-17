@@ -178,7 +178,7 @@ _STRESS_VM_WORKERS = flags.DEFINE_integer(
     'RAM (forcing swap).  Multiple workers are needed for fill speed — a '
     'single write64 worker cannot dirty enough memory within the timeout to '
     'reach RAM (run swap1: ~184 GB resident, no swap).  To stop the N '
-    'workers\' resident sets from collapsing to one worker\'s share, the '
+    "workers' resident sets from collapsing to one worker's share, the "
     'stressor uses random access (rand-set) and disables KSM page-merging '
     '(without those, identical write64 pages across workers were merged, '
     'leaving only ~vm_bytes/N resident and swap_out ~0).',
@@ -239,6 +239,20 @@ _COLLECT_COST = flags.DEFINE_boolean(
     'When True, emit a cost_estimate_usd sample using on-demand pricing '
     'for the instance type detected at runtime.',
 )
+_IO2_ENCRYPTED = flags.DEFINE_boolean(
+    'swap_encryption_io2_encrypted',
+    True,
+    'When True (default), the dedicated io2 swap volume is created with EBS '
+    'encryption (Nitro/KMS) -> matrix row "io2 + hardware encryption". '
+    'Set False for the unencrypted io2 baseline row. Only applies when '
+    '--swap_encryption_swap_type=io2 on AWS/EKS.',
+)
+_IO2_KMS_KEY_ID = flags.DEFINE_string(
+    'swap_encryption_io2_kms_key_id',
+    '',
+    'Optional KMS key id/ARN for the encrypted io2 volume. Empty = the '
+    'account default aws/ebs key. Ignored unless io2_encrypted is True.',
+)
 _FAIL_ON_DEGRADED = flags.DEFINE_boolean(
     'swap_encryption_fail_on_degraded',
     True,
@@ -265,13 +279,13 @@ _PHASES = flags.DEFINE_list(
 _MIN_SWAP_OUT_PAGES = flags.DEFINE_integer(
     'swap_encryption_min_swap_out_pages',
     1000,
-    'Minimum peak swap-out rate (pages/s) that Phase 2a must reach for the run '
-    'to count as a real swap-encryption measurement.  Below this the working '
-    'set never meaningfully paged (e.g. run swap1 peaked at 176 pages/s of '
-    'noise yet "passed" the old zero-only gate), so the dm-crypt overhead is '
-    'hollow and the run is flagged degraded.  A genuinely swapping run peaks in '
-    'the tens-to-hundreds of thousands of pages/s.  Set 0 to accept any '
-    'non-zero swap-out (legacy behaviour).',
+    'Minimum peak swap-out rate (pages/s) that Phase 2a must reach for the run'
+    ' to count as a real swap-encryption measurement.  Below this the working'
+    ' set never meaningfully paged (e.g. run swap1 peaked at 176 pages/s of'
+    ' noise yet "passed" the old zero-only gate), so the dm-crypt overhead is'
+    ' hollow and the run is flagged degraded.  A genuinely swapping run peaks'
+    ' in the tens-to-hundreds of thousands of pages/s.  Set 0 to accept any'
+    ' non-zero swap-out (legacy behaviour).',
 )
 
 # ---------------------------------------------------------------------------
@@ -381,7 +395,9 @@ _active_pod: list[str] = []  # single-element list so closures can mutate it
 # Cache for the stress-ng --vm-method string, detected once per pod at runtime.
 # Different GKE images ship different stress-ng versions: some support 'mmap',
 # others (e.g. Ubuntu on n4-highmem-32) don't.  We detect once and reuse.
-_stress_vm_method: list[str] = []  # single-element list; '' means no --vm-method flag
+_stress_vm_method: list[str] = (
+    []
+)  # single-element list; '' means no --vm-method flag
 # Human-readable reasons the current run is considered degraded.  Populated by
 # phases when they detect a fatal-but-swallowed condition (pod eviction, stress
 # OOM kill, empty critical data) and consumed by Run()'s final gate so a
@@ -420,6 +436,7 @@ _CRYPTO_PROCS = ('kswapd', 'kworker', 'kcryptd', 'dmcrypt_write')
 # ---------------------------------------------------------------------------
 # DaemonSet manifest (embedded YAML)
 # ---------------------------------------------------------------------------
+
 
 def _daemonset_yaml(image: str) -> str:
   """Return the privileged benchmark DaemonSet manifest as a YAML string.
@@ -702,6 +719,7 @@ OOM-killed before swap is exercised" >&2
 # PKB entry points
 # ---------------------------------------------------------------------------
 
+
 def GetConfig(user_config: dict[str, Any]) -> dict[str, Any]:
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
 
@@ -739,9 +757,24 @@ def Prepare(spec) -> None:
       logging.info('[swap_encryption] Step 2b2: attaching dedicated swap disk')
       _attach_swap_disk(cluster)
   else:
-    # AWS / unknown: nodepool management is done externally; log and continue.
-    logging.info('[swap_encryption] Non-GCP cluster — skipping nodepool '
-                 'create/delete steps; ensure a benchmark node is available.')
+    # AWS / EKS: nodepool management is external.  PKB's cluster creation
+    # labels nodes pkb_nodepool=default, so re-label all existing nodes here
+    # to match the DaemonSet nodeSelector (pkb_nodepool=benchmark).
+    logging.info(
+        '[swap_encryption] EKS cluster — labelling existing nodes with '
+        'pkb_nodepool=%s so the DaemonSet nodeSelector matches.',
+        _BENCHMARK_NODEPOOL,
+    )
+    kubectl.RunKubectlCommand([
+        'label',
+        'nodes',
+        '--all',
+        '--overwrite',
+        f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+    ])
+    # io2 test-matrix row: create + attach a real io2 EBS volume so swap runs
+    # on io2 hardware-encrypted storage (no-op unless swap_type=io2).
+    _ensure_io2_volume()
 
   # ── Step 2c: deploy DaemonSet ────────────────────────────────────────────
   # Deploy and wait for the pod BEFORE deleting the default nodepool.
@@ -762,8 +795,10 @@ def Prepare(spec) -> None:
     # the nodepool deletion (cluster control plane briefly interrupts pod
     # lifecycle).  Re-resolve the pod name to avoid stale-reference errors on
     # all subsequent _pod_exec calls.
-    logging.info('[swap_encryption] Step 2d: re-resolving benchmark pod '
-                 'after nodepool deletion')
+    logging.info(
+        '[swap_encryption] Step 2d: re-resolving benchmark pod '
+        'after nodepool deletion'
+    )
     pod = _wait_for_benchmark_pod()
     logging.info('[swap_encryption] Benchmark pod (post-deletion): %s', pod)
 
@@ -784,7 +819,9 @@ def Prepare(spec) -> None:
   # a swap device.  This blocks swap for the container regardless of
   # vm.swappiness.  Stress-ng gets OOM-killed in ~15s because the kernel can
   # page out for this cgroup.  Set 'max' so the container can use all swap.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     PKB_CG=$(awk -F: '/^0::/{print $3; exit}' /proc/self/cgroup 2>/dev/null)
     if [ -n "$PKB_CG" ] && [ -f "/sys/fs/cgroup${PKB_CG}/memory.swap.max" ]; then
       echo max > "/sys/fs/cgroup${PKB_CG}/memory.swap.max" 2>/dev/null || true
@@ -795,7 +832,9 @@ def Prepare(spec) -> None:
       echo -1 > "/sys/fs/cgroup/memory${PKB_CG1}/memory.memsw.limit_in_bytes" \
         2>/dev/null || true
     fi
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Enable zswap if requested
   if _ENABLE_ZSWAP.value:
@@ -872,19 +911,21 @@ def Run(spec) -> list[sample.Sample]:
   # the node is clean again for Tier 1/2.  Order in the results is unaffected
   # (samples carry their own phase labels).
   if _phase_selected('3c'):
-    logging.info('[swap_encryption] ── Phase OpenSearch (3c) — run first on '
-                 'clean node ──')
+    logging.info(
+        '[swap_encryption] ── Phase OpenSearch (3c) — run first on '
+        'clean node ──'
+    )
     try:
       results += _phase3c_opensearch(pod, base_meta)
     except Exception as e:  # pylint: disable=broad-except
-      logging.error('[swap_encryption] OpenSearch (3c) FAILED: %s — continuing',
-                    e)
+      logging.error(
+          '[swap_encryption] OpenSearch (3c) FAILED: %s — continuing', e
+      )
 
   # ── Tier 1 / Gate 1: fio microbenchmarks ─────────────────────────────────
   tier1_results = []
   if _phase_selected('fio'):
-    logging.info(
-        '[swap_encryption] ── Tier 1 / Gate 1: fio microbenchmarks ──')
+    logging.info('[swap_encryption] ── Tier 1 / Gate 1: fio microbenchmarks ──')
     try:
       tier1_results = _phase1_fio(pod, swap_dev, base_meta)
       results += tier1_results
@@ -894,12 +935,17 @@ def Run(spec) -> list[sample.Sample]:
       return results
 
     if not tier1_results:
-      logging.warning('[swap_encryption] Gate 1 produced no samples '
-                      '(loop-device skip or parse error) — '
-                      'continuing to Tier 2 with caution')
+      logging.warning(
+          '[swap_encryption] Gate 1 produced no samples '
+          '(loop-device skip or parse error) — '
+          'continuing to Tier 2 with caution'
+      )
   else:
-    logging.info('[swap_encryption] Skipping Tier 1 (fio) — not selected by '
-                 '--swap_encryption_phases=%s', ','.join(_PHASES.value))
+    logging.info(
+        '[swap_encryption] Skipping Tier 1 (fio) — not selected by '
+        '--swap_encryption_phases=%s',
+        ','.join(_PHASES.value),
+    )
 
   # ── Tier 2 / Gate 2: stress-ng CPU overhead + I/O interference ───────────
   if _phase_selected('2a') or _phase_selected('2b'):
@@ -912,17 +958,24 @@ def Run(spec) -> list[sample.Sample]:
         logging.info('[swap_encryption] Phase 2b: I/O interference')
         results += _phase2b_io_interference(pod, base_meta)
     except Exception as e:  # pylint: disable=broad-except
-      logging.error('[swap_encryption] Gate 2 FAILED — stress phase error: %s',
-                    e)
-      logging.warning('[swap_encryption] Proceeding to Tier 3 (workloads are '
-                      'independent of stress-ng results)')
+      logging.error(
+          '[swap_encryption] Gate 2 FAILED — stress phase error: %s', e
+      )
+      logging.warning(
+          '[swap_encryption] Proceeding to Tier 3 (workloads are '
+          'independent of stress-ng results)'
+      )
 
   # ── Tier 3 / Gate 3: real-world workloads ────────────────────────────────
   # NOTE: 3c (OpenSearch) is intentionally NOT here — it runs first, on a clean
   # node, before the swap phases saturate memory (see top of Run()).
   tier3 = [
       ('3a', 'Redis latency (3a)', lambda: _phase3a_redis(pod, base_meta)),
-      ('3b', 'Kernel build (3b)', lambda: _phase3b_kernel_build(pod, base_meta)),
+      (
+          '3b',
+          'Kernel build (3b)',
+          lambda: _phase3b_kernel_build(pod, base_meta),
+      ),
   ]
   if any(_phase_selected(tok) for tok, _, _ in tier3):
     logging.info('[swap_encryption] ── Tier 3 / Gate 3: workloads ──')
@@ -933,8 +986,12 @@ def Run(spec) -> list[sample.Sample]:
         logging.info('[swap_encryption] Phase %s', phase_name)
         results += phase_fn()
       except Exception as e:  # pylint: disable=broad-except
-        logging.error('[swap_encryption] %s FAILED: %s — continuing with '
-                      'remaining workloads', phase_name, e)
+        logging.error(
+            '[swap_encryption] %s FAILED: %s — continuing with '
+            'remaining workloads',
+            phase_name,
+            e,
+        )
 
   # ── Cost estimate ─────────────────────────────────────────────────────────
   if _COLLECT_COST.value:
@@ -949,23 +1006,26 @@ def Run(spec) -> list[sample.Sample]:
   # Detect those conditions here and surface them explicitly.
   if _active_pod and _active_pod[0] != original_pod:
     _degraded_reasons.append(
-        f'benchmark pod was replaced during the run '
+        'benchmark pod was replaced during the run '
         f'({original_pod} → {_active_pod[0]}) — it was OOM-evicted under swap '
-        f'pressure; phases executed after the eviction ran against a '
-        f'freshly-initialised pod (empty /tmp, swap re-setup) and may be '
-        f'invalid')
+        'pressure; phases executed after the eviction ran against a '
+        'freshly-initialised pod (empty /tmp, swap re-setup) and may be '
+        'invalid'
+    )
   if _pod_lost:
     _degraded_reasons.append(
-        f'benchmark pod(s) went NotFound during the run ({", ".join(_pod_lost)}) '
-        f'— the pod died (node memory-pressure eviction or container exit) and '
-        f'any phase running at or after that point (e.g. kernel-build baseline, '
-        f'OpenSearch) produced invalid data')
+        'benchmark pod(s) went NotFound during the run'
+        f' ({", ".join(_pod_lost)}) — the pod died (node memory-pressure'
+        ' eviction or container exit) and any phase running at or after that'
+        ' point (e.g. kernel-build baseline, OpenSearch) produced invalid data'
+    )
   if _oom_events:
     _degraded_reasons.append(
-        f'OOM kill(s) (rc=137) occurred during the run on pod(s) '
+        'OOM kill(s) (rc=137) occurred during the run on pod(s) '
         f'{", ".join(_oom_events)} — a phase exceeded memory and was killed by '
-        f'the OOM killer (the container may have restarted in place), so the '
-        f'affected phase(s) produced no or partial data')
+        'the OOM killer (the container may have restarted in place), so the '
+        'affected phase(s) produced no or partial data'
+    )
   if _phase_selected('fio') and not tier1_results:
     if swap_dev.startswith('/dev/loop'):
       # Expected: COS blocks device-mapper from pod namespaces on single-disk
@@ -975,25 +1035,31 @@ def Run(spec) -> list[sample.Sample]:
           '[swap_encryption] Gate 1 (fio) skipped — loop device %s has no '
           'dm-crypt support from inside a pod.  Tier 2/3 results are valid. '
           'Use c4-*-lssd or --swap_encryption_add_swap_disk for fio data.',
-          swap_dev)
+          swap_dev,
+      )
     else:
       _degraded_reasons.append(
           'Gate 1 (fio microbenchmarks) produced no samples — the raw swap '
-          'device was never characterised')
+          'device was never characterised'
+      )
 
   degraded = bool(_degraded_reasons)
-  results.append(sample.Sample(
-      'swap_encryption_run_status',
-      0.0 if degraded else 1.0,
-      'status',
-      dict(base_meta,
-           degraded=degraded,
-           degraded_reasons='; '.join(_degraded_reasons) or 'none',
-           num_samples=len(results) + 1)))
+  results.append(
+      sample.Sample(
+          'swap_encryption_run_status',
+          0.0 if degraded else 1.0,
+          'status',
+          dict(
+              base_meta,
+              degraded=degraded,
+              degraded_reasons='; '.join(_degraded_reasons) or 'none',
+              num_samples=len(results) + 1,
+          ),
+      )
+  )
 
   if degraded:
-    msg = ('[swap_encryption] RUN DEGRADED — '
-           + '; '.join(_degraded_reasons))
+    msg = '[swap_encryption] RUN DEGRADED — ' + '; '.join(_degraded_reasons)
     logging.error(msg)
     if _FAIL_ON_DEGRADED.value:
       # Raise so PKB marks the benchmark FAILED instead of SUCCEEDED.  The
@@ -1001,8 +1067,9 @@ def Run(spec) -> list[sample.Sample]:
       # is recorded, so no data is lost.
       raise errors.Benchmarks.RunError(msg)
   else:
-    logging.info('[swap_encryption] Run completed cleanly (%d samples)',
-                 len(results))
+    logging.info(
+        '[swap_encryption] Run completed cleanly (%d samples)', len(results)
+    )
 
   return results
 
@@ -1012,12 +1079,18 @@ def Cleanup(spec) -> None:
   pod = _wait_for_benchmark_pod(timeout=30)
   if pod:
     _pod_exec(pod, 'swapoff -a 2>/dev/null || true', ignore_failure=True)
-    _pod_exec(pod, textwrap.dedent("""
+    _pod_exec(
+        pod,
+        textwrap.dedent("""
       swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
       dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
-    """), ignore_failure=True)
+    """),
+        ignore_failure=True,
+    )
     # Clean up loop device backing files (single-disk fallback path).
-    _pod_exec(pod, textwrap.dedent("""
+    _pod_exec(
+        pod,
+        textwrap.dedent("""
       for backing in /var/pkb_swap_backing /run/pkb_swap_backing \
                      /mnt/stateful_partition/pkb_swap_backing
       do
@@ -1028,9 +1101,12 @@ def Cleanup(spec) -> None:
           done
         rm -f "$backing"
       done
-    """), ignore_failure=True)
-    _pod_exec(pod, "pkill -9 'stress-ng|fio' 2>/dev/null || true",
-             ignore_failure=True)
+    """),
+        ignore_failure=True,
+    )
+    _pod_exec(
+        pod, "pkill -9 'stress-ng|fio' 2>/dev/null || true", ignore_failure=True
+    )
 
   _delete_daemonset()
 
@@ -1043,6 +1119,7 @@ def Cleanup(spec) -> None:
 # ---------------------------------------------------------------------------
 # DaemonSet lifecycle helpers
 # ---------------------------------------------------------------------------
+
 
 def _deploy_daemonset() -> None:
   """Apply the benchmark DaemonSet manifest to the cluster."""
@@ -1067,18 +1144,27 @@ def _wait_for_benchmark_pod(timeout: int = 900) -> str | None:
   """
   deadline = time.time() + timeout
   last_phase = ''
-  ready_pod  = None   # pod name once phase == Running
+  ready_pod = None  # pod name once phase == Running
 
   while time.time() < deadline:
     # ── Step 1: wait for Running phase ──────────────────────────────────────
     if ready_pod is None:
-      out, _, rc = kubectl.RunKubectlCommand([
-          'get', 'pods',
-          '-l', f'app={_DS_LABEL}',
-          '-n', _DS_NAMESPACE,
-          '-o',
-          r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}',
-      ], raise_on_failure=False)
+      out, _, rc = kubectl.RunKubectlCommand(
+          [
+              'get',
+              'pods',
+              '-l',
+              f'app={_DS_LABEL}',
+              '-n',
+              _DS_NAMESPACE,
+              '-o',
+              (
+                  r'jsonpath={range'
+                  r' .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}'
+              ),
+          ],
+          raise_on_failure=False,
+      )
 
       if rc == 0 and out.strip():
         for line in out.strip().splitlines():
@@ -1086,12 +1172,17 @@ def _wait_for_benchmark_pod(timeout: int = 900) -> str | None:
           if len(parts) == 2:
             pod_name, phase = parts[0].strip(), parts[1].strip()
             if phase == 'Running':
-              logging.info('[swap_encryption] Pod %s is Running – '
-                           'waiting for tool install to finish...', pod_name)
+              logging.info(
+                  '[swap_encryption] Pod %s is Running – '
+                  'waiting for tool install to finish...',
+                  pod_name,
+              )
               ready_pod = pod_name
               break
             if phase != last_phase:
-              logging.info('[swap_encryption] Pod %s phase: %s', pod_name, phase)
+              logging.info(
+                  '[swap_encryption] Pod %s phase: %s', pod_name, phase
+              )
               last_phase = phase
               if phase in ('Pending',):
                 _log_pod_events(pod_name)
@@ -1100,39 +1191,63 @@ def _wait_for_benchmark_pod(timeout: int = 900) -> str | None:
 
     # ── Step 2: poll for /tmp/pkb_ready sentinel ────────────────────────────
     if ready_pod is not None:
-      sentinel_out, sentinel_err, sentinel_rc = kubectl.RunKubectlCommand([
-          'exec', ready_pod, '-n', _DS_NAMESPACE,
-          '--', 'test', '-f', '/tmp/pkb_ready',
-      ], raise_on_failure=False)
+      sentinel_out, sentinel_err, sentinel_rc = kubectl.RunKubectlCommand(
+          [
+              'exec',
+              ready_pod,
+              '-n',
+              _DS_NAMESPACE,
+              '--',
+              'test',
+              '-f',
+              '/tmp/pkb_ready',
+          ],
+          raise_on_failure=False,
+      )
       if sentinel_rc == 0:
         logging.info(
-            '[swap_encryption] Pod %s ready (tools installed)', ready_pod)
+            '[swap_encryption] Pod %s ready (tools installed)', ready_pod
+        )
         return ready_pod
       # "container not found" means the container crashed (CrashLoopBackOff or
       # exited) — treat it as a hard reset: re-check pod phase on next iteration.
-      if ('container not found' in sentinel_err
-          or 'unable to upgrade connection' in sentinel_err):
-        logging.warning('[swap_encryption] Pod %s: container not running (%s) '
-                        '— will re-check pod state', ready_pod, sentinel_err.strip())
+      if (
+          'container not found' in sentinel_err
+          or 'unable to upgrade connection' in sentinel_err
+      ):
+        logging.warning(
+            '[swap_encryption] Pod %s: container not running (%s) '
+            '— will re-check pod state',
+            ready_pod,
+            sentinel_err.strip(),
+        )
         ready_pod = None
         last_phase = ''
       else:
         logging.info(
-            '[swap_encryption] Pod %s: still installing tools...', ready_pod)
+            '[swap_encryption] Pod %s: still installing tools...', ready_pod
+        )
 
     time.sleep(15)
 
   logging.warning(
-      '[swap_encryption] Benchmark pod not ready after %ds', timeout)
+      '[swap_encryption] Benchmark pod not ready after %ds', timeout
+  )
   return None
 
 
 def _log_pod_events(pod_name: str) -> None:
   """Dump recent Kubernetes events for the pod to help diagnose startup hangs."""
-  events_out, _, _ = kubectl.RunKubectlCommand([
-      'describe', 'pod', pod_name,
-      '-n', _DS_NAMESPACE,
-  ], raise_on_failure=False)
+  events_out, _, _ = kubectl.RunKubectlCommand(
+      [
+          'describe',
+          'pod',
+          pod_name,
+          '-n',
+          _DS_NAMESPACE,
+      ],
+      raise_on_failure=False,
+  )
   # Only log the Events section to keep output manageable
   in_events = False
   lines = []
@@ -1144,23 +1259,32 @@ def _log_pod_events(pod_name: str) -> None:
   if lines:
     logging.info('[swap_encryption] Pod events:\n%s', '\n'.join(lines[:30]))
   else:
-    logging.info('[swap_encryption] kubectl describe output:\n%s',
-                 events_out[-2000:] if len(events_out) > 2000 else events_out)
+    logging.info(
+        '[swap_encryption] kubectl describe output:\n%s',
+        events_out[-2000:] if len(events_out) > 2000 else events_out,
+    )
 
 
 def _delete_daemonset() -> None:
   """Delete the benchmark DaemonSet."""
-  kubectl.RunKubectlCommand([
-      'delete', 'daemonset', _DS_NAME,
-      '-n', _DS_NAMESPACE,
-      '--ignore-not-found',
-  ], raise_on_failure=False)
+  kubectl.RunKubectlCommand(
+      [
+          'delete',
+          'daemonset',
+          _DS_NAME,
+          '-n',
+          _DS_NAMESPACE,
+          '--ignore-not-found',
+      ],
+      raise_on_failure=False,
+  )
   logging.info('[swap_encryption] DaemonSet deleted')
 
 
 # ---------------------------------------------------------------------------
 # Two-step GKE nodepool helpers
 # ---------------------------------------------------------------------------
+
 
 def _build_node_startup_script(enable_dmcrypt: bool, lssd: bool) -> str:
   """Return a bash startup script for the benchmark nodepool.
@@ -1247,7 +1371,9 @@ def _build_node_startup_script(enable_dmcrypt: bool, lssd: bool) -> str:
   """)
 
 
-_HYPERDISK_MAX_IOPS_PER_MBPS = 256  # GCP Hyperdisk Balanced: IOPS <= 256 x MiB/s
+_HYPERDISK_MAX_IOPS_PER_MBPS = (
+    256  # GCP Hyperdisk Balanced: IOPS <= 256 x MiB/s
+)
 
 
 def _valid_hyperdisk_throughput(iops: int, throughput: int) -> int:
@@ -1265,7 +1391,11 @@ def _valid_hyperdisk_throughput(iops: int, throughput: int) -> int:
     logging.warning(
         '[swap_encryption] boot/swap disk throughput %d MiB/s is too low for '
         '%d IOPS (Hyperdisk needs >= ceil(iops/256) = %d MiB/s); raising to %d',
-        throughput, iops, min_tput, min_tput)
+        throughput,
+        iops,
+        min_tput,
+        min_tput,
+    )
     return min_tput
   return throughput
 
@@ -1305,15 +1435,27 @@ def _create_benchmark_node_pool(cluster) -> None:
 
   disk_type = _BOOT_DISK_TYPE.value
   cmd = [
-      'gcloud', 'container', 'node-pools', 'create', _BENCHMARK_NODEPOOL,
-      '--cluster',      cluster.name,
-      '--project',      cluster.project,
-      '--machine-type', machine_type,
-      '--image-type',   _NODE_IMAGE_TYPE.value,
-      '--disk-type',    disk_type,
-      '--disk-size',    str(disk_size_gb),
-      '--num-nodes',    '1',
-      '--node-labels',  f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+      'gcloud',
+      'container',
+      'node-pools',
+      'create',
+      _BENCHMARK_NODEPOOL,
+      '--cluster',
+      cluster.name,
+      '--project',
+      cluster.project,
+      '--machine-type',
+      machine_type,
+      '--image-type',
+      _NODE_IMAGE_TYPE.value,
+      '--disk-type',
+      disk_type,
+      '--disk-size',
+      str(disk_size_gb),
+      '--num-nodes',
+      '1',
+      '--node-labels',
+      f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
       '--no-enable-autoupgrade',
       '--no-enable-autorepair',
   ] + zone_flags
@@ -1325,10 +1467,14 @@ def _create_benchmark_node_pool(cluster) -> None:
   # hyperdisk-balanced per-GiB cap (80 IOPS/GiB × 100 GiB = 8 000 max).
   if disk_type.startswith('hyperdisk') and not is_lssd:
     cmd += [
-        '--boot-disk-provisioned-iops', str(_BOOT_DISK_IOPS.value),
+        '--boot-disk-provisioned-iops',
+        str(_BOOT_DISK_IOPS.value),
         '--boot-disk-provisioned-throughput',
-        str(_valid_hyperdisk_throughput(_BOOT_DISK_IOPS.value,
-                                        _BOOT_DISK_THROUGHPUT.value)),
+        str(
+            _valid_hyperdisk_throughput(
+                _BOOT_DISK_IOPS.value, _BOOT_DISK_THROUGHPUT.value
+            )
+        ),
     ]
 
   # For LSSD machines, expose local NVMe as raw block devices so fio/mdadm
@@ -1336,18 +1482,26 @@ def _create_benchmark_node_pool(cluster) -> None:
   if is_lssd:
     cmd += ['--local-nvme-ssd-block', f'count={_LSSD_COUNT.value}']
 
-  logging.info('[swap_encryption] Creating benchmark nodepool: %s / %s / '
-               'image=%s / disk=%dGiB / iops=%d / dmcrypt=%s / lssd=%s / '
-               'add_swap_disk=%s',
-               _BENCHMARK_NODEPOOL, machine_type, _NODE_IMAGE_TYPE.value,
-               disk_size_gb, _BOOT_DISK_IOPS.value,
-               _ENABLE_DMCRYPT.value, is_lssd, _ADD_SWAP_DISK.value)
+  logging.info(
+      '[swap_encryption] Creating benchmark nodepool: %s / %s / '
+      'image=%s / disk=%dGiB / iops=%d / dmcrypt=%s / lssd=%s / '
+      'add_swap_disk=%s',
+      _BENCHMARK_NODEPOOL,
+      machine_type,
+      _NODE_IMAGE_TYPE.value,
+      disk_size_gb,
+      _BOOT_DISK_IOPS.value,
+      _ENABLE_DMCRYPT.value,
+      is_lssd,
+      _ADD_SWAP_DISK.value,
+  )
 
   # LSSD nodepools take longer to provision than PD-only nodepools because
   # GKE must also initialise the local NVMe devices before marking nodes Ready.
   # 1200 s (20 min) covers observed worst-case times on c4-lssd and n4 configs.
-  stdout, stderr, rc = vm_util.IssueCommand(cmd, timeout=1200,
-                                            raise_on_failure=False)
+  stdout, stderr, rc = vm_util.IssueCommand(
+      cmd, timeout=1200, raise_on_failure=False
+  )
 
   if rc != 0:
     # Idempotent prepare: if the nodepool already exists (e.g. re-running
@@ -1356,11 +1510,13 @@ def _create_benchmark_node_pool(cluster) -> None:
     # "Already exists" message in this case.
     low = (stderr or '').lower()
     if 'already exists' in low or 'alreadyexists' in low or 'code=409' in low:
-      logging.info('[swap_encryption] Benchmark nodepool already exists — '
-                   'reusing it (idempotent prepare); proceeding to DaemonSet')
+      logging.info(
+          '[swap_encryption] Benchmark nodepool already exists — '
+          'reusing it (idempotent prepare); proceeding to DaemonSet'
+      )
       return
     raise errors.Benchmarks.RunError(
-        f'[swap_encryption] Failed to create benchmark nodepool '
+        '[swap_encryption] Failed to create benchmark nodepool '
         f'(rc={rc}): {stderr}'
     )
   logging.info('[swap_encryption] Benchmark nodepool ready')
@@ -1379,28 +1535,38 @@ def _wait_for_benchmark_node(timeout: int = 900) -> None:
   pkb_nodepool=benchmark has Ready=True, then returns.
   """
   deadline = time.time() + timeout
-  logging.info('[swap_encryption] Waiting for benchmark node '
-               '(pkb_nodepool=benchmark) to be Ready...')
+  logging.info(
+      '[swap_encryption] Waiting for benchmark node '
+      '(pkb_nodepool=benchmark) to be Ready...'
+  )
   while time.time() < deadline:
-    out, _, rc = kubectl.RunKubectlCommand([
-        'get', 'nodes',
-        '-l', f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
-        '-o', r'jsonpath={range .items[*]}'
-               r'{.metadata.name}{"\t"}'
-               r'{range .status.conditions[?(@.type=="Ready")]}'
-               r'{.status}{"\n"}{end}{end}',
-    ], raise_on_failure=False)
+    out, _, rc = kubectl.RunKubectlCommand(
+        [
+            'get',
+            'nodes',
+            '-l',
+            f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+            '-o',
+            r'jsonpath={range .items[*]}'
+            r'{.metadata.name}{"\t"}'
+            r'{range .status.conditions[?(@.type=="Ready")]}'
+            r'{.status}{"\n"}{end}{end}',
+        ],
+        raise_on_failure=False,
+    )
 
     if rc == 0 and out.strip():
       for line in out.strip().splitlines():
         parts = line.split('\t')
         if len(parts) == 2 and parts[1].strip() == 'True':
-          logging.info('[swap_encryption] Benchmark node ready: %s',
-                       parts[0].strip())
+          logging.info(
+              '[swap_encryption] Benchmark node ready: %s', parts[0].strip()
+          )
           return
 
-    logging.info('[swap_encryption] Benchmark node not yet Ready — '
-                 'retrying in 15 s...')
+    logging.info(
+        '[swap_encryption] Benchmark node not yet Ready — retrying in 15 s...'
+    )
     time.sleep(15)
 
   raise errors.Benchmarks.RunError(
@@ -1432,7 +1598,8 @@ def _attach_swap_disk(cluster) -> None:
     zone = cluster.region
   if not zone:
     raise errors.Benchmarks.RunError(
-        '[swap_encryption] Cannot attach swap disk: cluster zone unknown')
+        '[swap_encryption] Cannot attach swap disk: cluster zone unknown'
+    )
 
   project = cluster.project
   disk_name = f'pkb-swap-{cluster.name}'
@@ -1440,60 +1607,97 @@ def _attach_swap_disk(cluster) -> None:
   disk_size_gb = _SWAP_DISK_SIZE_GB.value
 
   # ── Step 1: get the GCE instance name of the benchmark node ───────────────
-  node_out, _, rc = kubectl.RunKubectlCommand([
-      'get', 'nodes',
-      '-l', f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
-      '-o', 'jsonpath={.items[0].metadata.name}',
-  ], raise_on_failure=False)
+  node_out, _, rc = kubectl.RunKubectlCommand(
+      [
+          'get',
+          'nodes',
+          '-l',
+          f'pkb_nodepool={_BENCHMARK_NODEPOOL}',
+          '-o',
+          'jsonpath={.items[0].metadata.name}',
+      ],
+      raise_on_failure=False,
+  )
   instance_name = node_out.strip()
   if rc != 0 or not instance_name:
     raise errors.Benchmarks.RunError(
-        '[swap_encryption] Cannot find benchmark node for swap disk attach')
+        '[swap_encryption] Cannot find benchmark node for swap disk attach'
+    )
   logging.info('[swap_encryption] Benchmark node instance: %s', instance_name)
 
   # ── Step 2: create the hyperdisk ──────────────────────────────────────────
-  logging.info('[swap_encryption] Creating swap disk %s (%dGiB %s)',
-               disk_name, disk_size_gb, disk_type)
+  logging.info(
+      '[swap_encryption] Creating swap disk %s (%dGiB %s)',
+      disk_name,
+      disk_size_gb,
+      disk_type,
+  )
   create_cmd = [
-      'gcloud', 'compute', 'disks', 'create', disk_name,
-      '--project', project,
-      '--zone', zone,
-      '--type', disk_type,
-      '--size', f'{disk_size_gb}GB',
+      'gcloud',
+      'compute',
+      'disks',
+      'create',
+      disk_name,
+      '--project',
+      project,
+      '--zone',
+      zone,
+      '--type',
+      disk_type,
+      '--size',
+      f'{disk_size_gb}GB',
       '--quiet',
   ]
   if disk_type.startswith('hyperdisk'):
     create_cmd += [
-        '--provisioned-iops', str(_BOOT_DISK_IOPS.value),
+        '--provisioned-iops',
+        str(_BOOT_DISK_IOPS.value),
         '--provisioned-throughput',
-        str(_valid_hyperdisk_throughput(_BOOT_DISK_IOPS.value,
-                                        _BOOT_DISK_THROUGHPUT.value)),
+        str(
+            _valid_hyperdisk_throughput(
+                _BOOT_DISK_IOPS.value, _BOOT_DISK_THROUGHPUT.value
+            )
+        ),
     ]
-  _, stderr, rc = vm_util.IssueCommand(create_cmd, timeout=120,
-                                       raise_on_failure=False)
+  _, stderr, rc = vm_util.IssueCommand(
+      create_cmd, timeout=120, raise_on_failure=False
+  )
   if rc != 0:
     raise errors.Benchmarks.RunError(
-        f'[swap_encryption] Failed to create swap disk {disk_name}: {stderr}')
+        f'[swap_encryption] Failed to create swap disk {disk_name}: {stderr}'
+    )
 
   # ── Step 3: attach the disk to the node VM ────────────────────────────────
-  logging.info('[swap_encryption] Attaching swap disk %s to %s',
-               disk_name, instance_name)
+  logging.info(
+      '[swap_encryption] Attaching swap disk %s to %s', disk_name, instance_name
+  )
   attach_cmd = [
-      'gcloud', 'compute', 'instances', 'attach-disk', instance_name,
-      '--project', project,
-      '--zone', zone,
-      '--disk', disk_name,
-      '--device-name', 'pkb-swap',
+      'gcloud',
+      'compute',
+      'instances',
+      'attach-disk',
+      instance_name,
+      '--project',
+      project,
+      '--zone',
+      zone,
+      '--disk',
+      disk_name,
+      '--device-name',
+      'pkb-swap',
       '--quiet',
   ]
-  _, stderr, rc = vm_util.IssueCommand(attach_cmd, timeout=120,
-                                       raise_on_failure=False)
+  _, stderr, rc = vm_util.IssueCommand(
+      attach_cmd, timeout=120, raise_on_failure=False
+  )
   if rc != 0:
     raise errors.Benchmarks.RunError(
         f'[swap_encryption] Failed to attach swap disk to {instance_name}: '
-        f'{stderr}')
-  logging.info('[swap_encryption] Swap disk attached: %s → %s',
-               disk_name, instance_name)
+        f'{stderr}'
+    )
+  logging.info(
+      '[swap_encryption] Swap disk attached: %s → %s', disk_name, instance_name
+  )
 
 
 def _delete_disk_by_name(disk_name: str, project: str, zone: str) -> bool:
@@ -1506,35 +1710,85 @@ def _delete_disk_by_name(disk_name: str, project: str, zone: str) -> bool:
   """
   for attempt in range(1, 5):
     users, _, rc = vm_util.IssueCommand(
-        ['gcloud', 'compute', 'disks', 'describe', disk_name,
-         '--project', project, '--zone', zone, '--format=value(users)'],
-        timeout=60, raise_on_failure=False)
+        [
+            'gcloud',
+            'compute',
+            'disks',
+            'describe',
+            disk_name,
+            '--project',
+            project,
+            '--zone',
+            zone,
+            '--format=value(users)',
+        ],
+        timeout=60,
+        raise_on_failure=False,
+    )
     if rc != 0:
-      logging.info('[swap_encryption] Swap disk %s not present — nothing to '
-                   'delete', disk_name)
+      logging.info(
+          '[swap_encryption] Swap disk %s not present — nothing to delete',
+          disk_name,
+      )
       return True  # already gone
     user = users.strip()
     if user:
       inst = user.split('/')[-1]
-      logging.info('[swap_encryption] Detaching swap disk %s from %s',
-                   disk_name, inst)
+      logging.info(
+          '[swap_encryption] Detaching swap disk %s from %s', disk_name, inst
+      )
       vm_util.IssueCommand(
-          ['gcloud', 'compute', 'instances', 'detach-disk', inst,
-           '--project', project, '--zone', zone, '--disk', disk_name,
-           '--quiet'], timeout=120, raise_on_failure=False)
+          [
+              'gcloud',
+              'compute',
+              'instances',
+              'detach-disk',
+              inst,
+              '--project',
+              project,
+              '--zone',
+              zone,
+              '--disk',
+              disk_name,
+              '--quiet',
+          ],
+          timeout=120,
+          raise_on_failure=False,
+      )
     _, derr, drc = vm_util.IssueCommand(
-        ['gcloud', 'compute', 'disks', 'delete', disk_name,
-         '--project', project, '--zone', zone, '--quiet'],
-        timeout=180, raise_on_failure=False)
+        [
+            'gcloud',
+            'compute',
+            'disks',
+            'delete',
+            disk_name,
+            '--project',
+            project,
+            '--zone',
+            zone,
+            '--quiet',
+        ],
+        timeout=180,
+        raise_on_failure=False,
+    )
     if drc == 0:
       logging.info('[swap_encryption] Swap disk deleted: %s', disk_name)
       return True
-    logging.warning('[swap_encryption] Swap disk delete attempt %d/4 failed '
-                    '(%s); retrying in 10s', attempt, derr.strip()[:160])
+    logging.warning(
+        '[swap_encryption] Swap disk delete attempt %d/4 failed '
+        '(%s); retrying in 10s',
+        attempt,
+        derr.strip()[:160],
+    )
     time.sleep(10)
-  logging.error('[swap_encryption] Could NOT delete swap disk %s after retries '
-                '— delete it manually: gcloud compute disks delete %s '
-                '--zone %s --quiet', disk_name, disk_name, zone)
+  logging.error(
+      '[swap_encryption] Could NOT delete swap disk %s after retries '
+      '— delete it manually: gcloud compute disks delete %s '
+      '--zone %s --quiet',
+      disk_name,
+      disk_name,
+      zone,
+  )
   return False
 
 
@@ -1564,19 +1818,30 @@ def _delete_default_node_pool(cluster) -> None:
     zone_flags = ['--region', cluster.region]
 
   cmd = [
-      'gcloud', 'container', 'node-pools', 'delete', _DEFAULT_NODEPOOL,
-      '--cluster', cluster.name,
-      '--project', cluster.project,
+      'gcloud',
+      'container',
+      'node-pools',
+      'delete',
+      _DEFAULT_NODEPOOL,
+      '--cluster',
+      cluster.name,
+      '--project',
+      cluster.project,
       '--quiet',
   ] + zone_flags
 
   logging.info(
-      '[swap_encryption] Deleting default nodepool: %s', _DEFAULT_NODEPOOL)
-  stdout, stderr, rc = vm_util.IssueCommand(cmd, timeout=300,
-                                            raise_on_failure=False)
+      '[swap_encryption] Deleting default nodepool: %s', _DEFAULT_NODEPOOL
+  )
+  stdout, stderr, rc = vm_util.IssueCommand(
+      cmd, timeout=300, raise_on_failure=False
+  )
   if rc != 0:
-    logging.warning('[swap_encryption] Could not delete default nodepool '
-                    '(rc=%d): %s', rc, stderr)
+    logging.warning(
+        '[swap_encryption] Could not delete default nodepool (rc=%d): %s',
+        rc,
+        stderr,
+    )
   else:
     logging.info('[swap_encryption] Default nodepool deleted')
 
@@ -1584,6 +1849,7 @@ def _delete_default_node_pool(cluster) -> None:
 # ---------------------------------------------------------------------------
 # Pod exec wrapper
 # ---------------------------------------------------------------------------
+
 
 def _is_pod_gone(pod: str) -> bool:
   """Return True if the named pod no longer exists in the cluster.
@@ -1593,9 +1859,17 @@ def _is_pod_gone(pod: str) -> bool:
   """
   try:
     _, err, rc = kubectl.RunKubectlCommand(
-        ['get', 'pod', pod, '-n', _DS_NAMESPACE,
-         '-o', 'jsonpath={.metadata.name}'],
-        raise_on_failure=False, timeout=15,
+        [
+            'get',
+            'pod',
+            pod,
+            '-n',
+            _DS_NAMESPACE,
+            '-o',
+            'jsonpath={.metadata.name}',
+        ],
+        raise_on_failure=False,
+        timeout=15,
     )
     return rc != 0 and 'not found' in (err or '').lower()
   except Exception:  # pylint: disable=broad-except
@@ -1633,17 +1907,20 @@ def _pod_exec(
   # new name (e.g. after OOM-triggered node pressure eviction).
   # 'deleted state' covers "cannot exec in a deleted state" — the container
   # was OOM-killed and is mid-termination (not yet recreated).
-  _CONTAINER_GONE_ERRORS = ('container not found', 'procReady not received',
-                             'unable to upgrade connection', 'not found',
-                             'deleted state')
+  _CONTAINER_GONE_ERRORS = (
+      'container not found',
+      'procReady not received',
+      'unable to upgrade connection',
+      'not found',
+      'deleted state',
+  )
   # Use the globally-tracked active pod name — it may have been updated by
   # a previous _recover_pod call when eviction replaced the pod.
   active = _active_pod[0] if _active_pod else pod
 
   for attempt in range(_retries + 1):
     out, err, rc = kubectl.RunKubectlCommand(
-        ['exec', active, '-n', _DS_NAMESPACE,
-         '--', 'bash', '-c', cmd],
+        ['exec', active, '-n', _DS_NAMESPACE, '--', 'bash', '-c', cmd],
         raise_on_failure=False,
         raise_on_timeout=False,  # let _pod_exec's own retry loop handle transient resets
         timeout=timeout,
@@ -1652,7 +1929,10 @@ def _pod_exec(
     if is_transient and attempt < _retries:
       logging.warning(
           '[swap_encryption] kubectl exec connection reset (attempt %d/%d); '
-          'retrying in 10 s', attempt + 1, _retries + 1)
+          'retrying in 10 s',
+          attempt + 1,
+          _retries + 1,
+      )
       time.sleep(10)
       continue
     # rc=137 (SIGKILL): the OOM killer terminated the container process.
@@ -1676,27 +1956,35 @@ def _pod_exec(
       # "Error from server (NotFound): pods … not found".
       logging.warning(
           '[swap_encryption] rc=137 — sleeping 15s for Kubernetes to update '
-          'pod state before recovery check')
+          'pod state before recovery check'
+      )
       time.sleep(15)
       pod_gone = _is_pod_gone(active)
       if pod_gone:
         logging.warning(
-            '[swap_encryption] OOM-eviction detected (rc=137, pod gone) — '
-            'recovering pod name for subsequent commands (not retrying this cmd)')
+            '[swap_encryption] OOM-eviction detected (rc=137, pod gone) —'
+            ' recovering pod name for subsequent commands (not retrying this'
+            ' cmd)'
+        )
       else:
         logging.warning(
-            '[swap_encryption] Container OOM-killed (rc=137, pod still exists) — '
-            'waiting for container restart and tool re-install before continuing')
+            '[swap_encryption] Container OOM-killed (rc=137, pod still exists)'
+            ' — waiting for container restart and tool re-install before'
+            ' continuing'
+        )
       new_pod = _recover_pod(active)
       if new_pod != active:
-        logging.info('[swap_encryption] Pod name updated: %s → %s', active, new_pod)
+        logging.info(
+            '[swap_encryption] Pod name updated: %s → %s', active, new_pod
+        )
         if _active_pod:
           _active_pod[0] = new_pod
         active = new_pod
       break  # Do NOT retry — the OOM cmd itself is not re-run on the new pod.
 
-    is_container_gone = (rc != 0 and
-                         any(e in err.lower() for e in _CONTAINER_GONE_ERRORS))
+    is_container_gone = rc != 0 and any(
+        e in err.lower() for e in _CONTAINER_GONE_ERRORS
+    )
     if is_container_gone:
       # Record the loss for the run-level degradation gate REGARDLESS of retry
       # budget or ignore_failure.  A "pods … not found" on a best-effort command
@@ -1707,14 +1995,22 @@ def _pod_exec(
         _pod_lost.append(active)
         logging.error(
             '[swap_encryption] Benchmark pod %s is gone (%s) — recording run '
-            'as degraded', active, (err or '').strip()[:160])
+            'as degraded',
+            active,
+            (err or '').strip()[:160],
+        )
       if attempt < _retries:
         logging.warning(
             '[swap_encryption] Container gone/restarting (attempt %d/%d) — '
-            'waiting for pod to recover...', attempt + 1, _retries + 1)
+            'waiting for pod to recover...',
+            attempt + 1,
+            _retries + 1,
+        )
         new_pod = _recover_pod(active)
         if new_pod != active:
-          logging.info('[swap_encryption] Pod name updated: %s → %s', active, new_pod)
+          logging.info(
+              '[swap_encryption] Pod name updated: %s → %s', active, new_pod
+          )
           if _active_pod:
             _active_pod[0] = new_pod
           active = new_pod
@@ -1723,7 +2019,8 @@ def _pod_exec(
 
   if rc != 0 and not ignore_failure:
     raise errors.VmUtil.IssueCommandError(
-        f'[swap_encryption] _pod_exec failed (rc={rc}): {err}')
+        f'[swap_encryption] _pod_exec failed (rc={rc}): {err}'
+    )
   return out, err
 
 
@@ -1741,8 +2038,11 @@ def _recover_pod(pod: str, timeout_sec: int = 600) -> str:
   Returns the (possibly new) pod name once it is Running and ready.
   """
   deadline = time.time() + timeout_sec
-  logging.info('[swap_encryption] Waiting for pod %s to recover '
-               '(up to %ds)...', pod, timeout_sec)
+  logging.info(
+      '[swap_encryption] Waiting for pod %s to recover (up to %ds)...',
+      pod,
+      timeout_sec,
+  )
 
   # Phase 1: wait for a Running pod — either the named one (container
   # restart) or a replacement pod found via label selector (eviction).
@@ -1760,9 +2060,17 @@ def _recover_pod(pod: str, timeout_sec: int = 600) -> str:
     # lives entirely in status_err.  Discarding stderr (using _) means the
     # 'not found' check below never fires and we spin until deadline.
     status_out, status_err, status_rc = kubectl.RunKubectlCommand(
-        ['get', 'pod', pod, '-n', _DS_NAMESPACE,
-         '-o', 'jsonpath={.status.phase}|{.metadata.deletionTimestamp}'],
-        raise_on_failure=False, timeout=30,
+        [
+            'get',
+            'pod',
+            pod,
+            '-n',
+            _DS_NAMESPACE,
+            '-o',
+            'jsonpath={.status.phase}|{.metadata.deletionTimestamp}',
+        ],
+        raise_on_failure=False,
+        timeout=30,
     )
     # Parse "Running|" (no deletionTimestamp) vs "Running|2026-…" (terminating)
     fields = status_out.strip().split('|')
@@ -1776,51 +2084,81 @@ def _recover_pod(pod: str, timeout_sec: int = 600) -> str:
     # Pod no longer exists, OR it exists but is being terminated (Terminating
     # state or deletionTimestamp set) — look for a replacement pod by label.
     pod_gone_or_terminating = (
-        (status_rc != 0 and 'not found' in (status_out + status_err).lower())
-        or is_terminating
-    )
+        status_rc != 0 and 'not found' in (status_out + status_err).lower()
+    ) or is_terminating
     if pod_gone_or_terminating:
       label_out, _, label_rc = kubectl.RunKubectlCommand(
-          ['get', 'pods', '-n', _DS_NAMESPACE,
-           '-l', f'app={_DS_LABEL}',
-           '-o', 'jsonpath={range .items[?(@.status.phase=="Running")]}'
-                 '{.metadata.name}{"\\n"}{end}'],
-          raise_on_failure=False, timeout=30,
+          [
+              'get',
+              'pods',
+              '-n',
+              _DS_NAMESPACE,
+              '-l',
+              f'app={_DS_LABEL}',
+              '-o',
+              (
+                  'jsonpath={range .items[?(@.status.phase=="Running")]}'
+                  '{.metadata.name}{"\\n"}{end}'
+              ),
+          ],
+          raise_on_failure=False,
+          timeout=30,
       )
-      new_pods = [p.strip() for p in label_out.strip().splitlines() if p.strip()
-                  and p.strip() != pod]  # exclude the dying pod
+      new_pods = [
+          p.strip()
+          for p in label_out.strip().splitlines()
+          if p.strip() and p.strip() != pod
+      ]  # exclude the dying pod
       if label_rc == 0 and new_pods:
         recovered_pod = new_pods[0]
-        logging.info('[swap_encryption] Original pod %s gone/terminating; '
-                     'found replacement %s', pod, recovered_pod)
+        logging.info(
+            '[swap_encryption] Original pod %s gone/terminating; '
+            'found replacement %s',
+            pod,
+            recovered_pod,
+        )
         break
 
     time.sleep(10)
   else:
     raise errors.VmUtil.IssueCommandError(
         f'[swap_encryption] No Running pod found (original: {pod}) '
-        f'within {timeout_sec}s after OOM kill / eviction')
+        f'within {timeout_sec}s after OOM kill / eviction'
+    )
 
   # Phase 2: wait for init script to finish (sentinel written last).
   while time.time() < deadline:
     ready_out, _, ready_rc = kubectl.RunKubectlCommand(
-        ['exec', recovered_pod, '-n', _DS_NAMESPACE,
-         '--', 'bash', '-c', 'test -f /tmp/pkb_ready && echo READY'],
-        raise_on_failure=False, timeout=30,
+        [
+            'exec',
+            recovered_pod,
+            '-n',
+            _DS_NAMESPACE,
+            '--',
+            'bash',
+            '-c',
+            'test -f /tmp/pkb_ready && echo READY',
+        ],
+        raise_on_failure=False,
+        timeout=30,
     )
     if ready_rc == 0 and 'READY' in ready_out:
-      logging.info('[swap_encryption] Pod %s recovered and ready', recovered_pod)
+      logging.info(
+          '[swap_encryption] Pod %s recovered and ready', recovered_pod
+      )
       return recovered_pod
     time.sleep(15)
 
   raise errors.VmUtil.IssueCommandError(
       f'[swap_encryption] Pod {recovered_pod} did not become ready '
-      f'within {timeout_sec}s after OOM kill / eviction')
+      f'within {timeout_sec}s after OOM kill / eviction'
+  )
 
 
 # ---------------------------------------------------------------------------
 # Cloud-specific swap setup
 # ---------------------------------------------------------------------------
+
 
 def _detect_cloud(pod: str) -> str:
   """Detect GCP vs AWS from DMI product info exposed via /sys hostPath mount.
@@ -1834,18 +2172,20 @@ def _detect_cloud(pod: str) -> str:
   # Primary: DMI product name / vendor (available via /sys hostPath mount)
   dmi_out, _ = _pod_exec(
       pod,
-      'cat /sys/class/dmi/id/product_name 2>/dev/null || '
-      'cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo ""',
+      'cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name '
+      '/sys/class/dmi/id/bios_vendor 2>/dev/null || echo ""',
       ignore_failure=True,
   )
   dmi = dmi_out.strip().lower()
   if 'google' in dmi:
     logging.info(
-        '[swap_encryption] Cloud detected via DMI: gcp (%s)', dmi_out.strip())
+        '[swap_encryption] Cloud detected via DMI: gcp (%s)', dmi_out.strip()
+    )
     return 'gcp'
   if any(k in dmi for k in ('amazon', 'ec2', 'aws')):
     logging.info(
-        '[swap_encryption] Cloud detected via DMI: aws (%s)', dmi_out.strip())
+        '[swap_encryption] Cloud detected via DMI: aws (%s)', dmi_out.strip()
+    )
     return 'aws'
 
   # Secondary: GCP metadata endpoint.
@@ -1862,10 +2202,13 @@ def _detect_cloud(pod: str) -> str:
     logging.info('[swap_encryption] Cloud detected via metadata: gcp')
     return 'gcp'
 
-  # Tertiary: AWS IMDS
+  # Tertiary: AWS IMDS (IMDSv2 token-based; IMDSv1 is often disabled).
   aws_out, _ = _pod_exec(
       pod,
-      'curl -s -m 3 '
+      'T=$(curl -s -m 3 -X PUT '
+      'http://169.254.169.254/latest/api/token '
+      '-H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); '
+      'curl -s -m 3 -H "X-aws-ec2-metadata-token: $T" '
       'http://169.254.169.254/latest/meta-data/instance-id '
       '2>/dev/null || echo ""',
       ignore_failure=True,
@@ -1875,7 +2218,8 @@ def _detect_cloud(pod: str) -> str:
     return 'aws'
 
   logging.warning(
-      '[swap_encryption] Could not detect cloud from DMI or metadata')
+      '[swap_encryption] Could not detect cloud from DMI or metadata'
+  )
   return 'unknown'
 
 
@@ -1930,7 +2274,7 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
   # Step 2: find a non-boot disk using the literal name from step 1
   disk_out, _ = _pod_exec(
       pod,
-      f"lsblk -d -o NAME,TYPE | awk '$2==\"disk\"{{print $1}}' "
+      f'lsblk -d -o NAME,TYPE | awk \'$2=="disk"{{print $1}}\' '
       f"| grep -v '^{boot_base}$' | head -1",
       ignore_failure=True,
   )
@@ -1940,20 +2284,29 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
     logging.info(
         '[swap_encryption] No dedicated data disk found – '
         'falling back to loop device on /mnt/stateful_partition '
-        '(direct-io=on, dm-crypt=%s)', _ENABLE_DMCRYPT.value)
+        '(direct-io=on, dm-crypt=%s)',
+        _ENABLE_DMCRYPT.value,
+    )
     _setup_gke_loop_device_swap(pod)
     return
 
   disk = f'/dev/{disk_name}'
-  logging.info('[swap_encryption] GKE: swap target disk: %s  dmcrypt=%s',
-               disk, _ENABLE_DMCRYPT.value)
+  logging.info(
+      '[swap_encryption] GKE: swap target disk: %s  dmcrypt=%s',
+      disk,
+      _ENABLE_DMCRYPT.value,
+  )
 
   # Clean up any stale mapping from a previous failed run.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
     dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
     wipefs -a {disk} 2>/dev/null || true
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   if _ENABLE_DMCRYPT.value:
     # We cannot use cryptsetup open from inside a container because
@@ -1967,7 +2320,9 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
     #
     # insmod (not modprobe) loads the kernel module: modprobe also talks to
     # systemd-udevd and can deadlock from a container for the same reason.
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       grep -q dm_crypt /proc/modules 2>/dev/null || {{
         KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
         [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
@@ -1980,17 +2335,24 @@ def _setup_gke_hyperdisk_swap(pod: str) -> None:
       dmsetup mknodes swap_encrypted 2>/dev/null || true
       mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
-    """))
-    logging.info('[swap_encryption] GKE: dm-crypt swap active on '
-                 '/dev/mapper/swap_encrypted')
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: dm-crypt swap active on '
+        '/dev/mapper/swap_encrypted'
+    )
   else:
     # Encryption-disabled column of the test matrix
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       mkswap {disk} && \\
       swapon {disk}
-    """))
-    logging.info('[swap_encryption] GKE: plain (unencrypted) swap active '
-                 'on %s', disk)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: plain (unencrypted) swap active on %s', disk
+    )
 
 
 def _setup_gke_loop_device_swap(pod: str) -> None:
@@ -2036,7 +2398,9 @@ def _setup_gke_loop_device_swap(pod: str) -> None:
   backing = '/mnt/stateful_partition/pkb_swap_backing'
 
   # ── Step 0: detach any stale loop device from a previous failed run ───────
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | \
       while read dev
       do
@@ -2044,29 +2408,38 @@ def _setup_gke_loop_device_swap(pod: str) -> None:
         losetup -d "$dev" 2>/dev/null || true
       done
     rm -f {backing}
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # ── Step 1: allocate backing file on stateful partition (ext4) ───────────
   logging.info(
       '[swap_encryption] GKE: creating %dG backing file on stateful_partition',
-      size_gb)
+      size_gb,
+  )
   # fallocate preallocates real ext4 blocks (avoids fragmentation during swap
   # I/O); truncate is the sparse fallback for filesystems where fallocate
   # fails.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     fallocate -l {size_gb}G {backing} 2>/dev/null || \\
       truncate -s {size_gb}G {backing}
-  """))
+  """),
+  )
 
   # ── Step 2: loop device with direct-io passthrough ───────────────────────
   # --direct-io=on lets the loop driver pass O_DIRECT to the host ext4,
   # reducing double-buffering for workload I/O (kernel 5.x+, present on
   # GKE COS ≥ 1.29).
-  loop_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+  loop_out, _ = _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     LOOP=$(losetup -f) && \\
     losetup --direct-io=on "$LOOP" {backing} && \\
     echo "$LOOP"
-  """))
+  """),
+  )
   loop_dev = loop_out.strip()
   if not loop_dev.startswith('/dev/loop'):
     raise RuntimeError(
@@ -2104,11 +2477,16 @@ def _setup_gke_bootdisk_swap(pod: str) -> None:
   """
   size_gb = _SWAP_SIZE_GB.value
   backing = '/mnt/stateful_partition/pkb_swap_backing'
-  logging.info('[swap_encryption] GKE: boot-disk swap (%dG backing, dmcrypt=%s)',
-               size_gb, _ENABLE_DMCRYPT.value)
+  logging.info(
+      '[swap_encryption] GKE: boot-disk swap (%dG backing, dmcrypt=%s)',
+      size_gb,
+      _ENABLE_DMCRYPT.value,
+  )
 
   # Clean up any stale loop/mapping from a previous run.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
     dmsetup remove --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
     losetup -j {backing} 2>/dev/null | awk -F: '{{print $1}}' | while read d
@@ -2117,24 +2495,37 @@ def _setup_gke_bootdisk_swap(pod: str) -> None:
       losetup -d "$d" 2>/dev/null || true
     done
     rm -f {backing}
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Allocate the backing file on the boot-disk ext4 stateful partition.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     fallocate -l {size_gb}G {backing} 2>/dev/null || truncate -s {size_gb}G {backing}
-  """))
+  """),
+  )
 
-  loop_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+  loop_out, _ = _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     LOOP=$(losetup -f) && losetup --direct-io=on "$LOOP" {backing} && echo "$LOOP"
-  """))
-  loop_dev = loop_out.strip().splitlines()[-1].strip() if loop_out.strip() else ''
+  """),
+  )
+  loop_dev = (
+      loop_out.strip().splitlines()[-1].strip() if loop_out.strip() else ''
+  )
   if not loop_dev.startswith('/dev/loop'):
     raise RuntimeError(
-        f'[swap_encryption] boot-disk losetup failed: {loop_out!r}')
+        f'[swap_encryption] boot-disk losetup failed: {loop_out!r}'
+    )
   logging.info('[swap_encryption] GKE: boot-disk loop device: %s', loop_dev)
 
   if _ENABLE_DMCRYPT.value:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       grep -q dm_crypt /proc/modules 2>/dev/null || {{
         KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
         [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
@@ -2147,15 +2538,22 @@ def _setup_gke_bootdisk_swap(pod: str) -> None:
       dmsetup mknodes swap_encrypted 2>/dev/null || true
       mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
-    """))
-    logging.info('[swap_encryption] GKE: boot-disk dm-crypt swap active on '
-                 '/dev/mapper/swap_encrypted')
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: boot-disk dm-crypt swap active on '
+        '/dev/mapper/swap_encrypted'
+    )
   else:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       mkswap {loop_dev} && swapon {loop_dev}
-    """))
-    logging.info('[swap_encryption] GKE: boot-disk plain swap active on %s',
-                 loop_dev)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: boot-disk plain swap active on %s', loop_dev
+    )
 
 
 def _setup_gke_lssd_swap(pod: str) -> None:
@@ -2167,19 +2565,26 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   # LSSD look "unclean/busy" to the device selector below, which then wrongly
   # falls back to the hyperdisk path and tries the boot disk.  Tear down any
   # prior PKB swap mapping FIRST so the underlying LSSD is freed and selectable.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     swapoff /dev/mapper/swap_encrypted 2>/dev/null || true
     swapoff -a 2>/dev/null || true
     dmsetup remove --force --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Log the full block-device topology up front for diagnosis (every prior
   # swap failure traced back to picking the wrong device).
   topo, _ = _pod_exec(
-      pod, 'lsblk -o NAME,TYPE,SIZE,ROTA,MOUNTPOINT 2>/dev/null',
-      ignore_failure=True)
-  logging.info('[swap_encryption] block device topology:\n%s',
-               (topo or '').strip())
+      pod,
+      'lsblk -o NAME,TYPE,SIZE,ROTA,MOUNTPOINT 2>/dev/null',
+      ignore_failure=True,
+  )
+  logging.info(
+      '[swap_encryption] block device topology:\n%s', (topo or '').strip()
+  )
 
   # Identify candidate swap devices = whole disks that are NOT the boot/OS
   # disk.  We must NOT rely on a device name (boot disk enumerates as nvme0n1
@@ -2210,14 +2615,20 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   if not devices:
     logging.warning(
         '[swap_encryption] No clean (unpartitioned, unmounted) local SSD found '
-        '— falling back to hyperdisk swap path')
+        '— falling back to hyperdisk swap path'
+    )
     _setup_gke_hyperdisk_swap(pod)
     return
 
   device_list = ' '.join(devices)
   n = len(devices)
-  logging.info('[swap_encryption] GKE: LSSD RAID-0 across %d clean device(s): '
-               '%s  dmcrypt=%s', n, device_list, _ENABLE_DMCRYPT.value)
+  logging.info(
+      '[swap_encryption] GKE: LSSD RAID-0 across %d clean device(s): '
+      '%s  dmcrypt=%s',
+      n,
+      device_list,
+      _ENABLE_DMCRYPT.value,
+  )
 
   # Clean up stale mappings, RAID arrays, and GKE-managed mounts.
   #
@@ -2230,7 +2641,9 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   #
   # pkb_swap is the dm-crypt device created by the node startup script (for
   # single-LSSD nodes it holds /dev/nvme1n1 directly without an md0 layer).
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     echo "[pkb-lssd-cleanup] /proc/mdstat:" >&2
     cat /proc/mdstat 2>/dev/null || true
     echo "[pkb-lssd-cleanup] dmsetup ls:" >&2
@@ -2286,7 +2699,9 @@ def _setup_gke_lssd_swap(pod: str) -> None:
     losetup -D 2>/dev/null || true
     rm -f /mnt/stateful_partition/pkb_swap.img 2>/dev/null || true
     sleep 2
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Step 3: verify the devices are truly raw (unpartitioned).  On GKE Ubuntu
   # nodes the local NVMe device may be partitioned by node startup scripts
@@ -2310,7 +2725,9 @@ def _setup_gke_lssd_swap(pod: str) -> None:
       """),
       ignore_failure=True,
   )
-  raw_devices = [d.strip() for d in raw_check_out.strip().splitlines() if d.strip()]
+  raw_devices = [
+      d.strip() for d in raw_check_out.strip().splitlines() if d.strip()
+  ]
 
   if not raw_devices:
     logging.info(
@@ -2324,27 +2741,39 @@ def _setup_gke_lssd_swap(pod: str) -> None:
   devices = raw_devices
   device_list = ' '.join(devices)
   n = len(devices)
-  logging.info('[swap_encryption] GKE: using %d raw LSSD device(s): %s  '
-               'dmcrypt=%s', n, device_list, _ENABLE_DMCRYPT.value)
+  logging.info(
+      '[swap_encryption] GKE: using %d raw LSSD device(s): %s  dmcrypt=%s',
+      n,
+      device_list,
+      _ENABLE_DMCRYPT.value,
+  )
 
   # For N=1 LSSD, skip mdadm entirely and target the raw device directly.
   # For N>1 we stripe across multiple NVMe devices.
   if n > 1:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       mdadm --create /dev/md0 --force \\
         --level=0 --raid-devices={n} \\
         {device_list}
       test -b /dev/md0 || {{ echo "mdadm: /dev/md0 not created" >&2; exit 1; }}
-    """))
+    """),
+    )
     swap_block_dev = '/dev/md0'
   else:
     swap_block_dev = devices[0]
-    logging.info('[swap_encryption] GKE: single LSSD — skipping mdadm, '
-                 'using %s directly', swap_block_dev)
+    logging.info(
+        '[swap_encryption] GKE: single LSSD — skipping mdadm, '
+        'using %s directly',
+        swap_block_dev,
+    )
 
   if _ENABLE_DMCRYPT.value:
     # Same dmsetup --noudevrules --noudevsync approach as _setup_gke_hyperdisk_swap.
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       grep -q dm_crypt /proc/modules 2>/dev/null || {{
         KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
         [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
@@ -2359,16 +2788,22 @@ def _setup_gke_lssd_swap(pod: str) -> None:
       dmsetup mknodes swap_encrypted 2>/dev/null || true
       mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
-    """))
-    logging.info('[swap_encryption] GKE: LSSD dm-crypt swap active on %s',
-                 swap_block_dev)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: LSSD dm-crypt swap active on %s', swap_block_dev
+    )
   else:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       mkswap {swap_block_dev}
       swapon {swap_block_dev}
-    """))
-    logging.info('[swap_encryption] GKE: LSSD plain swap active on %s',
-                 swap_block_dev)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: LSSD plain swap active on %s', swap_block_dev
+    )
 
 
 def _setup_gke_lssd_stateful_loop_swap(pod: str) -> None:
@@ -2383,12 +2818,16 @@ def _setup_gke_lssd_stateful_loop_swap(pod: str) -> None:
   img_path = '/mnt/stateful_partition/pkb_swap.img'
 
   # Clean up any previous run artifacts.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     swapoff -a 2>/dev/null || true
     dmsetup remove --force --noudevrules --noudevsync swap_encrypted 2>/dev/null || true
     losetup -D 2>/dev/null || true
     rm -f {img_path} 2>/dev/null || true
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Determine file size: 80% of available space, at least 16 GB.
   size_out, _ = _pod_exec(
@@ -2398,16 +2837,23 @@ def _setup_gke_lssd_stateful_loop_swap(pod: str) -> None:
   )
   avail_kb = int(size_out.strip() or '0')
   swap_gb = max(16, int(avail_kb * 0.8 / 1024 / 1024))
-  logging.info('[swap_encryption] GKE: LSSD stateful-loop: %d GB image at %s',
-               swap_gb, img_path)
+  logging.info(
+      '[swap_encryption] GKE: LSSD stateful-loop: %d GB image at %s',
+      swap_gb,
+      img_path,
+  )
 
   # Allocate file (fallocate is instant on ext4; dd fallback for others).
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     fallocate -l {swap_gb}G {img_path} 2>/dev/null || \\
       dd if=/dev/zero of={img_path} bs=1G count={swap_gb}
     chmod 600 {img_path}
     losetup --direct-io=on -f {img_path}
-  """), timeout=300)
+  """),
+      timeout=300,
+  )
 
   loop_out, _ = _pod_exec(
       pod,
@@ -2422,7 +2868,9 @@ def _setup_gke_lssd_stateful_loop_swap(pod: str) -> None:
   logging.info('[swap_encryption] GKE: LSSD stateful-loop device: %s', loop_dev)
 
   if _ENABLE_DMCRYPT.value:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       grep -q dm_crypt /proc/modules 2>/dev/null || {{
         KO=$(find /lib/modules/$(uname -r) -name 'dm-crypt.ko*' 2>/dev/null | head -1)
         [ -n "$KO" ] && insmod "$KO" 2>/dev/null || true
@@ -2437,16 +2885,122 @@ def _setup_gke_lssd_stateful_loop_swap(pod: str) -> None:
       dmsetup mknodes swap_encrypted 2>/dev/null || true
       mkswap /dev/mapper/swap_encrypted
       swapon /dev/mapper/swap_encrypted
-    """))
-    logging.info('[swap_encryption] GKE: LSSD stateful-loop dm-crypt swap active '
-                 'on %s → %s', img_path, loop_dev)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: LSSD stateful-loop dm-crypt swap active '
+        'on %s → %s',
+        img_path,
+        loop_dev,
+    )
   else:
-    _pod_exec(pod, textwrap.dedent(f"""
+    _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       mkswap {loop_dev}
       swapon {loop_dev}
-    """))
-    logging.info('[swap_encryption] GKE: LSSD stateful-loop plain swap active '
-                 'on %s → %s', img_path, loop_dev)
+    """),
+    )
+    logging.info(
+        '[swap_encryption] GKE: LSSD stateful-loop plain swap active '
+        'on %s → %s',
+        img_path,
+        loop_dev,
+    )
+
+
+_IO2_VOLUME_ID = ''  # set by _ensure_io2_volume; serial-based detection
+
+
+def _ensure_io2_volume() -> None:
+  """Create + attach a dedicated io2 EBS volume to the benchmark node so the
+  io2 test-matrix row swaps on real io2 hardware-encrypted storage.
+
+  No-op unless --swap_encryption_swap_type=io2 on an AWS/EKS cluster.
+  Best-effort: logs and returns on failure.  Stashes the created volume id in
+  _IO2_VOLUME_ID for serial-based device detection in _setup_eks_io2_swap.
+  """
+  global _IO2_VOLUME_ID
+  if _SWAP_TYPE.value != 'io2':
+    return
+  out, _, rc = kubectl.RunKubectlCommand(
+      ['get', 'nodes', '-o', 'jsonpath={.items[0].spec.providerID}'],
+      raise_on_failure=False,
+  )
+  provider = (out or '').strip()  # aws:///us-east-1a/i-0abc...
+  if rc != 0 or 'aws://' not in provider:
+    logging.warning(
+        '[swap_encryption] io2 attach skipped: could not resolve '
+        'EC2 instance from providerID=%r',
+        provider,
+    )
+    return
+  parts = [p for p in provider.split('/') if p]
+  instance_id, az = parts[-1], parts[-2]
+  region = az[:-1]
+  base = ['aws', 'ec2', '--region', region]
+  try:
+    create_args = [
+        'create-volume',
+        '--volume-type',
+        'io2',
+        '--size',
+        '500',
+        '--iops',
+        '16000',
+        '--availability-zone',
+        az,
+        '--tag-specifications',
+        'ResourceType=volume,Tags=[{Key=pkb,Value=swap_encryption}]',
+    ]
+    if _IO2_ENCRYPTED.value:
+      create_args.append('--encrypted')
+      if _IO2_KMS_KEY_ID.value:
+        create_args += ['--kms-key-id', _IO2_KMS_KEY_ID.value]
+      logging.info(
+          '[swap_encryption] io2 volume will be EBS-encrypted '
+          '(row: hardware encryption)'
+      )
+    else:
+      logging.info('[swap_encryption] io2 volume UNENCRYPTED (baseline row)')
+    create_args += ['--query', 'VolumeId', '--output', 'text']
+    vol_id, _, vrc = vm_util.IssueCommand(
+        base + create_args, raise_on_failure=False
+    )
+    vol_id = (vol_id or '').strip()
+    if vrc != 0 or not vol_id.startswith('vol-'):
+      logging.warning('[swap_encryption] io2 create-volume failed: %r', vol_id)
+      return
+    vm_util.IssueCommand(
+        base + ['wait', 'volume-available', '--volume-ids', vol_id],
+        raise_on_failure=False,
+    )
+    vm_util.IssueCommand(
+        base
+        + [
+            'attach-volume',
+            '--volume-id',
+            vol_id,
+            '--instance-id',
+            instance_id,
+            '--device',
+            '/dev/sdf',
+        ],
+        raise_on_failure=False,
+    )
+    vm_util.IssueCommand(
+        base + ['wait', 'volume-in-use', '--volume-ids', vol_id],
+        raise_on_failure=False,
+    )
+    _IO2_VOLUME_ID = vol_id
+    logging.info(
+        '[swap_encryption] Attached io2 volume %s to %s as /dev/sdf',
+        vol_id,
+        instance_id,
+    )
+    time.sleep(15)  # allow the NVMe device node to appear
+  except Exception as e:  # pylint: disable=broad-except
+    logging.warning('[swap_encryption] io2 attach error (continuing): %s', e)
 
 
 def _setup_eks_swap(pod: str) -> None:
@@ -2466,7 +3020,8 @@ def _setup_eks_swap(pod: str) -> None:
     _setup_eks_io2_swap(pod)
   else:
     logging.warning(
-        '[swap_encryption] Unknown EKS swap type %s – fallback', swap_type)
+        '[swap_encryption] Unknown EKS swap type %s – fallback', swap_type
+    )
     _setup_eks_instance_store_swap(pod)
 
 
@@ -2487,7 +3042,8 @@ def _setup_eks_instance_store_swap(pod: str) -> None:
     # Common Instance Store device paths on AWS
     for candidate in ['/dev/nvme1n1', '/dev/nvme2n1', '/dev/xvdb']:
       exists_out, _ = _pod_exec(
-          pod, f'test -b {candidate} && echo yes || echo no',
+          pod,
+          f'test -b {candidate} && echo yes || echo no',
           ignore_failure=True,
       )
       if exists_out.strip() == 'yes':
@@ -2505,12 +3061,16 @@ def _setup_eks_instance_store_swap(pod: str) -> None:
 
   # Nitro encrypts all Instance Store writes automatically.
   # No additional cryptsetup required.
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     mkswap {device} && \\
     swapon {device}
-  """))
+  """),
+  )
   logging.info(
-      '[swap_encryption] EKS: Instance Store swap active on %s', device)
+      '[swap_encryption] EKS: Instance Store swap active on %s', device
+  )
 
 
 def _setup_eks_io2_swap(pod: str) -> None:
@@ -2521,40 +3081,62 @@ def _setup_eks_io2_swap(pod: str) -> None:
   cryptsetup is needed here; we simply format the attached data disk as swap.
 
   Device discovery order:
-    1. Any non-root, non-Instance-Store block device (xvd*, sdb, second NVMe).
-    2. /dev/nvme1n1, /dev/nvme2n1 – fallback if lsblk heuristics fail.
+    1. Match the io2 volume created by _ensure_io2_volume() by its NVMe serial
+       (serial == volume id without the dash).  This is unambiguous and never
+       picks the root disk or the instance store regardless of nvmeXn1
+       enumeration order on Nitro.
+    2. First non-root EBS ("Elastic Block Store") block device that is not
+       currently mounted.
   """
   logging.info('[swap_encryption] EKS: setting up io2 EBS swap')
 
-  # Identify root device so we can exclude it
+  # Identify root device so we can exclude it.
   root_out, _ = _pod_exec(
       pod,
-      "lsblk -no pkname $(findmnt -n -o SOURCE /) 2>/dev/null || echo nvme0n1",
+      'lsblk -no pkname $(findmnt -n -o SOURCE /) 2>/dev/null || echo nvme0n1',
       ignore_failure=True,
   )
   root_base = root_out.strip() or 'nvme0n1'
 
-  # Prefer non-NVMe EBS volumes (xvdb, sdb, …) which are clearly not
-  # Instance Store.  Fall back to the second NVMe if none found.
-  disk_out, _ = _pod_exec(
-      pod,
-      f"lsblk -d -o NAME,TYPE | awk '$2==\"disk\"{{print $1}}' | "
-      f"grep -v '{root_base}' | "
-      f"grep -E '^xvd[b-z]|^sd[b-z]' | head -1",
-      ignore_failure=True,
-  )
-  device = ('/dev/' + disk_out.strip()) if disk_out.strip() else ''
-
-  if not device or device == '/dev/':
-    # Try second NVMe (io2 can also appear as NVMe on Nitro)
-    for candidate in ['/dev/nvme1n1', '/dev/nvme2n1', '/dev/xvdb', '/dev/sdb']:
-      exists_out, _ = _pod_exec(
-          pod, f'test -b {candidate} && echo yes || echo no',
-          ignore_failure=True,
+  # Identify the io2 volume UNAMBIGUOUSLY by its NVMe serial == volume id.
+  # An EBS NVMe device's serial equals the volume id minus the dash
+  # (vol-0abc... -> serial vol0abc...).
+  device = ''
+  target = _IO2_VOLUME_ID.replace('-', '')
+  if target:
+    ser_out, _ = _pod_exec(
+        pod,
+        'for d in /sys/block/nvme*n1; do '
+        '[ -e "$d" ] || continue; '
+        's=$(cat "$d/device/serial" 2>/dev/null | tr -d "-" | tr -d " "); '
+        f'[ "$s" = "{target}" ] && {{ echo "/dev/$(basename "$d")"; break; }}; '
+        'done',
+        ignore_failure=True,
+    )
+    device = ser_out.strip()
+    if device:
+      logging.info(
+          '[swap_encryption] EKS: io2 matched by serial %s -> %s',
+          target,
+          device,
       )
-      if exists_out.strip() == 'yes':
-        device = candidate
-        break
+
+  if not device:
+    # Fallback: first non-root EBS device, excluding any device that is
+    # currently mounted (root) or already active swap.
+    disk_out, _ = _pod_exec(
+        pod,
+        'for d in /sys/block/nvme*n1 /sys/block/xvd[b-z] /sys/block/sd[b-z];'
+        ' do [ -e "$d" ] || continue; n=$(basename "$d"); [ "$n" ='
+        f' "{root_base}" ] && continue; m=$(cat "$d/device/model" 2>/dev/null);'
+        ' echo "$m" | grep -qi "Elastic Block Store" || continue; mnt=$(lsblk'
+        ' -no MOUNTPOINT "/dev/$n" 2>/dev/null | tr -d " "); [ -n "$mnt" ] &&'
+        ' continue; echo "/dev/$n"; break; done',
+        ignore_failure=True,
+    )
+    device = disk_out.strip()
+    if device:
+      logging.info('[swap_encryption] EKS: io2 fallback EBS device: %s', device)
 
   if not device:
     logging.warning(
@@ -2566,11 +3148,22 @@ def _setup_eks_io2_swap(pod: str) -> None:
   logging.info('[swap_encryption] EKS: io2 EBS device: %s', device)
 
   # EBS io2 encryption is handled at the AWS level (Nitro / KMS).
-  # No cryptsetup required on the guest side.
-  _pod_exec(pod, textwrap.dedent(f"""
-    mkswap {device} && \\
-    swapon {device}
-  """))
+  out, _ = _pod_exec(
+      pod,
+      textwrap.dedent(f"""
+    swapoff {device} 2>/dev/null || true
+    wipefs -a {device} 2>/dev/null || true
+    mkswap -f {device} && swapon {device}
+    swapon --show
+  """),
+      ignore_failure=True,
+  )
+  if device not in out:
+    raise RuntimeError(
+        f'[swap_encryption] io2 swap did not activate on {device}; '
+        f'swapon --show output: {out!r}. The device may be busy/mounted '
+        '(wrong device picked) or mkswap failed.'
+    )
   logging.info('[swap_encryption] EKS: io2 EBS swap active on %s', device)
 
 
@@ -2582,7 +3175,9 @@ def _setup_plain_swap_file(pod: str, size_gb: int) -> None:
   presents a proper block device to the mm subsystem and succeeds.
   """
   logging.info('[swap_encryption] Creating %dGB loop-device swap', size_gb)
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     fallocate -l {size_gb}G /tmp/pkb_swapfile && \\
     chmod 600 /tmp/pkb_swapfile && \\
     LOOP=$(losetup -f) && \\
@@ -2590,7 +3185,8 @@ def _setup_plain_swap_file(pod: str, size_gb: int) -> None:
     mkswap "$LOOP" && \\
     swapon "$LOOP" && \\
     echo "swap loop device: $LOOP"
-  """))
+  """),
+  )
 
 
 def _enable_zswap(pod: str) -> None:
@@ -2608,6 +3204,7 @@ def _enable_zswap(pod: str) -> None:
 # ---------------------------------------------------------------------------
 # Phase 1 – fio Microbenchmarks
 # ---------------------------------------------------------------------------
+
 
 def _phase1_fio(
     pod: str, swap_dev: str, base_meta: dict
@@ -2646,16 +3243,25 @@ def _phase1_fio(
   # at provisioned throughput, which exceeds the PKB command timeout.
   # Timeout: 20 GiB / ~150 MB/s (conservative dm-crypt write rate) + 60 s buffer.
   _PREFILL_GIB = 20
-  prefill_timeout = _PREFILL_GIB * 1024 // 150 + 60  # ~197 s, rounds up to ~200 s
-  prefill_timeout = max(prefill_timeout, 300)          # floor at 5 min
-  logging.info('[swap_encryption] Pre-filling %d GiB of %s', _PREFILL_GIB, swap_dev)
+  prefill_timeout = (
+      _PREFILL_GIB * 1024 // 150 + 60
+  )  # ~197 s, rounds up to ~200 s
+  prefill_timeout = max(prefill_timeout, 300)  # floor at 5 min
+  logging.info(
+      '[swap_encryption] Pre-filling %d GiB of %s', _PREFILL_GIB, swap_dev
+  )
   # No --output-format=json for prefill; we only care that it completes.
   # Still use --output to avoid streaming large stdout over the websocket.
-  _pod_exec(pod, (
-      f'fio --name=prefill --filename={swap_dev} '
-      f'--ioengine=libaio --direct=1 --rw=write --bs=1m '
-      f'--size={_PREFILL_GIB}g --verify=0 --output=/tmp/pkb_fio_prefill.log'
-  ), timeout=prefill_timeout, ignore_failure=True)
+  _pod_exec(
+      pod,
+      (
+          f'fio --name=prefill --filename={swap_dev} '
+          '--ioengine=libaio --direct=1 --rw=write --bs=1m '
+          f'--size={_PREFILL_GIB}g --verify=0 --output=/tmp/pkb_fio_prefill.log'
+      ),
+      timeout=prefill_timeout,
+      ignore_failure=True,
+  )
 
   # Each fio job: runtime + 90 s buffer (run + JSON write + file read).
   # We write fio output to a file inside the pod and retrieve it in a second
@@ -2674,28 +3280,41 @@ def _phase1_fio(
     # Remove any stale output first so a parse can never silently reuse a
     # previous job's/run's result (rules out byte-identical results between
     # runs being a caching artifact rather than a true device ceiling).
-    _pod_exec(pod, f'rm -f {out_file}', ignore_failure=True, _retries=0,
-              timeout=15)
+    _pod_exec(
+        pod, f'rm -f {out_file}', ignore_failure=True, _retries=0, timeout=15
+    )
     run_cmd = (
         f'fio --name={name} --filename={swap_dev} '
-        f'--ioengine=libaio --direct=1 --verify=0 --randrepeat=0 '
+        '--ioengine=libaio --direct=1 --verify=0 --randrepeat=0 '
         f'--bs={bs} --iodepth={depth} --rw={rw} '
         f'--time_based --runtime={_FIO_RUNTIME_SEC.value}s '
         f'--output-format=json --output={out_file}'
     )
-    _, err = _pod_exec(pod, run_cmd, timeout=fio_run_timeout,
-                       ignore_failure=True, _retries=0)
+    _, err = _pod_exec(
+        pod, run_cmd, timeout=fio_run_timeout, ignore_failure=True, _retries=0
+    )
     if 'connection reset by peer' in err:
-      logging.warning('[swap_encryption] fio %s: kubectl exec connection '
-                      'reset; result may be incomplete', name)
-    out, _ = _pod_exec(pod, f'cat {out_file} 2>/dev/null || echo ""',
-                       timeout=fio_read_timeout, ignore_failure=True)
+      logging.warning(
+          '[swap_encryption] fio %s: kubectl exec connection '
+          'reset; result may be incomplete',
+          name,
+      )
+    out, _ = _pod_exec(
+        pod,
+        f'cat {out_file} 2>/dev/null || echo ""',
+        timeout=fio_read_timeout,
+        ignore_failure=True,
+    )
     results += _parse_fio_json(out, name, label, base_meta)
 
   # fio prefill overwrites the entire device, destroying the mkswap header.
   # Re-stamp and re-enable before the remaining phases need active swap.
-  _pod_exec(pod, f'mkswap {swap_dev} && swapon {swap_dev}',
-           ignore_failure=True, timeout=120)
+  _pod_exec(
+      pod,
+      f'mkswap {swap_dev} && swapon {swap_dev}',
+      ignore_failure=True,
+      timeout=120,
+  )
   return results
 
 
@@ -2726,18 +3345,14 @@ def _parse_fio_json(
       lat_p999 = float(pct.get('99.900000', 0)) / 1000.0
       m = dict(meta, direction=direction)
       results += [
+          sample.Sample(f'{job_name}_{direction}_iops', iops, 'iops', m),
           sample.Sample(
-              f'{job_name}_{direction}_iops', iops, 'iops', m),
-          sample.Sample(
-              f'{job_name}_{direction}_bw_mbps', bw_kib / 1024, 'MB/s', m),
-          sample.Sample(
-              f'{job_name}_{direction}_lat_mean', lat_mean, 'us', m),
-          sample.Sample(
-              f'{job_name}_{direction}_lat_p50', lat_p50, 'us', m),
-          sample.Sample(
-              f'{job_name}_{direction}_lat_p99', lat_p99, 'us', m),
-          sample.Sample(
-              f'{job_name}_{direction}_lat_p999', lat_p999, 'us', m),
+              f'{job_name}_{direction}_bw_mbps', bw_kib / 1024, 'MB/s', m
+          ),
+          sample.Sample(f'{job_name}_{direction}_lat_mean', lat_mean, 'us', m),
+          sample.Sample(f'{job_name}_{direction}_lat_p50', lat_p50, 'us', m),
+          sample.Sample(f'{job_name}_{direction}_lat_p99', lat_p99, 'us', m),
+          sample.Sample(f'{job_name}_{direction}_lat_p999', lat_p999, 'us', m),
       ]
   return results
 
@@ -2745,6 +3360,7 @@ def _parse_fio_json(
 # ---------------------------------------------------------------------------
 # Phase 2a – CPU Overhead Under Swap Pressure
 # ---------------------------------------------------------------------------
+
 
 def _parse_vm_bytes_to_mb(vm_bytes: str) -> float:
   """Parse a vm-bytes string like '28G', '512M', '1024k' into megabytes."""
@@ -2920,7 +3536,10 @@ def _autoscale_vm_bytes(pod: str, vm_bytes: str) -> str:
         break
 
     if node_ram_kb <= 0:
-      logging.warning('[swap_encryption] Could not read MemTotal; using vm_bytes=%s', vm_bytes)
+      logging.warning(
+          '[swap_encryption] Could not read MemTotal; using vm_bytes=%s',
+          vm_bytes,
+      )
       return vm_bytes
 
     node_ram_mb = node_ram_kb / 1024.0
@@ -2934,17 +3553,21 @@ def _autoscale_vm_bytes(pod: str, vm_bytes: str) -> str:
     # the swap the cgroup can actually reach, not the node total — otherwise a
     # value like 32G OOM-kills the pod the instant it exceeds RAM.
     cgroup_swap_mb = _cgroup_swap_limit_mb(pod)
-    usable_swap_mb = swap_total_mb  # default / legacy when probe is inconclusive
+    usable_swap_mb = (
+        swap_total_mb  # default / legacy when probe is inconclusive
+    )
     if cgroup_swap_mb == 0.0:
       # Swap is fully locked.  Cap the working set just under RAM so the pod
       # survives, and mark the run degraded: swap-encryption overhead cannot be
       # measured when the cgroup cannot page out.
       safe_gb = max(1, int(node_ram_mb * 0.9 / 1024))
-      msg = (f'cgroup swap is locked (memory.swap.max=0); the '
-             f'{swap_total_mb/1024:.0f} GB node swap device is unreachable. '
-             f'Capping stress-ng vm_bytes {vm_bytes} → {safe_gb}G (0.9 x RAM) '
-             f'to keep the pod alive — swap-encryption overhead will NOT be '
-             f'measured this run')
+      msg = (
+          'cgroup swap is locked (memory.swap.max=0); the '
+          f'{swap_total_mb/1024:.0f} GB node swap device is unreachable. '
+          f'Capping stress-ng vm_bytes {vm_bytes} → {safe_gb}G (0.9 x RAM) '
+          'to keep the pod alive — swap-encryption overhead will NOT be '
+          'measured this run'
+      )
       logging.error('[swap_encryption] %s', msg)
       _degraded_reasons.append(msg)
       return f'{safe_gb}G'
@@ -2974,7 +3597,10 @@ def _autoscale_vm_bytes(pod: str, vm_bytes: str) -> str:
       logging.warning(
           '[swap_encryption] Auto-scaling vm_bytes UP: %s → %s '
           '(RAM %.0f GB, swap %.0f GB; original value would not trigger swap)',
-          vm_bytes, new_vm_bytes, node_ram_mb / 1024, swap_total_mb / 1024,
+          vm_bytes,
+          new_vm_bytes,
+          node_ram_mb / 1024,
+          swap_total_mb / 1024,
       )
       return new_vm_bytes
 
@@ -2983,13 +3609,20 @@ def _autoscale_vm_bytes(pod: str, vm_bytes: str) -> str:
       logging.warning(
           '[swap_encryption] Capping vm_bytes DOWN: %s → %s '
           '(RAM %.0f GB, swap %.0f GB; original value risks swap exhaustion)',
-          vm_bytes, new_vm_bytes, node_ram_mb / 1024, swap_total_mb / 1024,
+          vm_bytes,
+          new_vm_bytes,
+          node_ram_mb / 1024,
+          swap_total_mb / 1024,
       )
       return new_vm_bytes
 
     return vm_bytes
   except Exception as e:  # pylint: disable=broad-except
-    logging.warning('[swap_encryption] _autoscale_vm_bytes failed (%s); using %s', e, vm_bytes)
+    logging.warning(
+        '[swap_encryption] _autoscale_vm_bytes failed (%s); using %s',
+        e,
+        vm_bytes,
+    )
     return vm_bytes
 
 
@@ -3031,11 +3664,21 @@ def _get_stress_vm_method(pod: str) -> str:
   try:
     # stress-ng prints its valid vm-methods to stdout when given an invalid one.
     out, _, _ = kubectl.RunKubectlCommand(
-        ['exec', (_active_pod[0] if _active_pod else pod),
-         '-n', _DS_NAMESPACE,
-         '--', 'bash', '-c',
-         'stress-ng --vm 1 --vm-bytes 1M --vm-method __invalid__ --timeout 1s 2>&1 || true'],
-        raise_on_failure=False, timeout=15,
+        [
+            'exec',
+            (_active_pod[0] if _active_pod else pod),
+            '-n',
+            _DS_NAMESPACE,
+            '--',
+            'bash',
+            '-c',
+            (
+                'stress-ng --vm 1 --vm-bytes 1M --vm-method __invalid__'
+                ' --timeout 1s 2>&1 || true'
+            ),
+        ],
+        raise_on_failure=False,
+        timeout=15,
     )
     combined = out.lower()
     # Prefer rand-set: random access keeps every page of each worker's slice
@@ -3051,9 +3694,14 @@ def _get_stress_vm_method(pod: str) -> str:
       method = 'write64'
     else:
       method = ''  # omit flag; use stress-ng default
-    logging.info('[swap_encryption] stress-ng vm-method detected: %r', method or '(default)')
+    logging.info(
+        '[swap_encryption] stress-ng vm-method detected: %r',
+        method or '(default)',
+    )
   except Exception as e:  # pylint: disable=broad-except
-    logging.warning('[swap_encryption] vm-method detection failed (%s); using rand-set', e)
+    logging.warning(
+        '[swap_encryption] vm-method detection failed (%s); using rand-set', e
+    )
     method = 'rand-set'
 
   _stress_vm_method.append(method)
@@ -3079,8 +3727,9 @@ def _phase2a_cpu_overhead(pod: str, base_meta: dict) -> list[sample.Sample]:
   """
   # Build the list of vm-bytes intensities to sweep (gap 5)
   if _STRESS_VM_BYTES_LIST.value.strip():
-    intensities = [v.strip() for v in _STRESS_VM_BYTES_LIST.value.split(',')
-                   if v.strip()]
+    intensities = [
+        v.strip() for v in _STRESS_VM_BYTES_LIST.value.split(',') if v.strip()
+    ]
   else:
     intensities = [_STRESS_VM_BYTES.value]
 
@@ -3119,7 +3768,9 @@ def _run_cpu_overhead_sweep(
 
   for attempt in range(1, max_attempts + 1):
     t0 = time.time()
-    stress_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+    stress_out, _ = _pod_exec(
+        pod,
+        textwrap.dedent(f"""
       echo 2 > /sys/kernel/mm/ksm/run 2>/dev/null || true
       echo 0 > /sys/kernel/mm/ksm/run 2>/dev/null || true
       sysctl -w vm.swappiness=100 >/dev/null 2>&1 || true
@@ -3135,70 +3786,110 @@ def _run_cpu_overhead_sweep(
         --timeout {timeout}s \\
         --metrics-brief 2>&1 || true
       kill $VMSTAT_PID $PISTAT_PID 2>/dev/null || true
-    """), timeout=timeout + 60, ignore_failure=True)
+    """),
+        timeout=timeout + 60,
+        ignore_failure=True,
+    )
     elapsed = time.time() - t0
 
-    completed_cleanly = ('successful run completed' in stress_out.lower()
-                         or 'metrics-brief' in stress_out.lower()
-                         or 'bogo-ops' in stress_out.lower())
+    completed_cleanly = (
+        'successful run completed' in stress_out.lower()
+        or 'metrics-brief' in stress_out.lower()
+        or 'bogo-ops' in stress_out.lower()
+    )
     oom_killed = (not completed_cleanly) and elapsed < timeout * 0.8
     vmstat_out, _ = _pod_exec(pod, f'cat {vmstat_log}', ignore_failure=True)
     pidstat_out, _ = _pod_exec(pod, f'cat {pidstat_log}', ignore_failure=True)
     vmstat_samples = _parse_vmstat(vmstat_out, meta)
     swap_out_max = max(
-        (s.value for s in vmstat_samples
-         if s.metric in ('swap_out_pages_per_sec',
-                         'swap_out_pages_per_sec_max')), default=0.0)
+        (
+            s.value
+            for s in vmstat_samples
+            if s.metric
+            in ('swap_out_pages_per_sec', 'swap_out_pages_per_sec_max')
+        ),
+        default=0.0,
+    )
     bogo = None
     for line in stress_out.splitlines():
       mm = re.search(r'vm\s+\d+\s+(\d+)\s+\S+\s+bogo-ops', line)
       if mm:
         bogo = float(mm.group(1))
         break
-    logging.info('[swap_encryption] Phase 2a attempt %d/%d: peak swap-out '
-                 '%.0f pages/s (completed=%s, oom=%s)', attempt, max_attempts,
-                 swap_out_max, completed_cleanly, oom_killed)
+    logging.info(
+        '[swap_encryption] Phase 2a attempt %d/%d: peak swap-out '
+        '%.0f pages/s (completed=%s, oom=%s)',
+        attempt,
+        max_attempts,
+        swap_out_max,
+        completed_cleanly,
+        oom_killed,
+    )
     if best is None or swap_out_max > best['swap_out_max']:
-      best = dict(elapsed=elapsed, oom_killed=oom_killed,
-                  swap_out_max=swap_out_max, vmstat_samples=vmstat_samples,
-                  pidstat_out=pidstat_out, bogo=bogo)
+      best = dict(
+          elapsed=elapsed,
+          oom_killed=oom_killed,
+          swap_out_max=swap_out_max,
+          vmstat_samples=vmstat_samples,
+          pidstat_out=pidstat_out,
+          bogo=bogo,
+      )
     if oom_killed or swap_out_max >= min_so:
       break
     if attempt < max_attempts:
-      logging.warning('[swap_encryption] Phase 2a swap-out %.0f < %d threshold '
-                      '— reclaiming and retrying (%d/%d)', swap_out_max, min_so,
-                      attempt + 1, max_attempts)
-      _pod_exec(pod, textwrap.dedent("""
+      logging.warning(
+          '[swap_encryption] Phase 2a swap-out %.0f < %d threshold '
+          '— reclaiming and retrying (%d/%d)',
+          swap_out_max,
+          min_so,
+          attempt + 1,
+          max_attempts,
+      )
+      _pod_exec(
+          pod,
+          textwrap.dedent("""
         echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
         pkill -9 stress-ng 2>/dev/null || true
         sleep 3; sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-      """), ignore_failure=True, timeout=60)
+      """),
+          ignore_failure=True,
+          timeout=60,
+      )
 
   # Emit samples from the BEST attempt.
   results = [
       sample.Sample('stress_ng_duration_sec', best['elapsed'], 's', meta),
-      sample.Sample('stress_ng_completed',
-                    0.0 if best['oom_killed'] else 1.0, 'status', meta),
+      sample.Sample(
+          'stress_ng_completed',
+          0.0 if best['oom_killed'] else 1.0,
+          'status',
+          meta,
+      ),
   ]
   if best['bogo'] is not None:
-    results.append(sample.Sample('stress_ng_bogo_ops', best['bogo'], 'ops',
-                                 meta))
+    results.append(
+        sample.Sample('stress_ng_bogo_ops', best['bogo'], 'ops', meta)
+    )
   results += best['vmstat_samples']
   results += _parse_pidstat(best['pidstat_out'], meta)
 
   # Swap-activity gate: a completed run that moved ~no pages to swap never
   # exercised the encrypted swap path (the headline numbers would be hollow).
   if best['oom_killed']:
-    msg = (f'stress-ng (vm_bytes={vm_bytes}) was OOM-killed — the cgroup could '
-           f'not page anonymous memory out to swap; swap-encryption overhead '
-           f'was not measured')
+    msg = (
+        f'stress-ng (vm_bytes={vm_bytes}) was OOM-killed — the cgroup could '
+        'not page anonymous memory out to swap; swap-encryption overhead '
+        'was not measured'
+    )
     logging.error('[swap_encryption] %s', msg)
     _degraded_reasons.append(msg)
   elif best['swap_out_max'] < min_so:
-    msg = (f'stress-ng (vm_bytes={vm_bytes}) peak swap-out was only '
-           f'{best["swap_out_max"]:.0f} pages/s (< {min_so} threshold) after '
-           f'{max_attempts} attempts — the working set never meaningfully '
-           f'paged to swap. Check vm_bytes vs RAM and the swap device')
+    msg = (
+        f'stress-ng (vm_bytes={vm_bytes}) peak swap-out was only '
+        f'{best["swap_out_max"]:.0f} pages/s (< {min_so} threshold) after '
+        f'{max_attempts} attempts — the working set never meaningfully '
+        'paged to swap. Check vm_bytes vs RAM and the swap device'
+    )
     logging.error('[swap_encryption] %s', msg)
     _degraded_reasons.append(msg)
 
@@ -3250,19 +3941,17 @@ def _parse_vmstat(output: str, base_meta: dict) -> list[sample.Sample]:
 
   return [
       # Swap rates
+      sample.Sample('swap_in_pages_per_sec', _mean(si_vals), 'pages/s', meta),
       sample.Sample(
-          'swap_in_pages_per_sec', _mean(si_vals), 'pages/s', meta),
+          'swap_in_pages_per_sec_max', _peak(si_vals), 'pages/s', meta
+      ),
+      sample.Sample('swap_out_pages_per_sec', _mean(so_vals), 'pages/s', meta),
       sample.Sample(
-          'swap_in_pages_per_sec_max', _peak(si_vals), 'pages/s', meta),
-      sample.Sample(
-          'swap_out_pages_per_sec', _mean(so_vals), 'pages/s', meta),
-      sample.Sample(
-          'swap_out_pages_per_sec_max', _peak(so_vals), 'pages/s', meta),
+          'swap_out_pages_per_sec_max', _peak(so_vals), 'pages/s', meta
+      ),
       # Total CPU utilisation (gap 1)
-      sample.Sample(
-          'total_cpu_pct_avg', _mean(total_active), '%', meta),
-      sample.Sample(
-          'total_cpu_pct_max', _peak(total_active), '%', meta),
+      sample.Sample('total_cpu_pct_avg', _mean(total_active), '%', meta),
+      sample.Sample('total_cpu_pct_max', _peak(total_active), '%', meta),
       # System (kernel) time % – encryption overhead signal (gap 2)
       sample.Sample('system_time_pct_avg', _mean(sy_vals), '%', meta),
       sample.Sample('system_time_pct_max', _peak(sy_vals), '%', meta),
@@ -3301,6 +3990,7 @@ def _parse_pidstat(output: str, base_meta: dict) -> list[sample.Sample]:
 # Phase 2b – I/O Interference
 # ---------------------------------------------------------------------------
 
+
 def _launch_confined_bg_stress(pod: str, timeout_s: int, logfile: str) -> None:
   """Launch the Phase 2b/3a background swap stressor confined to its OWN
   memory-capped cgroup, so it drives swap pressure WITHOUT starving the
@@ -3322,7 +4012,9 @@ def _launch_confined_bg_stress(pod: str, timeout_s: int, logfile: str) -> None:
   """
   method = _stress_vm_method_flag(pod)
   vm_bytes = _STRESS_VM_BYTES.value
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     nohup bash -c '
       BG=/sys/fs/cgroup/pkb_bgstress
       mkdir -p "$BG" 2>/dev/null || true
@@ -3335,7 +4027,9 @@ def _launch_confined_bg_stress(pod: str, timeout_s: int, logfile: str) -> None:
     ' >{logfile} 2>&1 &
     disown
     echo STRESS_STARTED
-  """), timeout=30)
+  """),
+      timeout=30,
+  )
 
 
 def _set_memory_high_guard(pod: str, fraction: float = 0.9) -> None:
@@ -3355,7 +4049,9 @@ def _set_memory_high_guard(pod: str, fraction: float = 0.9) -> None:
   unchanged.  Phase 2a is deliberately NOT guarded (it works on both configs).
   Best-effort; any failure is ignored.
   """
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     PKB_MCG=$(awk -F: '/^0::/{{print $3}}' /proc/self/cgroup 2>/dev/null)
     MT_KB=$(awk '/MemTotal/{{print $2}}' /proc/meminfo)
     HIGH=$(( MT_KB * 1024 / 100 * {int(fraction * 100)} ))
@@ -3364,17 +4060,27 @@ def _set_memory_high_guard(pod: str, fraction: float = 0.9) -> None:
         && echo "[pkb] memory.high set to $HIGH bytes ({int(fraction * 100)}% RAM) — pod will swap, not OOM" \
         || echo "[pkb] WARNING: could not set memory.high" >&2
     fi
-  """), ignore_failure=True, timeout=30, _retries=0)
+  """),
+      ignore_failure=True,
+      timeout=30,
+      _retries=0,
+  )
 
 
 def _reset_memory_high_guard(pod: str) -> None:
   """Restore ``memory.high`` to ``max`` after a guarded phase."""
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     PKB_MCG=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup 2>/dev/null)
     if [ -n "$PKB_MCG" ] && [ -f "/sys/fs/cgroup$PKB_MCG/memory.high" ]; then
       echo max > "/sys/fs/cgroup$PKB_MCG/memory.high" 2>/dev/null || true
     fi
-  """), ignore_failure=True, timeout=30, _retries=0)
+  """),
+      ignore_failure=True,
+      timeout=30,
+      _retries=0,
+  )
 
 
 def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
@@ -3395,11 +4101,16 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   _set_memory_high_guard(pod)
 
   # Ensure fio is available — apt-get may have failed during DaemonSet init.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     command -v fio >/dev/null 2>&1 || {
       apt-get install -y -qq fio 2>/dev/null || true
     }
-  """), ignore_failure=True, timeout=120)
+  """),
+      ignore_failure=True,
+      timeout=120,
+  )
 
   # Reclaim node memory BEFORE creating the test file.  By this point Phase 2a
   # has hard-swapped the node and Phase 3c's OpenSearch (which runs first) may
@@ -3408,7 +4119,9 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # the cgroup memory.high guard can prevent (those are cgroup/page-cache
   # tools, not node-eviction controls).  Kill any leftover stressors/servers,
   # flush dirty pages, and drop caches so the node starts Phase 2b clean.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     pkill -9 stress-ng 2>/dev/null || true
     pkill -9 -f 'opensearch|elasticsearch' 2>/dev/null || true
     pkill -9 redis-server 2>/dev/null || true
@@ -3416,16 +4129,24 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
     sleep 2
     echo "[pkb] pre-2b MemAvailable_kB=$(awk '/MemAvailable/{print $2}' /proc/meminfo) SwapFree_kB=$(awk '/SwapFree/{print $2}' /proc/meminfo)"
-  """), ignore_failure=True, timeout=60)
+  """),
+      ignore_failure=True,
+      timeout=60,
+  )
 
   # Create the test file on the persistent disk (see app_file note above).
   # --direct=1 (O_DIRECT, ext4 supports it) bypasses the page cache.  Size is
   # kept at 4 GB (not 8) so the create + the concurrent background stressor
   # cannot exhaust a 30 GB node even with swap already in use.
-  _pod_exec(pod, (
-      f'fio --name=create --filename={app_file} '
-      f'--rw=write --bs=1m --size=4G --verify=0 --direct=1'
-  ), timeout=600, ignore_failure=True)
+  _pod_exec(
+      pod,
+      (
+          f'fio --name=create --filename={app_file} '
+          '--rw=write --bs=1m --size=4G --verify=0 --direct=1'
+      ),
+      timeout=600,
+      ignore_failure=True,
+  )
 
   def _run_app_fio(pressure_label: str) -> list[sample.Sample]:
     # --direct=1 (O_DIRECT) avoids page-cache buildup; ext4 on the persistent
@@ -3433,16 +4154,18 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
     # measures the disk's I/O under swap pressure directly.
     cmd = (
         f'fio --name=app_io --filename={app_file} '
-        f'--ioengine=libaio --direct=1 '
-        f'--rw=randrw --bs=4k --iodepth=32 --size=4G --verify=0 '
-        f'--time_based --runtime=60s --output-format=json'
+        '--ioengine=libaio --direct=1 '
+        '--rw=randrw --bs=4k --iodepth=32 --size=4G --verify=0 '
+        '--time_based --runtime=60s --output-format=json'
     )
     # ignore_failure=True: fio rc=137 is expected when the pod is OOM-evicted
     # under heavy swap pressure.  _pod_exec handles recovery; callers rely on
     # _parse_fio_json returning [] on empty/bad output rather than an exception.
     out, _ = _pod_exec(pod, cmd, ignore_failure=True)
     return _parse_fio_json(
-        out, 'app_io', f'App I/O ({pressure_label})',
+        out,
+        'app_io',
+        f'App I/O ({pressure_label})',
         dict(meta, pressure=pressure_label),
     )
 
@@ -3465,8 +4188,13 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
   # stress-ng is already dead — kill is a no-op and we skip the long wait.
   # _retries=0: no recovery here; the first Phase 3a command will recover
   # the pod properly if needed (and it already waits for /tmp/pkb_ready).
-  _pod_exec(pod, 'pkill -9 stress-ng 2>/dev/null || true',
-            ignore_failure=True, _retries=0, timeout=15)
+  _pod_exec(
+      pod,
+      'pkill -9 stress-ng 2>/dev/null || true',
+      ignore_failure=True,
+      _retries=0,
+      timeout=15,
+  )
   _reset_memory_high_guard(pod)
   return results
 
@@ -3474,6 +4202,7 @@ def _phase2b_io_interference(pod: str, base_meta: dict) -> list[sample.Sample]:
 # ---------------------------------------------------------------------------
 # Phase 3a – Redis Latency Under Memory Pressure
 # ---------------------------------------------------------------------------
+
 
 def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Load Redis beyond its memory cap and measure GET/SET P50/P90/P99 latency.
@@ -3494,7 +4223,9 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
   # `service redis-server start` fails inside a container (no init system)
   # so we fall through to a direct redis-server invocation.  A retry loop
   # on redis-cli PING is more reliable than a fixed sleep.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     pkill -x redis-server 2>/dev/null || true
     sleep 1
     redis-server --port 6379 --daemonize yes \
@@ -3508,21 +4239,34 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
       redis-cli -p 6379 ping 2>/dev/null | grep -q PONG && echo "Redis ready" && break
       sleep 1
     done
-  """), ignore_failure=True, timeout=45)
+  """),
+      ignore_failure=True,
+      timeout=45,
+  )
 
   maxmem = _REDIS_MAXMEMORY_MB.value * 1024 * 1024
-  _pod_exec(pod, f'redis-cli CONFIG SET maxmemory {maxmem}',
-            ignore_failure=True)
-  _pod_exec(pod, 'redis-cli CONFIG SET maxmemory-policy allkeys-lru',
-            ignore_failure=True)
+  _pod_exec(
+      pod, f'redis-cli CONFIG SET maxmemory {maxmem}', ignore_failure=True
+  )
+  _pod_exec(
+      pod,
+      'redis-cli CONFIG SET maxmemory-policy allkeys-lru',
+      ignore_failure=True,
+  )
 
   # Pre-load dataset (forces eviction/swap once dataset > maxmemory)
   n_keys = (_REDIS_DATASET_MB.value * 1024 * 1024) // 128
-  logging.info('[swap_encryption] Loading %d Redis keys (%d MB)',
-               n_keys, _REDIS_DATASET_MB.value)
-  _pod_exec(pod,
-           f'redis-benchmark -n {n_keys} -d 128 -t SET -q >/dev/null 2>&1',
-           ignore_failure=True, timeout=600)
+  logging.info(
+      '[swap_encryption] Loading %d Redis keys (%d MB)',
+      n_keys,
+      _REDIS_DATASET_MB.value,
+  )
+  _pod_exec(
+      pod,
+      f'redis-benchmark -n {n_keys} -d 128 -t SET -q >/dev/null 2>&1',
+      ignore_failure=True,
+      timeout=600,
+  )
 
   # Apply swap pressure with the confined stressor so it can't OOM Redis or
   # the pod on a small node (pages within a 60%-RAM cgroup; see helper).
@@ -3540,7 +4284,8 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
       pod,
       'command -v memtier_benchmark 2>/dev/null; '
       'ls /usr/local/bin/memtier_benchmark 2>/dev/null',
-      ignore_failure=True)
+      ignore_failure=True,
+  )
   mt_bin = next((l.strip() for l in mt_out.splitlines() if l.strip()), '')
   if mt_bin:
     meta = dict(base_meta, workload='redis', tool='memtier_benchmark')
@@ -3558,21 +4303,31 @@ def _phase3a_redis(pod: str, base_meta: dict) -> list[sample.Sample]:
     # --csv so the latency percentile distribution is printed, then parse both
     # throughput and percentiles (the --csv format is throughput-only, which is
     # why P50/P90/P99 were missing before).
-    logging.warning('[swap_encryption] memtier_benchmark not on PATH or in '
-                    '/usr/local/bin; using redis-benchmark for latency')
+    logging.warning(
+        '[swap_encryption] memtier_benchmark not on PATH or in '
+        '/usr/local/bin; using redis-benchmark for latency'
+    )
     # Surface WHY memtier is missing so the build failure is diagnosable from
     # the PKB log instead of only inside the pod (best-effort).
     blog, _ = _pod_exec(
-        pod, 'tail -n 15 /tmp/pkb_memtier_build.log 2>/dev/null || echo "(no build log)"',
-        ignore_failure=True, _retries=0, timeout=15)
-    logging.warning('[swap_encryption] memtier build log tail:\n%s',
-                    (blog or '').strip())
+        pod,
+        'tail -n 15 /tmp/pkb_memtier_build.log 2>/dev/null || echo "(no build'
+        ' log)"',
+        ignore_failure=True,
+        _retries=0,
+        timeout=15,
+    )
+    logging.warning(
+        '[swap_encryption] memtier build log tail:\n%s', (blog or '').strip()
+    )
     meta = dict(base_meta, workload='redis', tool='redis_benchmark_fallback')
     rb_out, _ = _pod_exec(
         pod,
         'redis-benchmark -h 127.0.0.1 -p 6379 -c 50 -n 100000 -d 128 '
         '-t get,set 2>&1',
-        ignore_failure=True, timeout=180)
+        ignore_failure=True,
+        timeout=180,
+    )
     results += _parse_redis_benchmark(rb_out, meta)
 
   _reset_memory_high_guard(pod)
@@ -3587,8 +4342,9 @@ def _parse_memtier_json(
   Extracts throughput (ops/s) and latency percentiles (P50, P90, P99)
   for both GET and SET operations, as required by the test plan.
   """
-  raw, _ = _pod_exec(pod, f'cat {json_path} 2>/dev/null || echo ""',
-                    ignore_failure=True)
+  raw, _ = _pod_exec(
+      pod, f'cat {json_path} 2>/dev/null || echo ""', ignore_failure=True
+  )
   results = []
   try:
     data = json.loads(raw)
@@ -3641,24 +4397,20 @@ def _parse_memtier_json(
     lat_p999 = _pget('p99.90', '99.900', '99.9th Percentile Latency')
     results += [
         sample.Sample(
-            f'redis_{op_label}_ops_per_sec', float(ops_sec), 'ops/s', m),
+            f'redis_{op_label}_ops_per_sec', float(ops_sec), 'ops/s', m
+        ),
+        sample.Sample(f'redis_{op_label}_lat_avg_ms', float(lat_avg), 'ms', m),
+        sample.Sample(f'redis_{op_label}_lat_p50_ms', float(lat_p50), 'ms', m),
+        sample.Sample(f'redis_{op_label}_lat_p90_ms', float(lat_p90), 'ms', m),
+        sample.Sample(f'redis_{op_label}_lat_p99_ms', float(lat_p99), 'ms', m),
         sample.Sample(
-            f'redis_{op_label}_lat_avg_ms', float(lat_avg), 'ms', m),
-        sample.Sample(
-            f'redis_{op_label}_lat_p50_ms', float(lat_p50), 'ms', m),
-        sample.Sample(
-            f'redis_{op_label}_lat_p90_ms', float(lat_p90), 'ms', m),
-        sample.Sample(
-            f'redis_{op_label}_lat_p99_ms', float(lat_p99), 'ms', m),
-        sample.Sample(
-            f'redis_{op_label}_lat_p999_ms', float(lat_p999), 'ms', m),
+            f'redis_{op_label}_lat_p999_ms', float(lat_p999), 'ms', m
+        ),
     ]
   return results
 
 
-def _parse_redis_benchmark(
-    output: str, base_meta: dict
-) -> list[sample.Sample]:
+def _parse_redis_benchmark(output: str, base_meta: dict) -> list[sample.Sample]:
   """Parse redis-benchmark (non-CSV) output: throughput + latency percentiles.
 
   redis-benchmark groups its output per operation.  We track the current op
@@ -3689,13 +4441,14 @@ def _parse_redis_benchmark(
       lat = next((ms for pct, ms in ordered if pct >= target), None)
       if lat is not None:
         results.append(
-            sample.Sample(f'redis_{cur_op}_lat_{lbl}_ms', lat, 'ms', m))
+            sample.Sample(f'redis_{cur_op}_lat_{lbl}_ms', lat, 'ms', m)
+        )
 
   for raw in output.splitlines():
     line = raw.strip()
     header = re.search(r'======\s*([A-Za-z_]+)\s*======', line)
     if header:
-      _flush(op, buckets)              # finalise the previous op's percentiles
+      _flush(op, buckets)  # finalise the previous op's percentiles
       op = header.group(1).lower()
       buckets = []
       expect_summary_row = False
@@ -3707,8 +4460,10 @@ def _parse_redis_benchmark(
     tput = re.search(r'([\d.]+)\s+requests per second', line)
     if tput:
       results.append(
-          sample.Sample(f'redis_{op}_ops_per_sec', float(tput.group(1)),
-                        'ops/s', m))
+          sample.Sample(
+              f'redis_{op}_ops_per_sec', float(tput.group(1)), 'ops/s', m
+          )
+      )
       continue
 
     # redis 7+ summary table: 'latency summary (msec):' header then a row of
@@ -3721,7 +4476,8 @@ def _parse_redis_benchmark(
       for lbl, val in zip(['avg', 'min', 'p50', 'p95', 'p99', 'max'], cols):
         if lbl in ('p50', 'p95', 'p99'):
           results.append(
-              sample.Sample(f'redis_{op}_lat_{lbl}_ms', float(val), 'ms', m))
+              sample.Sample(f'redis_{op}_lat_{lbl}_ms', float(val), 'ms', m)
+          )
       expect_summary_row = False
       continue
 
@@ -3731,15 +4487,18 @@ def _parse_redis_benchmark(
     pdist = re.search(r'([\d.]+)%\s*<=\s*([\d.]+)\s*milli', line)
     if pdist:
       buckets.append((float(pdist.group(1)), float(pdist.group(2))))
-  _flush(op, buckets)                  # finalise the last op
+  _flush(op, buckets)  # finalise the last op
   if not results:
-    logging.warning('[swap_encryption] redis-benchmark parse produced no samples')
+    logging.warning(
+        '[swap_encryption] redis-benchmark parse produced no samples'
+    )
   return results
 
 
 # ---------------------------------------------------------------------------
 # Phase 3b – Kernel Build Under Memory Constraint
 # ---------------------------------------------------------------------------
+
 
 def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Compile Linux inside a cgroup memory cap; compare to unconstrained."""
@@ -3755,25 +4514,32 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
   tarball = f'{root}/linux-{ver}.tar.xz'
   src = f'{root}/linux-{ver}'
   url = (
-      f'https://cdn.kernel.org/pub/linux/kernel/'
+      'https://cdn.kernel.org/pub/linux/kernel/'
       f'v{ver.split(".")[0]}.x/linux-{ver}.tar.xz'
   )
 
   # Ensure build tools are present — apt-get may have failed during DaemonSet
   # init (network transient, repo unavailable).  Idempotent on re-install.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     command -v make >/dev/null 2>&1 && command -v cgexec >/dev/null 2>&1 || {
       apt-get install -y -qq build-essential cgroup-tools 2>/dev/null || true
     }
-  """), ignore_failure=True, timeout=180)
+  """),
+      ignore_failure=True,
+      timeout=180,
+  )
 
   # Download and extract only if the init script didn't already do it
   # (e.g. if the stateful partition was freshly formatted).
   _pod_exec(pod, f'mkdir -p {root}')
-  _pod_exec(pod, f'test -f {tarball} || wget -q --timeout=300 -O {tarball} {url}',
-           timeout=600)
-  _pod_exec(pod, f'test -d {src} || tar -xf {tarball} -C {root}',
-           timeout=600)
+  _pod_exec(
+      pod,
+      f'test -f {tarball} || wget -q --timeout=300 -O {tarball} {url}',
+      timeout=600,
+  )
+  _pod_exec(pod, f'test -d {src} || tar -xf {tarball} -C {root}', timeout=600)
   _pod_exec(pod, f'make -C {src} defconfig -j$(nproc) 2>&1', timeout=300)
 
   mem_bytes = _KERNEL_MEMORY_MB.value * 1024 * 1024
@@ -3783,7 +4549,9 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
   # cgroup v2: /sys/fs/cgroup/<name>/memory.max  (value in bytes or 'max')
   # On GKE kernel 6.x (e.g. 6.8.0-1049-gke) cgroup v1 memory controller is
   # unavailable from pod namespaces — only cgroup v2 works.
-  cgroup_setup_out, _ = _pod_exec(pod, textwrap.dedent(f"""
+  cgroup_setup_out, _ = _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     if [ -d /sys/fs/cgroup/memory ] && \
        mkdir -p /sys/fs/cgroup/memory/pkb_kernelbuild 2>/dev/null && \
        echo {mem_bytes} > /sys/fs/cgroup/memory/pkb_kernelbuild/memory.limit_in_bytes 2>/dev/null; then
@@ -3796,18 +4564,31 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
     else
       echo CGROUP_NONE
     fi
-  """), ignore_failure=True, timeout=30)
-  cgroup_mode = cgroup_setup_out.strip().splitlines()[-1] if cgroup_setup_out.strip() else 'CGROUP_NONE'
-  logging.info('[swap_encryption] cgroup mode: %s (mem_limit=%dMB)', cgroup_mode, _KERNEL_MEMORY_MB.value)
+  """),
+      ignore_failure=True,
+      timeout=30,
+  )
+  cgroup_mode = (
+      cgroup_setup_out.strip().splitlines()[-1]
+      if cgroup_setup_out.strip()
+      else 'CGROUP_NONE'
+  )
+  logging.info(
+      '[swap_encryption] cgroup mode: %s (mem_limit=%dMB)',
+      cgroup_mode,
+      _KERNEL_MEMORY_MB.value,
+  )
 
   def _build(label: str, use_cgroup: bool) -> sample.Sample:
     _pod_exec(pod, f'make -C {src} clean 2>&1')
     if use_cgroup and cgroup_mode == 'CGROUPV1':
       # cgroup v1: cgexec pins the process to the named memory cgroup.
       # Fallback (||) runs without cgroup if cgexec itself fails.
-      cmd = (f'cgexec -g memory:pkb_kernelbuild '
-             f'make -C {src} -j$(nproc) vmlinux 2>&1 '
-             f'|| make -C {src} -j$(nproc) vmlinux 2>&1')
+      cmd = (
+          'cgexec -g memory:pkb_kernelbuild '
+          f'make -C {src} -j$(nproc) vmlinux 2>&1 '
+          f'|| make -C {src} -j$(nproc) vmlinux 2>&1'
+      )
     elif use_cgroup and cgroup_mode == 'CGROUPV2':
       # cgroup v2: write PID into the cgroup's cgroup.procs, then run make.
       # The memory.max limit set above applies to all processes in the cgroup.
@@ -3827,13 +4608,16 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
     # _pod_exec (OOM-eviction path) so subsequent phases use the new pod name.
     _pod_exec(pod, cmd, timeout=3600, ignore_failure=True)
     elapsed = time.time() - t0
-    m = dict(base_meta,
-             workload='kernel_build',
-             kernel_version=ver,
-             build_variant=label,
-             cgroup_mode=cgroup_mode,
-             memory_limit_mb=(
-                 _KERNEL_MEMORY_MB.value if use_cgroup else 'unconstrained'))
+    m = dict(
+        base_meta,
+        workload='kernel_build',
+        kernel_version=ver,
+        build_variant=label,
+        cgroup_mode=cgroup_mode,
+        memory_limit_mb=(
+            _KERNEL_MEMORY_MB.value if use_cgroup else 'unconstrained'
+        ),
+    )
     return sample.Sample('kernel_build_elapsed_sec', elapsed, 's', m)
 
   s_constrained = _build('constrained', use_cgroup=True)
@@ -3842,17 +4626,26 @@ def _phase3b_kernel_build(pod: str, base_meta: dict) -> list[sample.Sample]:
 
   if s_unconstrained.value > 0:
     ratio = s_constrained.value / s_unconstrained.value
-    results.append(sample.Sample(
-        'kernel_build_slowdown_ratio', ratio, 'ratio',
-        dict(base_meta, workload='kernel_build', kernel_version=ver,
-             memory_limit_mb=_KERNEL_MEMORY_MB.value),
-    ))
+    results.append(
+        sample.Sample(
+            'kernel_build_slowdown_ratio',
+            ratio,
+            'ratio',
+            dict(
+                base_meta,
+                workload='kernel_build',
+                kernel_version=ver,
+                memory_limit_mb=_KERNEL_MEMORY_MB.value,
+            ),
+        )
+    )
   return results
 
 
 # ---------------------------------------------------------------------------
 # Phase 3c – OpenSearch
 # ---------------------------------------------------------------------------
+
 
 def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
   """Index + query workload under swap pressure (esrally or curl fallback).
@@ -3872,7 +4665,9 @@ def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
   # cleanup OOM-IMMUNE (oom_score_adj=-1000) so it always survives, kill any
   # lingering stress-ng / non-serving OpenSearch, drop caches, and then POLL
   # until memory actually recovers before we try to launch OpenSearch.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
     pkill -9 stress-ng 2>/dev/null || true
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:9200/ 2>/dev/null)" != "200" ]; then
@@ -3887,10 +4682,14 @@ def _phase3c_opensearch(pod: str, base_meta: dict) -> list[sample.Sample]:
       sleep 2
     done
     echo "[pkb] 3c pre-clean free:"; free -h | head -2
-  """), ignore_failure=True, timeout=90)
+  """),
+      ignore_failure=True,
+      timeout=90,
+  )
 
   esrally_out, _ = _pod_exec(
-      pod, 'which esrally 2>/dev/null', ignore_failure=True)
+      pod, 'which esrally 2>/dev/null', ignore_failure=True
+  )
   if esrally_out.strip():
     return _run_esrally(pod, meta)
   else:
@@ -3909,7 +4708,9 @@ def _run_esrally(pod: str, meta: dict) -> list[sample.Sample]:
   """
   jvm_heap_mb = 512
   # Patch jvm.options before starting Elasticsearch/OpenSearch
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     for f in /etc/elasticsearch/jvm.options /etc/opensearch/jvm.options \\
               /usr/share/elasticsearch/config/jvm.options \\
               /usr/share/opensearch/config/jvm.options
@@ -3920,15 +4721,21 @@ def _run_esrally(pod: str, meta: dict) -> list[sample.Sample]:
     done
     export ES_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
     export OPENSEARCH_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
-  _pod_exec(pod,
-           'systemctl start elasticsearch 2>/dev/null || '
-           'systemctl start opensearch 2>/dev/null || true',
-           ignore_failure=True)
+  _pod_exec(
+      pod,
+      'systemctl start elasticsearch 2>/dev/null || '
+      'systemctl start opensearch 2>/dev/null || true',
+      ignore_failure=True,
+  )
   time.sleep(15)  # wait for the engine to be ready
 
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     esrally race \\
       --track=geonames \\
       --target-hosts=localhost:9200 \\
@@ -3937,7 +4744,10 @@ def _run_esrally(pod: str, meta: dict) -> list[sample.Sample]:
       --report-file=/tmp/pkb_esrally.csv \\
       --track-param="number_of_replicas:0" \\
       2>&1
-  """), ignore_failure=True, timeout=3600)
+  """),
+      ignore_failure=True,
+      timeout=3600,
+  )
 
   csv_out, _ = _pod_exec(pod, 'cat /tmp/pkb_esrally.csv 2>/dev/null || echo ""')
   results = []
@@ -3949,9 +4759,14 @@ def _run_esrally(pod: str, meta: dict) -> list[sample.Sample]:
     try:
       value = float(parts[2])
       unit = parts[3].strip() if len(parts) > 3 else 'unknown'
-      results.append(sample.Sample(f'opensearch_{metric}', value, unit,
-                                   dict(meta, tool='esrally',
-                                        jvm_heap_mb=jvm_heap_mb)))
+      results.append(
+          sample.Sample(
+              f'opensearch_{metric}',
+              value,
+              unit,
+              dict(meta, tool='esrally', jvm_heap_mb=jvm_heap_mb),
+          )
+      )
     except (ValueError, IndexError):
       pass
   return results
@@ -3968,7 +4783,9 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
   # 512 MB heap on a 32-vCPU node leaves almost all RAM available for page
   # cache, which the kernel will then need to reclaim under bulk-index load.
   jvm_heap_mb = 512
-  _pod_exec(pod, textwrap.dedent(f"""
+  _pod_exec(
+      pod,
+      textwrap.dedent(f"""
     # Patch jvm.options in-place for Elasticsearch and OpenSearch installs
     for jvm_opts_file in \\
         /etc/elasticsearch/jvm.options \\
@@ -3984,7 +4801,9 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     # Environment-variable fallback (works with both ES and OpenSearch)
     export ES_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
     export OPENSEARCH_JAVA_OPTS="-Xms{jvm_heap_mb}m -Xmx{jvm_heap_mb}m"
-  """), ignore_failure=True)
+  """),
+      ignore_failure=True,
+  )
 
   # Start the search server.  The pod has no systemd, so after trying any
   # packaged ES/OS via systemctl we launch the OpenSearch bundle installed by
@@ -3992,7 +4811,9 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
   # Redirect the whole launch session to a log file FIRST, so the file always
   # exists and records every decision even if a guard short-circuits — this is
   # the only artifact that tells us whether the launch ran and why it stopped.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     exec >/tmp/pkb_opensearch_run.log 2>&1
     # Make this launch session OOM-immune so it always survives long enough to
     # kill a stale server and relaunch, even if the node is memory-saturated.
@@ -4041,34 +4862,45 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
     echo "[pkb] :9200 probe:"; curl -s -m 3 http://localhost:9200/ 2>&1 | head -8
     echo "[pkb] kernel OOM kills (dmesg):"; dmesg 2>/dev/null | grep -iE 'killed process|out of memory|oom-kill' | tail -5
     echo "[pkb] -------- end diagnostics --------"
-  """), ignore_failure=True, timeout=120)
+  """),
+      ignore_failure=True,
+      timeout=120,
+  )
 
   # Wait for the HTTP endpoint to actually accept connections before timing
   # anything.  Without this probe a server that never starts (curl exit 7,
   # connection refused) still produced opensearch_*_sec samples that were
   # really just failed-connection round trips, polluting the results.  An
   # OpenSearch JVM cold start can take ~60-90 s, so poll up to ~120 s.
-  ready_out, _ = _pod_exec(pod, textwrap.dedent("""
+  ready_out, _ = _pod_exec(
+      pod,
+      textwrap.dedent("""
     for _i in $(seq 1 60); do
       code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
              http://localhost:9200/ 2>/dev/null || echo 000)
       if [ "$code" = "200" ]; then echo READY; break; fi
       sleep 2
     done
-  """), ignore_failure=True, timeout=150)
+  """),
+      ignore_failure=True,
+      timeout=150,
+  )
 
   if 'READY' not in ready_out:
     logging.warning(
         '[swap_encryption] OpenSearch/Elasticsearch HTTP endpoint never came '
         'up on localhost:9200 (curl could not connect); skipping opensearch '
-        'samples for this run rather than recording failed-connection timings')
+        'samples for this run rather than recording failed-connection timings'
+    )
     # Stop any hung OpenSearch so it does not hold memory into the swap phases
     # (kill by pidfile — never `pkill -f`, which would match this shell).
-    _pod_exec(pod,
-              'if [ -f /tmp/opensearch.pid ]; then '
-              'kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null; '
-              'rm -f /tmp/opensearch.pid; fi || true',
-              ignore_failure=True)
+    _pod_exec(
+        pod,
+        'if [ -f /tmp/opensearch.pid ]; then '
+        'kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null; '
+        'rm -f /tmp/opensearch.pid; fi || true',
+        ignore_failure=True,
+    )
     return []
 
   # Server is up.  NOW apply swap pressure (detached) so the index/query below
@@ -4077,8 +4909,9 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
   # cascade into every later phase (fio Gate 1, stress 2a, …) and fail the
   # whole run.  Use the confined stressor (capped at 60% RAM in its own cgroup)
   # so it cannot starve the OpenSearch JVM or trip the node OOM/eviction.
-  _launch_confined_bg_stress(pod, _STRESS_TIMEOUT_SEC.value,
-                             '/tmp/pkb_stress_opensearch.log')
+  _launch_confined_bg_stress(
+      pod, _STRESS_TIMEOUT_SEC.value, '/tmp/pkb_stress_opensearch.log'
+  )
   time.sleep(10)
 
   doc = '{"index":{}}\n{"field":"benchmark","ts":"2026-01-01"}\n'
@@ -4088,37 +4921,53 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
   # itself emit a success/failure token on stdout (curl -f fails on HTTP >=400
   # and on connection errors) and inspect that.
   t0 = time.time()
-  bulk_out, _ = _pod_exec(pod, (
-      f'printf "%s" \'{bulk}\' | '
-      "curl -s -f -X POST 'http://localhost:9200/pkb_test/_bulk' "
-      "-H 'Content-Type: application/x-ndjson' "
-      "--data-binary @- -o /dev/null && echo PKB_OK || echo PKB_FAIL"
-  ), ignore_failure=True)
+  bulk_out, _ = _pod_exec(
+      pod,
+      (
+          f'printf "%s" \'{bulk}\' | '
+          "curl -s -f -X POST 'http://localhost:9200/pkb_test/_bulk' "
+          "-H 'Content-Type: application/x-ndjson' "
+          '--data-binary @- -o /dev/null && echo PKB_OK || echo PKB_FAIL'
+      ),
+      ignore_failure=True,
+  )
   index_sec = time.time() - t0
 
   t0 = time.time()
-  query_out, _ = _pod_exec(pod, (
-      "curl -s -f 'http://localhost:9200/pkb_test/_search?q=field:benchmark' "
-      "-o /dev/null && echo PKB_OK || echo PKB_FAIL"
-  ), ignore_failure=True)
+  query_out, _ = _pod_exec(
+      pod,
+      (
+          'curl -s -f'
+          " 'http://localhost:9200/pkb_test/_search?q=field:benchmark' -o"
+          ' /dev/null && echo PKB_OK || echo PKB_FAIL'
+      ),
+      ignore_failure=True,
+  )
   query_sec = time.time() - t0
 
   # 3c runs FIRST (before the swap phases), so tear it down now: kill its
   # stressor and stop OpenSearch, then reclaim — leaving a clean node for
   # Phase 2a's swap measurement.  OOM-immune so it always completes.
-  _pod_exec(pod, textwrap.dedent("""
+  _pod_exec(
+      pod,
+      textwrap.dedent("""
     echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
     pkill -9 stress-ng 2>/dev/null || true
     if [ -f /tmp/opensearch.pid ]; then kill -9 "$(cat /tmp/opensearch.pid 2>/dev/null)" 2>/dev/null || true; rm -f /tmp/opensearch.pid; fi
     sleep 3; sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
     echo "[pkb] 3c teardown free:"; free -h | head -2
-  """), ignore_failure=True, timeout=60)
+  """),
+      ignore_failure=True,
+      timeout=60,
+  )
 
   if 'PKB_OK' not in bulk_out or 'PKB_OK' not in query_out:
     logging.warning(
         '[swap_encryption] OpenSearch bulk/query curl failed after the server '
         'reported ready (bulk ok=%s, query ok=%s); skipping opensearch samples',
-        'PKB_OK' in bulk_out, 'PKB_OK' in query_out)
+        'PKB_OK' in bulk_out,
+        'PKB_OK' in query_out,
+    )
     return []
 
   m = dict(meta, tool='curl_fallback')
@@ -4138,17 +4987,17 @@ def _run_opensearch_curl(pod: str, meta: dict) -> list[sample.Sample]:
 _INSTANCE_PRICE_USD_PER_HR: dict[str, float] = {
     # GCP  (on-demand, us-central1 unless noted)
     'c4-standard-8-lssd': 0.5888,  # 8 vCPU, 32 GB RAM + 1×375 GB LSSD
-    'c4-standard-8':      0.5008,  # 8 vCPU, 32 GB RAM, no LSSD
-    'n4-highmem-32':      3.0256,  # 32 vCPU, 256 GB RAM
-    'n2-highmem-32':      2.5216,  # 32 vCPU, 256 GB RAM
-    'n2-standard-32':     1.5264,  # 32 vCPU, 120 GB RAM
-    'z3-highmem-8':       2.7248,  # 8 vCPU + 4× LSSD
+    'c4-standard-8': 0.5008,  # 8 vCPU, 32 GB RAM, no LSSD
+    'n4-highmem-32': 3.0256,  # 32 vCPU, 256 GB RAM
+    'n2-highmem-32': 2.5216,  # 32 vCPU, 256 GB RAM
+    'n2-standard-32': 1.5264,  # 32 vCPU, 120 GB RAM
+    'z3-highmem-8': 2.7248,  # 8 vCPU + 4× LSSD
     # AWS
-    'i4i.4xlarge':        1.4960,  # 16 vCPU, 128 GB RAM, NVMe Instance Store
-    'i4i.2xlarge':        0.7480,
-    'm6id.4xlarge':       0.9072,  # 16 vCPU, 64 GB RAM, NVMe Instance Store
-    'm6i.4xlarge':        0.7680,  # 16 vCPU, 64 GB RAM, no Instance Store
-    'r6i.4xlarge':        1.0080,  # 16 vCPU, 128 GB RAM, no Instance Store
+    'i4i.4xlarge': 1.4960,  # 16 vCPU, 128 GB RAM, NVMe Instance Store
+    'i4i.2xlarge': 0.7480,
+    'm6id.4xlarge': 0.9072,  # 16 vCPU, 64 GB RAM, NVMe Instance Store
+    'm6i.4xlarge': 0.7680,  # 16 vCPU, 64 GB RAM, no Instance Store
+    'r6i.4xlarge': 1.0080,  # 16 vCPU, 128 GB RAM, no Instance Store
 }
 
 
@@ -4175,9 +5024,9 @@ def _collect_cost_sample(
   # GCP: machine type is the last segment of the metadata URL value
   gcp_type_out, _ = _pod_exec(
       pod,
-      'curl -s -m 3 --fail '
-      'http://metadata.google.internal/computeMetadata/v1/instance/machine-type '
-      '-H "Metadata-Flavor: Google" 2>/dev/null || echo ""',
+      'curl -s -m 3 --fail'
+      ' http://metadata.google.internal/computeMetadata/v1/instance/machine-type'
+      ' -H "Metadata-Flavor: Google" 2>/dev/null || echo ""',
       ignore_failure=True,
   )
   if gcp_type_out.strip():
@@ -4234,6 +5083,7 @@ def _collect_cost_sample(
 # Swap device detection (runs inside the pod)
 # ---------------------------------------------------------------------------
 
+
 def _detect_swap_device(pod: str) -> str:
   """Return the active swap device path on the cluster node."""
   if _SWAP_DEVICE.value:
@@ -4273,16 +5123,19 @@ def _detect_swap_device(pod: str) -> str:
 # Metadata builder
 # ---------------------------------------------------------------------------
 
+
 def _build_metadata(pod: str, swap_dev: str) -> dict:
   """Collect node environment, encryption type, and config into a dict."""
 
   kernel_out, _ = _pod_exec(pod, 'uname -r', ignore_failure=True)
   mem_out, _ = _pod_exec(
-      pod, "awk '/MemTotal/{print $2}' /proc/meminfo",
+      pod,
+      "awk '/MemTotal/{print $2}' /proc/meminfo",
       ignore_failure=True,
   )
   swap_out, _ = _pod_exec(
-      pod, "awk 'NR>1{sum+=$3} END{print sum+0}' /proc/swaps",
+      pod,
+      "awk 'NR>1{sum+=$3} END{print sum+0}' /proc/swaps",
       ignore_failure=True,
   )
 
@@ -4318,9 +5171,9 @@ def _build_metadata(pod: str, swap_dev: str) -> dict:
   if not instance_label:
     gcp_type_out, _ = _pod_exec(
         pod,
-        'curl -s -m 3 --fail '
-        'http://metadata.google.internal/computeMetadata/v1/instance/machine-type '
-        '-H "Metadata-Flavor: Google" 2>/dev/null || echo ""',
+        'curl -s -m 3 --fail'
+        ' http://metadata.google.internal/computeMetadata/v1/instance/machine-type'
+        ' -H "Metadata-Flavor: Google" 2>/dev/null || echo ""',
         ignore_failure=True,
     )
     if gcp_type_out.strip():

@@ -1,0 +1,20 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pyink
+        name: pyink
+        entry: pyink --pyink-indentation 2 --pyink-use-majority-quotes --unstable --line-length=80
+        language: system
+        types: [python]
+      - id: lint-diffs
+        name: lint-diffs (changed lines only)
+        entry: bash -c 'git diff -U0 upstream/master -- "$@" | lint-diffs'
+        language: system
+        types: [python]
+        pass_filenames: true
+      - id: no-print
+        name: no print statements (non-test files)
+        entry: bash -c 'grep -n "^\s*print(" "$@" && exit 1 || exit 0'
+        language: system
+        types: [python]
+        exclude: "(^tests/|^tools/|^perfkitbenchmarker/scripts/)"
