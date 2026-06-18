@@ -1,0 +1,12 @@
+########################################################################
+# SPLIT-B: azure_kubernetes_service.py
+# Description: AKS CreateNodePool (sync) + CreateNodePoolAsync
+#
+# These methods have been split out from the main PR for separate
+# discussion (per hubatish's review comment about splitting the
+# create-nodepools scenario).
+#
+# To apply: copy these methods back into the appropriate class/file
+# in the new -B PR branch.
+########################################################################
+
