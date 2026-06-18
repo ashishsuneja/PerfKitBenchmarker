@@ -442,95 +442,6 @@ class GoogleKubernetesEngineVersionFlagTestCase(PatchedObjectsTestCase):
       self.assertNotIn('--no-enable-autoupgrade', issue_command.all_commands)
 
 
-class GoogleKubernetesEngineAsyncOpsTestCase(PatchedObjectsTestCase):
-  """Tests async management-plane ops and the op-name fallback.
-
-  create/delete print the operation name to stdout. upgrade/update reliably
-  return success with empty stdout (gcloud does not print the name for those
-  subcommands), so _IssueAsync recovers it from `operations list`.
-  """
-
-  @staticmethod
-  def _spec():
-    return container_spec.ContainerClusterSpec(
-        'NAME',
-        **{
-            'cloud': 'GCP',
-            'vm_spec': {
-                'GCP': {
-                    'machine_type': 'fake-machine-type',
-                    'zone': 'us-central1-a',
-                },
-            },
-            'vm_count': 2,
-        },
-    )
-
-  def testCreateReturnsOpNameDirectly(self):
-    """create prints an op name on stdout — no fallback needed."""
-    spec = self._spec()
-    op = 'operation-create-1779870000000-abcd'
-    with self.patch_critical_objects(stdout=op + '\n') as issue_command:
-      cluster = google_kubernetes_engine.GkeCluster(spec)
-      pool = mock.Mock(name='pool-cfg')
-      pool.name = 'pkbma000'
-      pool.num_nodes = 2
-      pool.machine_type = 'fake-machine-type'
-      self.enter_context(mock.patch.object(cluster, '_AddNodeParamsToCmd'))
-      handle = cluster.CreateNodePoolAsync(pool)
-    self.assertEqual(op, handle)
-    self.assertIn(
-        'gcloud container node-pools create', issue_command.all_commands
-    )
-    # No operations-list lookup should have been needed.
-    self.assertNotIn(
-        'gcloud container operations list', issue_command.all_commands
-    )
-
-  def testUpgradeFallsBackToOpsList(self):
-    """upgrade returns empty stdout; op name recovered from operations list."""
-    spec = self._spec()
-    found_op = 'operation-1779870514692-250d3b27-upgrade'
-    with self.patch_critical_objects():
-      cluster = google_kubernetes_engine.GkeCluster(spec)
-      issue = self.MockIssueCommand({
-          'clusters upgrade': [('', '', 0)],  # empty stdout -> fallback
-          'operations list': [(found_op + '\n', '', 0)],
-      })
-      handle = cluster.UpgradeNodePoolAsync('pkbma000', '1.34')
-    self.assertEqual(found_op, handle)
-    self.assertIn('gcloud container clusters upgrade', issue.all_commands)
-    self.assertIn('gcloud container operations list', issue.all_commands)
-    self.assertIn('operationType=UPGRADE_NODES', issue.all_commands)
-
-  def testUpdateClusterFallsBackToOpsList(self):
-    """update returns empty stdout; op name recovered from operations list."""
-    spec = self._spec()
-    found_op = 'operation-1779873580306-efa66f70-update'
-    with self.patch_critical_objects():
-      cluster = google_kubernetes_engine.GkeCluster(spec)
-      issue = self.MockIssueCommand({
-          'clusters update': [('', '', 0)],
-          'operations list': [(found_op + '\n', '', 0)],
-      })
-      handle = cluster.UpdateClusterAsync()
-    self.assertEqual(found_op, handle)
-    self.assertIn('operationType=UPDATE_CLUSTER', issue.all_commands)
-    # Fast updates may already be DONE: filter must include DONE + startTime.
-    self.assertIn('status=DONE', issue.all_commands)
-    self.assertIn('startTime>=', issue.all_commands)
-
-  def testIssueAsyncRaisesWhenNoOpNameAndNoFallback(self):
-    """Empty stdout with no fallback configured is a hard error."""
-    spec = self._spec()
-    with self.patch_critical_objects():
-      cluster = google_kubernetes_engine.GkeCluster(spec)
-      self.MockIssueCommand({'': [('', '', 0)]})
-      cmd = cluster._GcloudCommand('container', 'node-pools', 'delete', 'x')
-      with self.assertRaises(errors.Resource.CreationError):
-        cluster._IssueAsync(cmd)
-
-
 class GoogleKubernetesEngineGvnicFlagTestCase(PatchedObjectsTestCase):
 
   @staticmethod
@@ -907,7 +818,7 @@ class GoogleKubernetesEngineAutopilotTestCase(PatchedObjectsTestCase):
           metadata,
       )
 
-  @flagsaver.flagsaver(run_uri='123')
+  @flagsaver.flagsaver(gpu_type='h100', gpu_count=1, run_uri='123')
   def testApplyYamlGpusH100(self):
     self.enter_context(
         mock.patch(
@@ -947,8 +858,6 @@ class GoogleKubernetesEngineAutopilotTestCase(PatchedObjectsTestCase):
         )
     )
     spec = self.create_kubernetes_engine_spec()
-    spec.vm_spec.gpu_count = 1
-    spec.vm_spec.gpu_type = 'h100'
     with self.assertLogs(level='INFO') as logs:
       cluster = google_kubernetes_engine.GkeAutopilotCluster(spec)
       yamls = kubernetes_commands.ConvertManifestToYamlDicts(
@@ -976,7 +885,9 @@ class GoogleKubernetesEngineAutopilotTestCase(PatchedObjectsTestCase):
     spec = self.create_kubernetes_engine_spec()
     with self.patch_critical_objects():
       cluster = google_kubernetes_engine.GkeAutopilotCluster(spec)
-    self.MockIssueCommand({'get node': [('ek-standard-16', '', 0)]})
+    self.MockIssueCommand(
+        {'get node': [('ek-standard-16', '', 0)]}
+    )
     self.assertEqual(
         cluster.GetMachineTypeFromNodeName(
             'gke-pkb-cluster-default-pool-node-1'
