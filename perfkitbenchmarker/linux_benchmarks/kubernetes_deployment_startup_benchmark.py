@@ -15,34 +15,39 @@
 
 PR 1 — Metrics & Observability (Layer 0)
 ==========================================================================
-Extends the existing benchmark with two new metrics and per-sample
-metadata, with no workload or scenario logic changes:
+See PR 1 section further down / git history: max_pod_ready_time (existing),
+per_pod_ready_time, startup_latency/per_pod_startup_latency,
+cpu_utilization_peak/mean_millicores + cpu_utilization_reading_count.
 
-  1. startup_latency (+ per_pod_startup_latency) — PodRunning -> Ready,
-     i.e. container-process-started -> app-passed-readiness-probe.
-     PodRunning is synthesized in kubernetes_conditions.py from
-     containerStatuses[].state.running.startedAt, since Kubernetes
-     doesn't report it as a real pod condition. Distinct from the
-     existing max_pod_ready_time (PodReadyToStartContainers -> Ready),
-     which also includes scheduling + image pull time.
-  2. cpu_utilization_{peak,mean}_millicores + cpu_utilization_reading_count
-     — CPU sampled in a background thread during the startup window via
-     `kubectl top pods`, following the same background-collector pattern
-     used by kubernetes_hpa_benchmark.py / kubernetes_vpa_benchmark.py.
-  3. per_pod_ready_time — per-pod max_pod_ready_time breakdown, useful for
-     percentile analysis across replicas.
-  4. metadata (scenario/workload/cloud) added to every sample for
-     cross-config comparison. scenario/workload are static "baseline"/
-     "jvm" string literals here since the actual --scenario/--workload
-     flags don't exist until PR 3 / PR 2; those PRs replace these
-     hardcoded values with real flag-driven ones.
+PR 2 — vLLM Workload Support (Layer 1)
+==========================================================================
+Adds a second workload option alongside the existing slow-starting JVM
+app: a CPU-only vLLM OpenAI-compatible server
+(public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo), selected via
+--kubernetes_deployment_startup_workload={jvm,vllm}.
 
-Required metrics fail loudly rather than silently degrading: if a metric
-can't be computed at all for the whole run, this raises instead of
-logging a warning and returning partial results.
+  - New WORKLOAD flag (default 'jvm').
+  - New VLLM_IMAGE / VLLM_YAML flags pointing at the vLLM container image
+    and its Deployment+Service manifest (vllm.yaml.j2).
+  - GetConfig() swaps the container spec's image to VLLM_IMAGE when
+    workload=vllm.
+  - Prepare()/Run() branch on WORKLOAD to apply/wait-on the right
+    Deployment (startup vs vllm-startup).
+  - Sample metadata's 'workload' field is now flag-driven instead of the
+    hardcoded 'jvm' literal from PR 1 ('scenario' stays hardcoded
+    'baseline' until PR 3 introduces the scenario flag).
+  - New VLLM_GPU_MEMORY_UTILIZATION / VLLM_MEMORY_LIMIT flags, forwarded
+    to vllm.yaml.j2 as --gpu-memory-utilization and
+    requests/limits.memory. These are bundled into this layer (rather
+    than landing as later hotfixes) because vLLM's own defaults
+    (~0.9 utilization, no explicit memory limit) are not viable defaults
+    for this benchmark at all: they deterministically crash-loop
+    ("ValueError: Available memory ... is less than desired CPU memory
+    utilization") or OOMKill during compile/warmup against a small
+    container memory limit. A vLLM workload option that ships without
+    working defaults isn't a usable PR 2.
 
-Nothing in Prepare() or Cleanup() changes. PR 2 adds vLLM workload
-support; PR 3 adds the VPA CPU Startup Boost scenario flag.
+No scenario/CPU-Startup-Boost logic yet -- that's PR 3.
 """
 
 import collections
@@ -66,7 +71,7 @@ BENCHMARK_NAME = 'kubernetes_deployment_startup'
 BENCHMARK_CONFIG = """
 kubernetes_deployment_startup:
   description: >
-    Measures the time it takes for a slow-starting JVM application
+    Measures the time it takes for a slow-starting JVM application or vLLM
     to become ready in a Kubernetes cluster.
   container_cluster:
     cloud: GCP
@@ -82,48 +87,126 @@ kubernetes_deployment_startup:
         zone: 'us-central1'
 """
 
+# ── Existing flags (PR 1) ────────────────────────────────────────────────
 DEPLOYMENT_YAML = flags.DEFINE_string(
     'kubernetes_deployment_startup_yaml',
     'container/kubernetes_deployment_startup/slowjvmstartup.yaml.j2',
-    'Deployment yaml',
+    'Deployment yaml for JVM workload.',
 )
 DEPLOYMENT_IMAGE = flags.DEFINE_string(
     'kubernetes_deployment_startup_image',
     None,
-    'Image name. If omitted, "slowjvmstartup" will be used',
+    'Image name for JVM workload. If omitted, "slowjvmstartup" will be used.',
 )
 
+# ── New flags (PR 2) ──────────────────────────────────────────────────────
+WORKLOAD = flags.DEFINE_enum(
+    'kubernetes_deployment_startup_workload',
+    'jvm',
+    ['jvm', 'vllm'],
+    'Workload type to deploy.',
+)
+VLLM_IMAGE = flags.DEFINE_string(
+    'kubernetes_deployment_startup_vllm_image',
+    'public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest',
+    'Container image for the vLLM CPU workload.',
+)
+VLLM_YAML = flags.DEFINE_string(
+    'kubernetes_deployment_startup_vllm_yaml',
+    'container/kubernetes_deployment_startup/vllm.yaml.j2',
+    'Deployment yaml for the vLLM workload.',
+)
+VLLM_GPU_MEMORY_UTILIZATION = flags.DEFINE_float(
+    'kubernetes_deployment_startup_vllm_gpu_memory_utilization',
+    0.5,
+    "Fraction of the vLLM container's memory limit to reserve for model "
+    + "weights/KV cache -- vLLM's --gpu-memory-utilization flag, which "
+    + 'despite the name also governs the CPU backend. vLLM defaults to '
+    + "~0.9, which assumes far more headroom than this benchmark's "
+    + 'container memory limit provides once Python/PyTorch/runtime '
+    + 'overhead is subtracted -- an unconfigured default here '
+    + 'deterministically crash-loops ("ValueError: Available memory ... is '
+    + 'less than desired CPU memory utilization"). 0.5 keeps the '
+    + 'reservation within the observed available headroom.',
+    lower_bound=0.05,
+    upper_bound=0.95,
+)
+VLLM_MEMORY_LIMIT = flags.DEFINE_string(
+    'kubernetes_deployment_startup_vllm_memory_limit',
+    '8Gi',
+    "vLLM container's requests/limits.memory (Kubernetes quantity, e.g."
+    + ' "8Gi"). vLLM OOMKills (exit 137) during its "Warming up model for'
+    + ' the compilation..." phase against too small a limit -- 8Gi keeps'
+    + ' the pod Guaranteed QoS (requests == limits) and fits comfortably'
+    + ' on the n2-standard-4 nodes used for baseline vLLM runs (~16GiB'
+    + ' allocatable).',
+)
+
+_JVM_DEPLOYMENT_NAME = 'startup'
+_VLLM_DEPLOYMENT_NAME = 'vllm-startup'
 _CPU_POLL_INTERVAL_SECS = 5
 
 
 def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
+  """Returns merged benchmark config.
+
+  For workload=vllm, swaps the container spec's image to VLLM_IMAGE.
+
+  Args:
+    user_config: User-supplied configuration.
+
+  Returns:
+    Loaded benchmark configuration.
+  """
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
-  if DEPLOYMENT_IMAGE.value is not None:
+
+  if WORKLOAD.value == 'vllm':
+    config['container_specs']['kubernetes_deployment_startup'][
+        'image'
+    ] = VLLM_IMAGE.value
+  elif DEPLOYMENT_IMAGE.value is not None:
     config['container_specs']['kubernetes_deployment_startup'][
         'image'
     ] = DEPLOYMENT_IMAGE.value
+
   return config
 
 
 def Prepare(benchmark_spec: bm_spec.BenchmarkSpec):
   """Prepares the Kubernetes cluster for the benchmark.
 
+  Deploys the JVM or vLLM workload depending on WORKLOAD.
+
   Args:
     benchmark_spec: The benchmark specification.
   """
-  del benchmark_spec
+  image = benchmark_spec.container_specs['kubernetes_deployment_startup'].image
+  workload = WORKLOAD.value
+
+  if workload == 'vllm':
+    logging.info('[startup] Deploying vLLM workload (image=%s)', image)
+    kubernetes_commands.ApplyManifest(
+        VLLM_YAML.value,
+        name=_VLLM_DEPLOYMENT_NAME,
+        image=image,
+        gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION.value,
+        memory_limit=VLLM_MEMORY_LIMIT.value,
+    )
+  else:
+    logging.info('[startup] Deploying JVM workload (image=%s)', image)
+    kubernetes_commands.ApplyManifest(
+        DEPLOYMENT_YAML.value,
+        name=_JVM_DEPLOYMENT_NAME,
+        image=image,
+    )
 
 
 def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   """Runs the benchmark and collects startup metrics.
 
-  Collects:
-    1. max_pod_ready_time     — PodReadyToStartContainers -> Ready
-       (existing metric, preserved).
-    2. per_pod_ready_time     — per-pod breakdown of the above (PR 1).
-    3. startup_latency        — PodRunning -> Ready (per-pod:
-       per_pod_startup_latency) (PR 1).
-    4. cpu_utilization_*      — background CPU collector (PR 1).
+  Collects all PR 1 metrics (max_pod_ready_time, per_pod_ready_time,
+  startup_latency/per_pod_startup_latency, cpu_utilization_*) against
+  whichever workload's Deployment is active.
 
   Required metrics fail loudly rather than silently degrading: if a
   metric can't be computed at all for the whole run, this raises instead
@@ -138,18 +221,17 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
       if zero CPU utilization readings were collected all run.
 
   Returns:
-    A list of sample.Sample objects.
+    List of sample.Sample objects.
   """
-  image = benchmark_spec.container_specs['kubernetes_deployment_startup'].image
-  kubernetes_commands.ApplyManifest(
-      DEPLOYMENT_YAML.value,
-      name='startup',
-      image=image,
+  del benchmark_spec  # Image/deployment name are resolved via flags below.
+  workload = WORKLOAD.value
+  deployment_name = (
+      _VLLM_DEPLOYMENT_NAME if workload == 'vllm' else _JVM_DEPLOYMENT_NAME
   )
 
   base_metadata: Dict[str, Any] = {
       'scenario': 'baseline',
-      'workload': 'jvm',
+      'workload': workload,
       'cloud': FLAGS.cloud,
   }
 
@@ -175,7 +257,9 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
     )
     collector_thread.start()
 
-    kubernetes_commands.WaitForRollout('deployment/startup', timeout=600)
+    kubernetes_commands.WaitForRollout(
+        f'deployment/{deployment_name}', timeout=600
+    )
 
   finally:
     stop.set()
@@ -289,7 +373,9 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   )
 
   logging.info(
-      '[startup] max_pod_ready_time=%.2fs startup_latency=%.2fs pods=%d',
+      '[startup] workload=%s max_pod_ready_time=%.2fs'
+      + ' startup_latency=%.2fs pods=%d',
+      workload,
       max_pod_ready_t,
       max_startup_latency,
       len(pod_name_to_start_end_times),
@@ -308,7 +394,7 @@ def Cleanup(benchmark_spec: bm_spec.BenchmarkSpec):
 
 
 # ---------------------------------------------------------------------------
-# CPU Utilization Background Collector (PR 1)
+# CPU Utilization Background Collector (PR 1 — unchanged)
 # ---------------------------------------------------------------------------
 
 
@@ -327,9 +413,7 @@ class _CpuUtilizationCollector:
     Transient poll failures (e.g. the Kubernetes Metrics API still
     warming up on a freshly created cluster) are tolerated by _Observe
     and simply retried. This only raises if the metric ends up with zero
-    data for the entire run -- the same standard applied to
-    startup_latency, so a total collection failure is surfaced as a
-    benchmark failure instead of silently shipping incomplete results.
+    data for the entire run.
 
     Raises:
       RuntimeError: If not a single CPU reading was collected all run.

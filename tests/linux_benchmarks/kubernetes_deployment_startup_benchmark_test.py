@@ -11,19 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for kubernetes_deployment_startup_benchmark (PR 1).
+"""Tests for kubernetes_deployment_startup_benchmark (PR 1-2)."""
 
-Scope: metrics + observability only (max_pod_ready_time, per_pod_ready_time,
-startup_latency/per_pod_startup_latency, cpu_utilization_*). No
-workload/scenario flags exist yet -- those are added in PR 2/PR 3 -- so
-sample metadata here is asserted against the hardcoded 'baseline'/'jvm'
-literals Run() emits at this layer.
-"""
-
+import os
 import threading
 from unittest import mock
 
 from absl.testing import flagsaver
+import jinja2
+import yaml
+from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker.linux_benchmarks import (
     kubernetes_deployment_startup_benchmark as bench,
@@ -190,9 +187,6 @@ class StartupLatencyTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertLen(per_pod, 2)
 
   def testDistinctFromMaxPodReadyTime(self):
-    # PodReadyToStartContainers is earlier than PodRunning (scheduling +
-    # image pull happen first), so startup_latency should be smaller than
-    # max_pod_ready_time for the same pod.
     conditions = [
         _MakeCondition('pod-0', 'PodReadyToStartContainers', 1000),
         _MakeCondition('pod-0', 'PodRunning', 1015),
@@ -207,10 +201,6 @@ class StartupLatencyTest(pkb_common_test_case.PkbCommonTestCase):
     )
 
   def testRaisesWhenPodRunningMissing(self):
-    # Per review: if the cluster/runtime never reports containerStatuses
-    # startedAt for any pod, startup_latency can't be computed at all --
-    # this must fail loudly rather than silently succeeding with the
-    # metric missing.
     conditions = [
         _MakeCondition('pod-0', 'PodReadyToStartContainers', 1000),
         _MakeCondition('pod-0', 'Ready', 1030),
@@ -220,15 +210,15 @@ class StartupLatencyTest(pkb_common_test_case.PkbCommonTestCase):
 
 
 class SampleMetadataTest(pkb_common_test_case.PkbCommonTestCase):
-  """Tests for sample metadata (PR 1).
-
-  scenario/workload aren't flag-driven yet at this layer (that's PR 2/PR 3)
-  -- Run() emits the hardcoded 'baseline'/'jvm' literals for every sample.
-  """
+  """Tests for sample metadata (PR 1 + PR 2)."""
 
   def testAllSamplesCarryScenarioWorkloadCloud(self):
     samples = _RunWithConditions(
-        _DefaultConditions(), flag_kwargs={'cloud': 'GCP'}
+        _DefaultConditions(),
+        flag_kwargs={
+            'cloud': 'GCP',
+            'kubernetes_deployment_startup_workload': 'jvm',
+        },
     )
     pod_samples = [
         s
@@ -240,6 +230,19 @@ class SampleMetadataTest(pkb_common_test_case.PkbCommonTestCase):
       self.assertEqual(s.metadata['scenario'], 'baseline')
       self.assertEqual(s.metadata['workload'], 'jvm')
       self.assertEqual(s.metadata['cloud'], 'GCP')
+
+  def testWorkloadMetadataReflectsFlag(self):
+    # PR 2: workload is now flag-driven instead of the PR 1 hardcoded
+    # literal.
+    samples = _RunWithConditions(
+        _DefaultConditions(),
+        flag_kwargs={
+            'cloud': 'GCP',
+            'kubernetes_deployment_startup_workload': 'vllm',
+        },
+    )
+    pod_samples = [s for s in samples if s.metric == 'max_pod_ready_time']
+    self.assertEqual(pod_samples[0].metadata['workload'], 'vllm')
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +280,6 @@ class CpuUtilizationCollectorTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(by_metric['cpu_utilization_reading_count'], 3)
 
   def testRaisesWhenNoReadings(self):
-    # Per review: zero CPU readings for the whole run must fail loudly
-    # rather than silently shipping results with cpu_utilization missing.
     collector, samples, stop = self._MakeCollector()
     collector._readings = []
     stop.set()
@@ -301,9 +302,6 @@ class CpuUtilizationCollectorTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(call_count[0], 3)
 
   def testRunRaisesWhenCpuCollectionFailsEntirely(self):
-    # End-to-end: bench.Run() runs the collector on a background thread,
-    # so this also verifies the collector's RuntimeError is captured and
-    # re-raised on the main thread rather than silently disappearing.
     with self.assertRaises(RuntimeError):
       _RunWithConditions(_DefaultConditions(), cpu_millicores=None)
 
@@ -362,3 +360,230 @@ class GetTotalCpuMillicoresTest(pkb_common_test_case.PkbCommonTestCase):
   def testReturnsNoneOnEmpty(self):
     with self._MockKubectl(''):
       self.assertIsNone(bench._GetTotalCpuMillicores())
+
+
+# ---------------------------------------------------------------------------
+# PR 2: vLLM workload
+# ---------------------------------------------------------------------------
+
+
+class VllmWorkloadTest(pkb_common_test_case.PkbCommonTestCase):
+  """Tests for vLLM workload support (PR 2)."""
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm', cloud='GCP'
+  )
+  def testPrepareDeploysVllmManifest(self):
+    bm = _MakeSpec(image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest')
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest'
+    ) as mock_apply:
+      bench.Prepare(bm)
+      call_args = mock_apply.call_args[0][0]
+      self.assertIn('vllm', call_args)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='jvm', cloud='GCP'
+  )
+  def testPrepareDeploysJvmManifest(self):
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest'
+    ) as mock_apply:
+      bench.Prepare(_MakeSpec())
+      call_args = mock_apply.call_args[0][0]
+      self.assertIn('slowjvmstartup', call_args)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm', cloud='GCP'
+  )
+  def testRunWaitsOnVllmDeployment(self):
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest'
+    ), mock.patch.object(
+        bench.kubernetes_commands, 'WaitForRollout'
+    ) as mock_wait, mock.patch.object(
+        bench.kubernetes_conditions,
+        'GetStatusConditionsForResourceType',
+        return_value=_DefaultConditions(),
+    ), mock.patch.object(
+        bench, '_GetTotalCpuMillicores', return_value=100.0
+    ):
+      bench.Run(_MakeSpec())
+      mock_wait.assert_called_with('deployment/vllm-startup', timeout=600)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='jvm', cloud='GCP'
+  )
+  def testRunWaitsOnJvmDeployment(self):
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest'
+    ), mock.patch.object(
+        bench.kubernetes_commands, 'WaitForRollout'
+    ) as mock_wait, mock.patch.object(
+        bench.kubernetes_conditions,
+        'GetStatusConditionsForResourceType',
+        return_value=_DefaultConditions(),
+    ), mock.patch.object(
+        bench, '_GetTotalCpuMillicores', return_value=100.0
+    ):
+      bench.Run(_MakeSpec())
+      mock_wait.assert_called_with('deployment/startup', timeout=600)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm', cloud='GCP'
+  )
+  def testPrepareUsesGpuMemoryUtilizationDefault(self):
+    # vLLM's own ~0.9 default crash-loops against a constrained container
+    # memory limit, so Prepare() must always forward an explicit value.
+    captured = {}
+
+    def _record(*args, **kwargs):
+      if 'vllm' in args[0]:
+        captured.update(kwargs)
+
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest', side_effect=_record
+    ):
+      bench.Prepare(
+          _MakeSpec(
+              image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest'
+          )
+      )
+
+    self.assertEqual(
+        captured['gpu_memory_utilization'],
+        bench.VLLM_GPU_MEMORY_UTILIZATION.default,
+    )
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm',
+      kubernetes_deployment_startup_vllm_gpu_memory_utilization=0.3,
+      cloud='GCP',
+  )
+  def testPrepareGpuMemoryUtilizationOverridableViaFlag(self):
+    captured = {}
+
+    def _record(*args, **kwargs):
+      if 'vllm' in args[0]:
+        captured.update(kwargs)
+
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest', side_effect=_record
+    ):
+      bench.Prepare(
+          _MakeSpec(
+              image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest'
+          )
+      )
+
+    self.assertEqual(captured['gpu_memory_utilization'], 0.3)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm', cloud='GCP'
+  )
+  def testPrepareUsesMemoryLimitDefault(self):
+    # The old hardcoded 4Gi OOMKilled during vLLM's compile/warmup phase.
+    captured = {}
+
+    def _record(*args, **kwargs):
+      if 'vllm' in args[0]:
+        captured.update(kwargs)
+
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest', side_effect=_record
+    ):
+      bench.Prepare(
+          _MakeSpec(
+              image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest'
+          )
+      )
+
+    self.assertEqual(captured['memory_limit'], bench.VLLM_MEMORY_LIMIT.default)
+
+  @flagsaver.flagsaver(
+      kubernetes_deployment_startup_workload='vllm',
+      kubernetes_deployment_startup_vllm_memory_limit='12Gi',
+      cloud='GCP',
+  )
+  def testPrepareMemoryLimitOverridableViaFlag(self):
+    captured = {}
+
+    def _record(*args, **kwargs):
+      if 'vllm' in args[0]:
+        captured.update(kwargs)
+
+    with mock.patch.object(
+        bench.kubernetes_commands, 'ApplyManifest', side_effect=_record
+    ):
+      bench.Prepare(
+          _MakeSpec(
+              image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest'
+          )
+      )
+
+    self.assertEqual(captured['memory_limit'], '12Gi')
+
+
+# ---------------------------------------------------------------------------
+# Regression test: manifest files must actually exist on disk.
+#
+# All tests above mock kubernetes_commands.ApplyManifest, so none of them
+# ever resolve DEPLOYMENT_YAML/VLLM_YAML against the real `data/`
+# directory. These tests close that gap by calling data.ResourcePath() for
+# real.
+# ---------------------------------------------------------------------------
+
+
+class ManifestResourceResolutionTest(pkb_common_test_case.PkbCommonTestCase):
+  """Confirms every manifest flag default resolves to a real, valid file."""
+
+  def testJvmManifestResolves(self):
+    path = data.ResourcePath(bench.DEPLOYMENT_YAML.value)
+    self.assertTrue(os.path.isfile(path))
+
+  def testVllmManifestResolves(self):
+    path = data.ResourcePath(bench.VLLM_YAML.value)
+    self.assertTrue(os.path.isfile(path))
+
+  def testJvmManifestRendersValidYaml(self):
+    path = data.ResourcePath(bench.DEPLOYMENT_YAML.value)
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(os.path.dirname(path))
+    )
+    rendered = env.get_template(os.path.basename(path)).render(
+        name='startup', image='slowjvmstartup'
+    )
+    docs = list(yaml.safe_load_all(rendered))
+    self.assertEqual(docs[0]['kind'], 'Deployment')
+
+  def testVllmManifestRendersValidYaml(self):
+    path = data.ResourcePath(bench.VLLM_YAML.value)
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(os.path.dirname(path))
+    )
+    rendered = env.get_template(os.path.basename(path)).render(
+        name='vllm-startup',
+        image='public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest',
+        gpu_memory_utilization=bench.VLLM_GPU_MEMORY_UTILIZATION.default,
+        memory_limit=bench.VLLM_MEMORY_LIMIT.default,
+    )
+    docs = list(yaml.safe_load_all(rendered))
+    self.assertEqual(docs[0]['kind'], 'Deployment')
+    self.assertEqual(docs[1]['kind'], 'Service')
+    container_args = docs[0]['spec']['template']['spec']['containers'][0][
+        'args'
+    ]
+    self.assertIn('--gpu-memory-utilization', container_args)
+    self.assertEqual(
+        container_args[container_args.index('--gpu-memory-utilization') + 1],
+        str(bench.VLLM_GPU_MEMORY_UTILIZATION.default),
+    )
+    resources = docs[0]['spec']['template']['spec']['containers'][0][
+        'resources'
+    ]
+    self.assertEqual(
+        resources['requests']['memory'], bench.VLLM_MEMORY_LIMIT.default
+    )
+    self.assertEqual(
+        resources['limits']['memory'], bench.VLLM_MEMORY_LIMIT.default
+    )
