@@ -13,41 +13,89 @@
 # limitations under the License.
 """Benchmark for measuring time to start up a deployment on Kubernetes.
 
-PR 1 — Metrics & Observability (Layer 0)
+PR 3 — Baseline/Optimized Scenario + CPU Startup Boost via VPA (Layer 2)
 ==========================================================================
-See PR 1 section further down / git history: max_pod_ready_time (existing),
-per_pod_ready_time, startup_latency/per_pod_startup_latency,
-cpu_utilization_peak/mean_millicores + cpu_utilization_reading_count.
+Completes the 4-configuration benchmark matrix:
 
-PR 2 — vLLM Workload Support (Layer 1)
+  Config 1: GKE  w/o cpuboost  (scenario=baseline,   cloud=GCP)
+  Config 2: AWS  w/o cpuboost  (scenario=baseline,   cloud=AWS)
+  Config 3: AKS  w/o cpuboost  (scenario=baseline,   cloud=Azure)
+  Config 4: GKE  w/  cpuboost  (scenario=optimized,  cloud=GCP)
+
+Changes vs PR 2:
+  - BOOST_FACTOR flag (default 2, matching Kam's "factor of 2 or 3").
+  - GetConfig(): enables VPA on the cluster config for scenario=optimized.
+  - Prepare(): deploys a VerticalPodAutoscaler alongside the JVM manifest
+    when scenario=optimized (GKE only). VPA manifest uses startup boost
+    policy with the configured boost factor.
+  - CheckPrerequisites(): raises if scenario=optimized is used on non-GCP.
+  - Run(): adds scenario to all sample metadata for cross-config comparison.
+
+PR 4 — CPU Startup Boost for vLLM
 ==========================================================================
-Adds a second workload option alongside the existing slow-starting JVM
-app: a CPU-only vLLM OpenAI-compatible server
-(public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo), selected via
---kubernetes_deployment_startup_workload={jvm,vllm}.
+scenario=optimized is no longer JVM-only. AI/inference workloads spend a
+large share of startup loading models into memory, so the same GKE VPA
+CPU Startup Boost mechanism used for the JVM workload is now wired into
+the vLLM Prepare() path too -- same code, same
+--kubernetes_deployment_startup_scenario / _workload flags, just toggled
+per run.
 
-  - New WORKLOAD flag (default 'jvm').
-  - New VLLM_IMAGE / VLLM_YAML flags pointing at the vLLM container image
-    and its Deployment+Service manifest (vllm.yaml.j2).
-  - GetConfig() swaps the container spec's image to VLLM_IMAGE when
-    workload=vllm.
-  - Prepare()/Run() branch on WORKLOAD to apply/wait-on the right
-    Deployment (startup vs vllm-startup).
-  - Sample metadata's 'workload' field is now flag-driven instead of the
-    hardcoded 'jvm' literal from PR 1 ('scenario' stays hardcoded
-    'baseline' until PR 3 introduces the scenario flag).
-  - New VLLM_GPU_MEMORY_UTILIZATION / VLLM_MEMORY_LIMIT flags, forwarded
-    to vllm.yaml.j2 as --gpu-memory-utilization and
-    requests/limits.memory. These are bundled into this layer (rather
-    than landing as later hotfixes) because vLLM's own defaults
-    (~0.9 utilization, no explicit memory limit) are not viable defaults
-    for this benchmark at all: they deterministically crash-loop
-    ("ValueError: Available memory ... is less than desired CPU memory
-    utilization") or OOMKill during compile/warmup against a small
-    container memory limit. A vLLM workload option that ships without
-    working defaults isn't a usable PR 2.
+  - CheckPrerequisites(): no longer raises for workload=vllm; only the
+    cloud=GCP restriction remains for scenario=optimized.
+  - Prepare(): VPA apply-before-deployment ordering now runs for either
+    workload, targeting whichever Deployment name is active
+    (startup / vllm-startup).
+  - The VPA manifest's CPU ceiling (resourcePolicy.maxAllowed.cpu) and
+    startupBoost.cpu.durationSeconds are now template parameters instead
+    of hardcoded values -- vLLM's baseline CPU request (2 cores) already
+    exceeds the JVM-tuned ceiling of "1", and model loading is expected
+    to take longer than the JVM's ~67s baseline that the old fixed 120s
+    duration was sized for. New optional flags
+    (kubernetes_deployment_startup_vpa_max_cpu /
+    _vpa_duration_seconds) override the per-workload defaults if they
+    don't fit a given model/image.
 
-No scenario/CPU-Startup-Boost logic yet -- that's PR 3.
+PR 5 — Fix vLLM crash-loop from default GPU memory utilization
+==========================================================================
+Production runs of workload=vllm crash-looped indefinitely (readiness
+probe never passed, deployment exceeded its progress deadline) with:
+  ValueError: Available memory on node 0 (2.12/4.0 GiB) on startup is
+  less than desired CPU memory utilization (0.92, 3.68 GiB).
+vLLM's CPU backend defaults --gpu-memory-utilization to ~0.9 (despite the
+GPU-sounding name, it also governs the CPU backend), which assumes far
+more headroom than this benchmark's 4Gi container memory limit provides
+once Python/PyTorch/runtime overhead is subtracted. Raising the memory
+limit to compensate would require an impractically large allocation (the
+observed ~1.88GiB of fixed overhead means the limit would need to be
+~23GiB just to satisfy the default 92% reservation) -- the container's
+memory limit was never the actual bottleneck, vLLM's default utilization
+fraction was.
+
+  - New VLLM_GPU_MEMORY_UTILIZATION flag
+    (kubernetes_deployment_startup_vllm_gpu_memory_utilization, default
+    0.5) passed to the vLLM container as a `--gpu-memory-utilization`
+    arg in vllm.yaml.j2, keeping the reservation within the headroom
+    actually available under the existing 4Gi limit.
+
+PR 6 — Fix vLLM OOMKill during compile/warmup (4Gi limit was too small)
+==========================================================================
+PR 5's fix stopped the deterministic startup ValueError, but production
+runs still OOMKilled (exit 137) a few minutes later, during the "Warming
+up model for the compilation..." phase -- confirmed via `kubectl
+describe pod` (State: Terminated, Reason: OOMKilled) and `kubectl top
+pods` showing RSS plateau right at the 4Gi limit before the pod reset.
+Lowering --gpu-memory-utilization from 0.5 to 0.3 (shrinking the KV
+cache reservation by ~800MiB) made no measurable difference to the
+observed peak (4041Mi vs 4044Mi) -- the overage comes from
+compile/warmup buffers, a cost that's largely fixed regardless of KV
+cache sizing, so gpu_memory_utilization alone can't fix it.
+
+  - New VLLM_MEMORY_LIMIT flag (kubernetes_deployment_startup_vllm_
+    memory_limit, default "8Gi") templated into vllm.yaml.j2's
+    requests/limits.memory (kept equal to preserve Guaranteed QoS),
+    replacing the old hardcoded 4Gi.
+
+Exact VPA startup-boost policy fields follow Kam's linked guide.
 """
 
 import collections
@@ -61,6 +109,7 @@ from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
 from perfkitbenchmarker.resources.container_service import kubernetes_conditions
@@ -72,7 +121,8 @@ BENCHMARK_CONFIG = """
 kubernetes_deployment_startup:
   description: >
     Measures the time it takes for a slow-starting JVM application or vLLM
-    to become ready in a Kubernetes cluster.
+    to become ready in a Kubernetes cluster. Supports CPU Startup Boost via
+    VPA on GKE (scenario=optimized).
   container_cluster:
     cloud: GCP
     type: Kubernetes
@@ -87,7 +137,7 @@ kubernetes_deployment_startup:
         zone: 'us-central1'
 """
 
-# ── Existing flags (PR 1) ────────────────────────────────────────────────
+# ── Existing flags (PR 1 + PR 2) ─────────────────────────────────────────
 DEPLOYMENT_YAML = flags.DEFINE_string(
     'kubernetes_deployment_startup_yaml',
     'container/kubernetes_deployment_startup/slowjvmstartup.yaml.j2',
@@ -98,13 +148,17 @@ DEPLOYMENT_IMAGE = flags.DEFINE_string(
     None,
     'Image name for JVM workload. If omitted, "slowjvmstartup" will be used.',
 )
-
-# ── New flags (PR 2) ──────────────────────────────────────────────────────
 WORKLOAD = flags.DEFINE_enum(
     'kubernetes_deployment_startup_workload',
     'jvm',
     ['jvm', 'vllm'],
     'Workload type to deploy.',
+)
+SCENARIO = flags.DEFINE_enum(
+    'kubernetes_deployment_startup_scenario',
+    'baseline',
+    ['baseline', 'optimized'],
+    'Startup scenario. optimized enables GKE VPA CPU Startup Boost (GCP only).',
 )
 VLLM_IMAGE = flags.DEFINE_string(
     'kubernetes_deployment_startup_vllm_image',
@@ -116,41 +170,151 @@ VLLM_YAML = flags.DEFINE_string(
     'container/kubernetes_deployment_startup/vllm.yaml.j2',
     'Deployment yaml for the vLLM workload.',
 )
+
+# ── New flags (PR 5) ──────────────────────────────────────────────────────
 VLLM_GPU_MEMORY_UTILIZATION = flags.DEFINE_float(
     'kubernetes_deployment_startup_vllm_gpu_memory_utilization',
     0.5,
     "Fraction of the vLLM container's memory limit to reserve for model "
     + "weights/KV cache -- vLLM's --gpu-memory-utilization flag, which "
     + 'despite the name also governs the CPU backend. vLLM defaults to '
-    + "~0.9, which assumes far more headroom than this benchmark's "
+    + "~0.9, which assumes far more headroom than this benchmark's 4Gi "
     + 'container memory limit provides once Python/PyTorch/runtime '
-    + 'overhead is subtracted -- an unconfigured default here '
-    + 'deterministically crash-loops ("ValueError: Available memory ... is '
+    + 'overhead is subtracted -- confirmed in production logs as a '
+    + 'deterministic crash-loop ("ValueError: Available memory ... is '
     + 'less than desired CPU memory utilization"). 0.5 keeps the '
-    + 'reservation within the observed available headroom.',
+    + 'reservation within the observed available headroom on a 4Gi limit.',
     lower_bound=0.05,
     upper_bound=0.95,
 )
+
+# ── New flags (PR 6) ──────────────────────────────────────────────────────
 VLLM_MEMORY_LIMIT = flags.DEFINE_string(
     'kubernetes_deployment_startup_vllm_memory_limit',
     '8Gi',
     "vLLM container's requests/limits.memory (Kubernetes quantity, e.g."
-    + ' "8Gi"). vLLM OOMKills (exit 137) during its "Warming up model for'
-    + ' the compilation..." phase against too small a limit -- 8Gi keeps'
-    + ' the pod Guaranteed QoS (requests == limits) and fits comfortably'
-    + ' on the n2-standard-4 nodes used for baseline vLLM runs (~16GiB'
-    + ' allocatable).',
+    + ' "8Gi"). Production runs OOMKilled (exit 137) against the prior'
+    + ' hardcoded 4Gi limit during the "Warming up model for the'
+    + ' compilation..." phase, even after lowering'
+    + ' --gpu-memory-utilization from 0.5 to 0.3 -- observed peak RSS'
+    + ' stayed ~4.0GiB in both cases (4041Mi vs 4044Mi), confirming the'
+    + ' overage is compile/warmup overhead largely independent of the KV'
+    + ' cache reservation, not something --gpu-memory-utilization alone'
+    + ' can fix. 8Gi keeps the pod Guaranteed QoS (requests == limits)'
+    + ' and fits comfortably on the n2-standard-4 nodes used for'
+    + ' baseline vLLM runs (~16GiB allocatable).',
+)
+
+# ── New flags (PR 3) ──────────────────────────────────────────────────────
+BOOST_FACTOR = flags.DEFINE_integer(
+    'kubernetes_deployment_startup_boost_factor',
+    2,
+    'CPU Startup Boost factor for VPA (scenario=optimized only, GCP only). '
+    + 'Matches Kam\'s recommended "factor of 2 or 3".',
+    lower_bound=1,
+    upper_bound=10,
+)
+VPA_YAML = flags.DEFINE_string(
+    'kubernetes_deployment_startup_vpa_yaml',
+    'container/kubernetes_deployment_startup/slowjvmstartup_vpa.yaml.j2',
+    'VPA manifest for CPU Startup Boost (scenario=optimized, GCP only).',
+)
+
+# ── New flags (PR 4) ──────────────────────────────────────────────────────
+VPA_MAX_CPU = flags.DEFINE_string(
+    'kubernetes_deployment_startup_vpa_max_cpu',
+    None,
+    'Ceiling for the VPA CPU Startup Boost '
+    + '(resourcePolicy.containerPolicies[0].maxAllowed.cpu). If unset, '
+    + 'defaults to "1" for --kubernetes_deployment_startup_workload=jvm and '
+    + '"4" for =vllm (scenario=optimized only) -- vLLM already requests 2 '
+    + 'full cores at baseline, which exceeds the JVM-tuned "1" ceiling.',
+)
+VPA_DURATION_SECONDS = flags.DEFINE_integer(
+    'kubernetes_deployment_startup_vpa_duration_seconds',
+    None,
+    'How long, in seconds, the VPA keeps the CPU boost applied before '
+    + 'scaling back down (startupBoost.cpu.durationSeconds). If unset, '
+    + 'defaults to 120 for workload=jvm and 300 for workload=vllm '
+    + '(scenario=optimized only) -- sized to comfortably exceed each '
+    + "workload's observed baseline startup time; a boost that reverts "
+    + 'before the workload is ready defeats the point.',
+    lower_bound=1,
 )
 
 _JVM_DEPLOYMENT_NAME = 'startup'
 _VLLM_DEPLOYMENT_NAME = 'vllm-startup'
 _CPU_POLL_INTERVAL_SECS = 5
 
+_VPA_CRD_NAME = 'verticalpodautoscalers.autoscaling.k8s.io'
+_VPA_CRD_WAIT_TIMEOUT_SECS = 180
+
+# PR 4: per-workload VPA sizing defaults, overridable via VPA_MAX_CPU /
+# VPA_DURATION_SECONDS. vLLM's baseline CPU request (2 cores, see
+# vllm.yaml.j2) already exceeds the JVM-tuned "1" ceiling, and model
+# loading is expected to take longer than the JVM's ~67s baseline that
+# 120s was originally sized for.
+_VPA_DEFAULT_MAX_CPU = {'jvm': '1', 'vllm': '4'}
+_VPA_DEFAULT_DURATION_SECONDS = {'jvm': 120, 'vllm': 300}
+
+
+def _GetVpaMaxCpu(workload: str) -> str:
+  """Returns the VPA CPU ceiling for the given workload."""
+  return VPA_MAX_CPU.value or _VPA_DEFAULT_MAX_CPU[workload]
+
+
+def _GetVpaDurationSeconds(workload: str) -> int:
+  """Returns the VPA boost duration (seconds) for the given workload."""
+  return VPA_DURATION_SECONDS.value or _VPA_DEFAULT_DURATION_SECONDS[workload]
+
+
+def _WaitForVpaCrd() -> None:
+  """Waits for the VerticalPodAutoscaler CRD to be registered on the API server.
+
+  Enabling VPA via --enable-vertical-pod-autoscaling at cluster creation
+  triggers an asynchronous GKE addon install for the VPA CRDs. That install
+  can lag behind the cluster's own RUNNING status and behind kube-dns
+  readiness, so applying a VerticalPodAutoscaler manifest immediately after
+  the cluster comes up can race the CRD registration -- confirmed in
+  production logs where `kubectl apply` failed with "no matches for kind
+  VerticalPodAutoscaler" just seconds after kube-dns reported ready.
+  Poll for the CRD instead of assuming it's already there.
+
+  Raises:
+    RuntimeError: If the CRD never registers within the timeout.
+  """
+
+  @vm_util.Retry(
+      timeout=_VPA_CRD_WAIT_TIMEOUT_SECS,
+      retryable_exceptions=(errors.VmUtil.IssueCommandError,),
+  )
+  def _Poll():
+    # Deliberately do NOT pass raise_on_failure=False here: kubectl.
+    # RunKubectlCommand's suppress_failure wrapper rewrites a suppressed
+    # failure's return code to 0 (see vm_util.IssueCommand), which would
+    # silently defeat a `retcode != 0` check on the result -- this exact
+    # bug let a failing "get crd" report success and skip straight to
+    # applying the VPA manifest in production. Let a failing `get crd`
+    # raise IssueCommandError naturally and use that as the retry signal.
+    kubectl.RunKubectlCommand(['get', 'crd', _VPA_CRD_NAME])
+
+  try:
+    _Poll()
+  except vm_util.RetryError as e:
+    raise RuntimeError(
+        f'VerticalPodAutoscaler CRD ({_VPA_CRD_NAME}) never registered'
+        f' within {_VPA_CRD_WAIT_TIMEOUT_SECS}s. GKE installs VPA CRDs'
+        ' asynchronously after --enable-vertical-pod-autoscaling; either'
+        ' the addon install is unusually slow, or CPU Startup Boost is'
+        ' not supported on this cluster configuration.'
+    ) from e
+
 
 def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
   """Returns merged benchmark config.
 
-  For workload=vllm, swaps the container spec's image to VLLM_IMAGE.
+  For scenario=optimized, enables VPA on the container cluster spec so
+  PKB provisions a VPA-enabled GKE cluster.
 
   Args:
     user_config: User-supplied configuration.
@@ -169,19 +333,91 @@ def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
         'image'
     ] = DEPLOYMENT_IMAGE.value
 
+  # PR 3: enable VPA on the cluster for the optimized scenario.
+  if SCENARIO.value == 'optimized':
+    config['container_cluster']['enable_vpa'] = True
+    logging.info(
+        '[startup] scenario=optimized: enable_vpa=True on cluster config'
+    )
+
   return config
+
+
+def CheckPrerequisites(_) -> None:
+  """Validates flag combinations before cluster creation.
+
+  Args:
+    _: Unused benchmark spec (required by PKB interface).
+
+  Raises:
+    ValueError: If scenario=optimized is used on a non-GCP cloud. (PR 4:
+      scenario=optimized is supported for both workload=jvm and
+      workload=vllm -- only the GKE/cloud restriction remains.)
+  """
+  if SCENARIO.value == 'optimized' and FLAGS.cloud != 'GCP':
+    raise ValueError(
+        '--kubernetes_deployment_startup_scenario=optimized requires '
+        f'--cloud=GCP (GKE only). Got --cloud={FLAGS.cloud}.'
+    )
 
 
 def Prepare(benchmark_spec: bm_spec.BenchmarkSpec):
   """Prepares the Kubernetes cluster for the benchmark.
 
-  Deploys the JVM or vLLM workload depending on WORKLOAD.
+  For scenario=optimized (either workload, PR 4), first deploys a
+  VerticalPodAutoscaler manifest with a startup boost policy targeting
+  the active Deployment, and only then deploys the Deployment itself.
+
+  Ordering matters here: GKE's CPU Startup Boost takes effect via a
+  mutating admission webhook that intercepts *new* pod creation events.
+  If the Deployment (and its first pod) were applied before the VPA
+  object exists, that pod's initial CPU request would never be boosted,
+  and this benchmark would end up measuring an unboosted startup even
+  though scenario=optimized was requested. The VPA is safe to create
+  before its targetRef Deployment exists -- it simply waits for the
+  target to appear.
+
+  For scenario=optimized, also waits for the VerticalPodAutoscaler CRD to
+  be registered before applying the VPA manifest -- GKE installs VPA CRDs
+  asynchronously after cluster creation, and that install can still be in
+  flight even once the cluster and kube-dns report ready (see
+  _WaitForVpaCrd).
 
   Args:
     benchmark_spec: The benchmark specification.
+
+  Raises:
+    RuntimeError: If scenario=optimized and the VerticalPodAutoscaler CRD
+      never registers within the wait timeout.
   """
   image = benchmark_spec.container_specs['kubernetes_deployment_startup'].image
   workload = WORKLOAD.value
+  scenario = SCENARIO.value
+  deployment_name = (
+      _VLLM_DEPLOYMENT_NAME if workload == 'vllm' else _JVM_DEPLOYMENT_NAME
+  )
+
+  # PR 4: apply VPA with startup boost for optimized scenario BEFORE the
+  # deployment, for either workload, so the boost's admission-time
+  # mutation applies to the very first pod this benchmark measures (see
+  # docstring above). Sizing (CPU ceiling / boost duration) is
+  # per-workload since vLLM's baseline CPU footprint and model-load time
+  # are both much larger than the JVM's.
+  if scenario == 'optimized':
+    _WaitForVpaCrd()
+    logging.info(
+        '[startup] scenario=optimized workload=%s: VPA boost_factor=%d'
+        + ' applied first',
+        workload,
+        BOOST_FACTOR.value,
+    )
+    kubernetes_commands.ApplyManifest(
+        VPA_YAML.value,
+        name=deployment_name,
+        boost_factor=BOOST_FACTOR.value,
+        max_allowed_cpu=_GetVpaMaxCpu(workload),
+        duration_seconds=_GetVpaDurationSeconds(workload),
+    )
 
   if workload == 'vllm':
     logging.info('[startup] Deploying vLLM workload (image=%s)', image)
@@ -204,13 +440,26 @@ def Prepare(benchmark_spec: bm_spec.BenchmarkSpec):
 def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   """Runs the benchmark and collects startup metrics.
 
-  Collects all PR 1 metrics (max_pod_ready_time, per_pod_ready_time,
-  startup_latency/per_pod_startup_latency, cpu_utilization_*) against
-  whichever workload's Deployment is active.
+  Collects all metrics required by the benchmark methodology doc, plus
+  metadata from PR 3:
+    1. max_pod_ready_time     — PodReadyToStartContainers -> Ready.
+    2. startup_latency        — PodRunning -> Ready (per-pod:
+       per_pod_startup_latency). PodRunning is synthesized in
+       kubernetes_conditions from containerStatuses[].state.running.
+       startedAt, since Kubernetes doesn't report it as a real condition.
+    3. cpu_utilization_*       — background CPU collector (PR 1).
+    (per_pod_ready_time is also emitted as a PR 1 bonus metric, not
+    required by the doc but useful for percentile analysis across
+    replicas.)
+
+  For scenario=optimized, the VPA startup boost is already active from
+  Prepare() — no additional Run() changes needed.
 
   Required metrics fail loudly rather than silently degrading: if a
   metric can't be computed at all for the whole run, this raises instead
-  of logging a warning and returning partial results.
+  of logging a warning and returning partial results. (A silent warning
+  here is exactly what let a prior VPA-ordering bug ship a "successful"
+  optimized-scenario run that never actually applied the CPU boost.)
 
   Args:
     benchmark_spec: The benchmark specification.
@@ -225,14 +474,19 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   """
   del benchmark_spec  # Image/deployment name are resolved via flags below.
   workload = WORKLOAD.value
+  scenario = SCENARIO.value
+
   deployment_name = (
       _VLLM_DEPLOYMENT_NAME if workload == 'vllm' else _JVM_DEPLOYMENT_NAME
   )
 
+  # PR 3: boost_factor in metadata so config 1 vs config 4 comparison is clear.
   base_metadata: Dict[str, Any] = {
-      'scenario': 'baseline',
+      'scenario': scenario,
       'workload': workload,
       'cloud': FLAGS.cloud,
+      'deployment_name': deployment_name,
+      'boost_factor': BOOST_FACTOR.value if scenario == 'optimized' else 1,
   }
 
   # ── CPU background collector (PR 1) ──────────────────────────────────
@@ -271,9 +525,10 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   # ── Parse pod conditions ──────────────────────────────────────────────
   # max_pod_ready_time uses PodReadyToStartContainers -> Ready (existing).
   # startup_latency uses PodRunning -> Ready (container process started ->
-  # app passed its readiness probe). PodRunning is synthesized by
-  # kubernetes_conditions from containerStatuses[].state.running.startedAt,
-  # since it isn't a real pod condition.
+  # app passed its readiness probe), per the requirements doc's Metrics
+  # table. PodRunning is synthesized by kubernetes_conditions from
+  # containerStatuses[].state.running.startedAt, since it isn't a real
+  # pod condition.
   pod_name_to_start_end_times: dict[str, tuple[int, int]] = (
       collections.defaultdict(lambda: (0, 0))
   )
@@ -339,6 +594,9 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
       )
 
   # ── Metric 3: startup_latency (PodRunning -> Ready) ──────────────────
+  # Required by the doc's Metrics table alongside Max Pod Ready Time and
+  # CPU Utilization. Only computed for pods where both a PodRunning
+  # timestamp and a Ready timestamp were observed.
   max_startup_latency = -1
   for pod_name, (running_t, ready_t) in pod_name_to_running_ready_times.items():
     if running_t <= 0 or ready_t <= 0:
@@ -373,8 +631,9 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
   )
 
   logging.info(
-      '[startup] workload=%s max_pod_ready_time=%.2fs'
+      '[startup] scenario=%s workload=%s max_pod_ready_time=%.2fs'
       + ' startup_latency=%.2fs pods=%d',
+      scenario,
       workload,
       max_pod_ready_t,
       max_startup_latency,
@@ -413,7 +672,9 @@ class _CpuUtilizationCollector:
     Transient poll failures (e.g. the Kubernetes Metrics API still
     warming up on a freshly created cluster) are tolerated by _Observe
     and simply retried. This only raises if the metric ends up with zero
-    data for the entire run.
+    data for the entire run -- the same standard applied to
+    startup_latency, so a total collection failure is surfaced as a
+    benchmark failure instead of silently shipping incomplete results.
 
     Raises:
       RuntimeError: If not a single CPU reading was collected all run.
@@ -429,19 +690,17 @@ class _CpuUtilizationCollector:
       )
     peak = max(readings)
     mean = sum(readings) / len(readings)
-    self._samples.extend(
-        [
-            sample.Sample(
-                'cpu_utilization_peak_millicores', peak, 'millicores', {}
-            ),
-            sample.Sample(
-                'cpu_utilization_mean_millicores', mean, 'millicores', {}
-            ),
-            sample.Sample(
-                'cpu_utilization_reading_count', len(readings), 'count', {}
-            ),
-        ]
-    )
+    self._samples.extend([
+        sample.Sample(
+            'cpu_utilization_peak_millicores', peak, 'millicores', {}
+        ),
+        sample.Sample(
+            'cpu_utilization_mean_millicores', mean, 'millicores', {}
+        ),
+        sample.Sample(
+            'cpu_utilization_reading_count', len(readings), 'count', {}
+        ),
+    ])
 
   def _PollCpuMillicoresSample(self) -> List[sample.Sample]:
     cpu_m = _GetTotalCpuMillicores()
